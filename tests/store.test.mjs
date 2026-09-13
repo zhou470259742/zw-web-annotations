@@ -3,7 +3,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createStore, pageKey, validateGroup, buildSendPayload, ARCHIVE_DIRNAME } from './scripts/runtime/core/store.mjs';
+import { createStore, pageKey, validateGroup, buildSendPayload, ARCHIVE_DIRNAME } from '../scripts/runtime/core/store.mjs';
 
 const page = { url: 'https://example.com/login', title: '登录页' };
 

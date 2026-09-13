@@ -6,7 +6,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { stableTaskId, canonicalPageUrl } from './scripts/runtime/client/annotator.mjs';
+import { stableTaskId, canonicalPageUrl } from '../scripts/runtime/client/annotator.mjs';
 
 /** 复刻组件的编号分配规则：按已存在的最大编号递增，删除后不重排。 */
 function nextSeq(tasks) {

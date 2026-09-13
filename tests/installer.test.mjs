@@ -15,7 +15,7 @@ import {
   META_FILE,
   TASKS_DIR,
   SKILL_VERSION,
-} from './scripts/index.mjs';
+} from '../scripts/index.mjs';
 
 async function tempProject(files = {}) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-install-'));
@@ -104,7 +104,7 @@ test('declared tasks dir matches where the runtime actually writes', async () =>
   assert.match(cfg, new RegExp(TASKS_DIR.replace(/\//g, '\\/')));
 
   // 用与运行时相同的方式解析，确认落盘位置就是 tasks/
-  const { createStore } = await import('../skills/zcode-web-annotations/scripts/runtime/core/store.mjs');
+  const { createStore } = await import('../scripts/runtime/core/store.mjs');
   const store = createStore(dir, { dir: TASKS_DIR });
   const expected = path.join(dir, TASKS_DIR);
   assert.equal(store.taskDir, expected);

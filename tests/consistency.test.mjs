@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createStore, DEFAULT_DIR, RUNTIME_VERSION } from './scripts/runtime/core/store.mjs';
-import { TASKS_DIR, WORK_ROOT, SKILL_VERSION, SKILL_NAME } from './scripts/index.mjs';
+import { createStore, DEFAULT_DIR, RUNTIME_VERSION } from '../scripts/runtime/core/store.mjs';
+import { TASKS_DIR, WORK_ROOT, SKILL_VERSION, SKILL_NAME } from '../scripts/index.mjs';
 
 /**
  * 这组测试锁死各模块对“任务落盘位置”的共识。
@@ -41,7 +42,12 @@ test('a store created without dir writes into the installer tasks dir', async ()
   assert.equal(store.taskDir, path.join(workspace, TASKS_DIR));
 });
 
-test('MCP server resolves the same directory as the installer', async () => {
+// mcp/ 与 bridge/ 是归档仓库期的附属物，不随技能分发；只有在包含它们的
+// 目录里运行测试（如归档仓库）时才校验，技能目录内自动跳过。
+const mcpSkip = existsSync(new URL('../mcp/server.mjs', import.meta.url))
+  ? false
+  : 'mcp/ 不随技能分发，仅在包含它的归档仓库中校验';
+test('MCP server resolves the same directory as the installer', { skip: mcpSkip }, async () => {
   const source = await fs.readFile(new URL('../mcp/server.mjs', import.meta.url), 'utf8');
   // MCP 曾自己复刻一份文件读写，导致归档、附件保活等规则与运行时各自演化；
   // 现在必须走 createStore，与 bridge 用同一套实现。
@@ -52,7 +58,10 @@ test('MCP server resolves the same directory as the installer', async () => {
   assert.match(source, /purge_annotation_archive/);
 });
 
-test('bridge server resolves the same directory as the installer', async () => {
+const bridgeSkip = existsSync(new URL('../bridge/server.mjs', import.meta.url))
+  ? false
+  : 'bridge/ 不随技能分发，仅在包含它的归档仓库中校验';
+test('bridge server resolves the same directory as the installer', { skip: bridgeSkip }, async () => {
   const source = await fs.readFile(new URL('../bridge/server.mjs', import.meta.url), 'utf8');
   assert.match(source, /createStore/);
   // bridge 通过 createStore 拿到默认目录，不应出现硬编码的任务路径

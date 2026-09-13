@@ -4,8 +4,8 @@ import http from 'node:http';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createAnnotationsMiddleware, injectAnnotatorScript } from './scripts/runtime/adapters/http.mjs';
-import { DEFAULT_DIR } from './scripts/runtime/core/store.mjs';
+import { createAnnotationsMiddleware, injectAnnotatorScript } from '../scripts/runtime/adapters/http.mjs';
+import { DEFAULT_DIR } from '../scripts/runtime/core/store.mjs';
 
 function request(port, { method = 'GET', path: urlPath, body } = {}) {
   return new Promise((resolve, reject) => {

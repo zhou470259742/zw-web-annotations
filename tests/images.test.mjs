@@ -12,7 +12,7 @@ import test from 'node:test';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { createStore, parseDataUrl, validateGroup, buildSendPayload, IMAGE_TYPES, ATTACHMENTS_DIRNAME, DEFAULT_DIR } from './scripts/runtime/core/store.mjs';
+import { createStore, parseDataUrl, validateGroup, buildSendPayload, IMAGE_TYPES, ATTACHMENTS_DIRNAME, DEFAULT_DIR } from '../scripts/runtime/core/store.mjs';
 
 const page = { url: 'https://example.com/page', title: '测试页' };
 const at = '2026-01-01T00:00:00.000Z';

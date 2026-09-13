@@ -8,7 +8,7 @@ import {
   findFrontendProjects,
   recommendIntegration,
   majorOf,
-} from './scripts/detect.mjs';
+} from '../scripts/detect.mjs';
 
 /** 建一个临时项目目录，写入给定文件。 */
 async function project(files = {}) {
