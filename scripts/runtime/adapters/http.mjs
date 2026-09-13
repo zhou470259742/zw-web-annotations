@@ -8,7 +8,7 @@
  *
  * 以 Express 为例：
  *   import express from 'express';
- *   import { createAnnotationsMiddleware } from './.zw-web-annotations/runtime/adapters/http.mjs';
+ *   import { createAnnotationsMiddleware } from './.zwa/runtime/adapters/http.mjs';
  *   const app = express();
  *   app.use(createAnnotationsMiddleware({ workspace: process.cwd() }));
  *

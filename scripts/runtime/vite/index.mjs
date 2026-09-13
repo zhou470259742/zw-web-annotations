@@ -6,7 +6,7 @@
  * 2. 提供同源接口 /__zw-web-annotations/*，直接把任务写入本地工作区。
  *
  * 用法（vite.config.js）：
- *   import { zwAnnotations } from './.zw-web-annotations/runtime/vite/index.mjs';
+ *   import { zwAnnotations } from './.zwa/runtime/vite/index.mjs';
  *   export default { plugins: [zwAnnotations()] };
  */
 import fs from 'node:fs/promises';

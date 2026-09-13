@@ -32,7 +32,7 @@ test('skill version matches the repository version', async () => {
 
 test('installer tasks dir matches the store default dir', () => {
   assert.equal(TASKS_DIR, DEFAULT_DIR);
-  assert.equal(DEFAULT_DIR, '.zw-web-annotations/tasks');
+  assert.equal(DEFAULT_DIR, '.zwa/tasks');
   assert.ok(DEFAULT_DIR.startsWith(`${WORK_ROOT}/`));
 });
 

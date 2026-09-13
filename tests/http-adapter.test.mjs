@@ -64,7 +64,7 @@ test('middleware writes annotations to the local workspace', async () => {
     const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
     assert.equal(saved.status, 200);
     assert.equal(saved.json().added, 1);
-    assert.match(saved.json().relativePath, /^\.zw-web-annotations\/tasks\//);
+    assert.match(saved.json().relativePath, /^\.zwa\/tasks\//);
 
     const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     assert.equal(listed.json().groups.length, 1);

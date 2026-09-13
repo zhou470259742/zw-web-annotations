@@ -11,7 +11,7 @@ export const MAX_BODY_BYTES = 24 * 1024 * 1024;
  * 任何一处写死别的路径，都会让「安装器说存在 tasks/，运行时却写到别处」
  * 这类不一致重新出现。
  */
-export const DEFAULT_DIR = '.zw-web-annotations/tasks';
+export const DEFAULT_DIR = '.zwa/tasks';
 export const ATTACHMENTS_DIRNAME = 'attachments';
 
 /**

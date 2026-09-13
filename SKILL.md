@@ -119,10 +119,10 @@ node "<技能目录>/scripts/cli.mjs" install --root "<项目目录>"
 
 安装器会：
 
-1. 拷贝运行时到 `<项目>/.zw-web-annotations/runtime/`，项目因此**自包含**；
-2. 创建 `<项目>/.zw-web-annotations/tasks/` 并追加 `.gitignore` 忽略规则；
+1. 拷贝运行时到 `<项目>/.zwa/runtime/`，项目因此**自包含**；
+2. 创建 `<项目>/.zwa/tasks/` 并追加 `.gitignore` 忽略规则；
 3. 幂等接入构建配置：写入前备份为 `*.zw-backup`，写入后 `node --check` 校验语法，失败自动回滚；
-4. 写元数据 `<项目>/.zw-web-annotations/install.json`。
+4. 写元数据 `<项目>/.zwa/install.json`。
 
 ## 第四步：自检并汇报
 
@@ -136,7 +136,7 @@ node "<技能目录>/scripts/cli.mjs" doctor --root "<项目目录>"
 - 接入动作是 `created` / `patched` / `manual` 中的哪一种，改了哪个文件；
 - 若是 `manual`，把 `integration.snippet.files[]` 里的代码**原样**给出，并说明每个代码块粘到哪个文件；
 - 若是 `patched`，说明备份文件位置与回滚方式；
-- 任务 JSON 的落盘位置：`<项目>/.zw-web-annotations/tasks/`。
+- 任务 JSON 的落盘位置：`<项目>/.zwa/tasks/`。
 
 其中 `runtime-version` 检查项意在发现**技能已升级、项目里还是旧运行时**的情况。它不通过时按第零步的升级询问流程征得用户同意后执行：
 

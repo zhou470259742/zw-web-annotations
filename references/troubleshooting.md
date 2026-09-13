@@ -73,17 +73,17 @@ UI 能显示说明脚本加载成功，问题在写盘接口。
 检查安装元数据里声明的目录：
 
 ```bash
-cat "<项目>/.zw-web-annotations/install.json"
+cat "<项目>/.zwa/install.json"
 ```
 
 对比 `tasksDir` 与实际落盘位置：
 
 ```bash
-find "<项目>/.zw-web-annotations" -name "*.json" -not -path "*/runtime/*"
+find "<项目>/.zwa" -name "*.json" -not -path "*/runtime/*"
 ```
 
-**常见原因**：中间件没传 `dir`，于是回退到默认目录 `.zw-web-annotations/`，而安装器初始化的是 `.zw-web-annotations/tasks/`。
-解决：给 `createAnnotationsMiddleware` 显式传 `dir: '.zw-web-annotations/tasks'`。
+**常见原因**：中间件没传 `dir`，于是回退到默认目录 `.zwa/`，而安装器初始化的是 `.zwa/tasks/`。
+解决：给 `createAnnotationsMiddleware` 显式传 `dir: '.zwa/tasks'`。
 
 ## 7. 图片附件打不开
 
@@ -112,7 +112,7 @@ cp vite.config.ts.zw-backup vite.config.ts
 组件脚本带内容哈希（`?v=<sha1>`），源码变化时 URL 会变，浏览器必然重新拉取。
 Vite 插件同时监听文件变化并触发整页刷新。若仍不生效：
 
-- 确认改的是项目内 `.zw-web-annotations/runtime/client/annotator.mjs`（运行时是副本，改仓库源码不会影响已安装的项目）；
+- 确认改的是项目内 `.zwa/runtime/client/annotator.mjs`（运行时是副本，改仓库源码不会影响已安装的项目）；
 - 重启开发服务器。
 
 **升级运行时的正确方式是重新安装**：
@@ -140,7 +140,7 @@ ZW_ANNOTATIONS=off npm run dev
 
 ```js
 // vite.config.mjs
-zwAnnotations({ dir: '.zw-web-annotations/tasks', enabled: false })
+zwAnnotations({ dir: '.zwa/tasks', enabled: false })
 ```
 
 关闭是**整条链路一起关**：页面不再注入组件，接口 `/__zw-web-annotations/*` 也返回 404。

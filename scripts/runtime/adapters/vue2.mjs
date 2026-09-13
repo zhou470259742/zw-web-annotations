@@ -8,7 +8,7 @@
  * 用法（main.js）：
  *   import Vue from 'vue';
  *   import App from './App.vue';
- *   import { createAnnotations } from './.zw-web-annotations/runtime/adapters/vue2.mjs';
+ *   import { createAnnotations } from './.zwa/runtime/adapters/vue2.mjs';
  *
  *   Vue.use(createAnnotations());
  *   new Vue({ render: h => h(App) }).$mount('#app');

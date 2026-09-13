@@ -1,6 +1,6 @@
 # 各框架接入细节
 
-运行时安装到 `<项目>/.zw-web-annotations/runtime/` 后，各框架的接入方式如下。
+运行时安装到 `<项目>/.zwa/runtime/` 后，各框架的接入方式如下。
 安装器会按检测结果自动处理 Vite；其余情况输出代码片段，需要粘进用户项目。
 
 ## 通用原理
@@ -9,7 +9,7 @@
 
 这个中间件同时负责两半：
 
-1. **接口**：提供 `/__zw-web-annotations/*`，把任务写进 `.zw-web-annotations/tasks/`；
+1. **接口**：提供 `/__zw-web-annotations/*`，把任务写进 `.zwa/tasks/`；
 2. **UI**：自动把标注脚本注入它下游返回的 HTML。
 
 Vite 插件在内部做的就是这件事，所以 Vite 项目自动接入即可用。其他构建器只需把同一段中间件代码粘到各自的 dev server 配置里，**一处即可**，不需要再单独挂适配器。
@@ -19,10 +19,10 @@ Vite 插件在内部做的就是这件事，所以 Vite 项目自动接入即可
 安装器自动注入：
 
 ```js
-import { zwAnnotations } from './.zw-web-annotations/runtime/vite/index.mjs';
+import { zwAnnotations } from './.zwa/runtime/vite/index.mjs';
 
 export default {
-  plugins: [zwAnnotations({ dir: '.zw-web-annotations/tasks' })],
+  plugins: [zwAnnotations({ dir: '.zwa/tasks' })],
 };
 ```
 
@@ -39,7 +39,7 @@ Vue 3：
 ```js
 // src/main.js
 import { createApp } from 'vue';
-import { createAnnotations } from './.zw-web-annotations/runtime/adapters/vue3.mjs';
+import { createAnnotations } from './.zwa/runtime/adapters/vue3.mjs';
 
 const app = createApp(App);
 app.use(createAnnotations());
@@ -51,7 +51,7 @@ Vue 2：
 ```js
 // src/main.js
 import Vue from 'vue';
-import { createAnnotations } from './.zw-web-annotations/runtime/adapters/vue2.mjs';
+import { createAnnotations } from './.zwa/runtime/adapters/vue2.mjs';
 
 Vue.use(createAnnotations());
 new Vue({ render: h => h(App) }).$mount('#app');
@@ -66,14 +66,14 @@ new Vue({ render: h => h(App) }).$mount('#app');
 在 `vue.config.js` 注册中间件，一处即可（UI 由中间件自动注入）：
 
 ```js
-const { createAnnotationsMiddleware } = require('./.zw-web-annotations/runtime/adapters/http.mjs');
+const { createAnnotationsMiddleware } = require('./.zwa/runtime/adapters/http.mjs');
 
 module.exports = {
   devServer: {
     setupMiddlewares(middlewares, devServer) {
       devServer.app.use(createAnnotationsMiddleware({
         workspace: __dirname,
-        dir: '.zw-web-annotations/tasks',
+        dir: '.zwa/tasks',
       }));
       return middlewares;
     },
@@ -86,14 +86,14 @@ module.exports = {
 同样一处即可，中间件会自己注入 UI：
 
 ```js
-const { createAnnotationsMiddleware } = require('./.zw-web-annotations/runtime/adapters/http.mjs');
+const { createAnnotationsMiddleware } = require('./.zwa/runtime/adapters/http.mjs');
 
 module.exports = {
   devServer: {
     setupMiddlewares(middlewares, devServer) {
       devServer.app.use(createAnnotationsMiddleware({
         workspace: __dirname,
-        dir: '.zw-web-annotations/tasks',
+        dir: '.zwa/tasks',
       }));
       return middlewares;
     },
@@ -108,11 +108,11 @@ React / Svelte / Solid 等没有专用适配器，因为它们不需要：标注
 任何能挂 connect 风格中间件的服务器都可以：
 
 ```js
-import { createAnnotationsMiddleware } from './.zw-web-annotations/runtime/adapters/http.mjs';
+import { createAnnotationsMiddleware } from './.zwa/runtime/adapters/http.mjs';
 
 app.use(createAnnotationsMiddleware({
   workspace: process.cwd(),
-  dir: '.zw-web-annotations/tasks',
+  dir: '.zwa/tasks',
 }));
 ```
 
@@ -125,7 +125,7 @@ app.use(createAnnotationsMiddleware({
 | `route` | `/__zw-web-annotations` | 接口前缀 |
 | `clientPath` | `/__zw-web-annotations/client.js` | 组件脚本路径 |
 | `workspace` | `process.cwd()` | 工作区根目录，决定任务落盘位置 |
-| `dir` | 空（回退到 `.zw-web-annotations/tasks`） | 任务目录，相对 workspace 解析 |
+| `dir` | 空（回退到 `.zwa/tasks`） | 任务目录，相对 workspace 解析 |
 | `injectHtml` | `true` | 是否自动把脚本注入下游 HTML；设 `false` 则只提供接口 |
 
 **建议始终显式传 `dir`**，与安装器初始化的目录保持一致。
@@ -133,7 +133,7 @@ app.use(createAnnotationsMiddleware({
 自动注入只作用于 `text/html` 且**未被压缩**的响应；遇到 gzip/brotli 正文会原样放行，不会写坏内容。若你的 dev server 在中间件之前就把 HTML 发走了，改用 `injectAnnotatorScript()` 手动注入：
 
 ```js
-import { injectAnnotatorScript } from './.zw-web-annotations/runtime/adapters/http.mjs';
+import { injectAnnotatorScript } from './.zwa/runtime/adapters/http.mjs';
 
 html = injectAnnotatorScript(html);
 ```
@@ -146,4 +146,4 @@ html = injectAnnotatorScript(html);
 cp vite.config.ts.zw-backup vite.config.ts
 ```
 
-完全移除：删除 `.zw-web-annotations/` 目录，并撤销对构建配置的改动。
+完全移除：删除 `.zwa/` 目录，并撤销对构建配置的改动。

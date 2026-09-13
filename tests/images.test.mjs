@@ -175,7 +175,7 @@ test('send payload includes size, screenshot path and manual marker', () => {
     updatedAt: at,
     page,
     tasks: [
-      elementTask({ images: [{ id: 'i', file: '.zw-web-annotations/attachments/task_a-i.png' }] }),
+      elementTask({ images: [{ id: 'i', file: '.zwa/attachments/task_a-i.png' }] }),
       {
         id: 'manual_1',
         seq: 2,

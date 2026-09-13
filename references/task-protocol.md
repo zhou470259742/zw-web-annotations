@@ -3,7 +3,7 @@
 安装完成后，标注任务以 JSON 落在项目里：
 
 ```text
-<项目>/.zw-web-annotations/tasks/<页面>-<哈希>.json
+<项目>/.zwa/tasks/<页面>-<哈希>.json
 ```
 
 同一页面的标注归并到同一个文件；`attachments/` 存放粘贴的图片，JSON 里只存相对路径。
@@ -30,7 +30,7 @@
     "metrics": { "offsetWidth": 120, "offsetHeight": 32 },
     "styles": { "color": "rgb(255,255,255)", "fontSize": "14px" }
   },
-  "images": [{ "file": ".zw-web-annotations/tasks/attachments/task_ab12cd34-i1.png" }],
+  "images": [{ "file": ".zwa/tasks/attachments/task_ab12cd34-i1.png" }],
   "history": []
 }
 ```
@@ -91,7 +91,7 @@ curl -X POST http://localhost:<端口>/__zw-web-annotations/delete \
 用户通常会用「复制提示词」生成一段指令，形如：
 
 ```text
-请参考 /绝对/路径/.zw-web-annotations/tasks/<页面>-<哈希>.json 中的待处理工作，进行处理。
+请参考 /绝对/路径/.zwa/tasks/<页面>-<哈希>.json 中的待处理工作，进行处理。
 处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。
 如果工作内容较多，请合理通过多 agent 进行并行处理。
 ```
@@ -103,9 +103,9 @@ curl -X POST http://localhost:<端口>/__zw-web-annotations/delete \
 ```text
 请处理以下网页标注任务（项目跨多个页面，任务已按页面分成多个任务文件）：
 1. 页面：<标题>（当前页面），待处理 2 项
-   任务文件：/绝对/路径/<项目>/.zw-web-annotations/tasks/<页面A>-<哈希>.json
+   任务文件：/绝对/路径/<项目>/.zwa/tasks/<页面A>-<哈希>.json
 2. 页面：<标题>，待处理 3 项
-   任务文件：/绝对/路径/<项目>/.zw-web-annotations/tasks/<页面B>-<哈希>.json
+   任务文件：/绝对/路径/<项目>/.zwa/tasks/<页面B>-<哈希>.json
 
 请依次参考这些任务文件中的待处理工作，进行处理。
 处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。

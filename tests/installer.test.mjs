@@ -61,7 +61,7 @@ test('install copies a self-contained runtime into the project', async () => {
   }
   // 运行时自包含：配置只引用项目内相对路径
   const cfg = await fs.readFile(path.join(dir, 'vite.config.mjs'), 'utf8');
-  assert.match(cfg, /\.\/\.zw-web-annotations\/runtime\/vite\/index\.mjs/);
+  assert.match(cfg, /\.\/\.zwa\/runtime\/vite\/index\.mjs/);
   assert.doesNotMatch(cfg, /\/Users\//);
 });
 
@@ -79,7 +79,7 @@ test('install initializes workspace, metadata and gitignore', async () => {
   assert.equal(meta.framework, 'vue');
   assert.equal(meta.frameworkMajor, 3);
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
-  assert.match(ignore, /\.zw-web-annotations\/tasks\//);
+  assert.match(ignore, /\.zwa\/tasks\//);
 });
 
 test('githubignore is appended without clobbering existing content', async () => {
@@ -91,7 +91,7 @@ test('githubignore is appended without clobbering existing content', async () =>
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
   assert.match(ignore, /node_modules/);
   assert.match(ignore, /dist/);
-  assert.match(ignore, /\.zw-web-annotations\/tasks\//);
+  assert.match(ignore, /\.zwa\/tasks\//);
 });
 
 test('declared tasks dir matches where the runtime actually writes', async () => {

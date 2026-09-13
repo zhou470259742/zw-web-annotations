@@ -2,7 +2,7 @@
  * 网页标注：项目安装器
  *
  * 职责（全部为确定性文件操作，不依赖模型自由发挥）：
- * 1. 把运行时拷贝到目标项目的 .zw-web-annotations/runtime/，使项目自包含；
+ * 1. 把运行时拷贝到目标项目的 .zwa/runtime/，使项目自包含；
  * 2. 初始化工作区目录与忽略规则；
  * 3. 幂等接入构建配置（默认 Vite），写入前备份并做语法校验，失败自动回滚；
  * 4. 写入安装元数据，供后续检测、升级与卸载使用。
@@ -10,6 +10,7 @@
  * 对外只暴露 installProject / detectProject / planInstall，便于测试与 Skill 调用。
  */
 import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -36,7 +37,7 @@ export const RUNTIME_FILES = [
   'schema/annotations.schema.json',
 ];
 
-export const WORK_ROOT = '.zw-web-annotations';
+export const WORK_ROOT = '.zwa';
 export const META_FILE = `${WORK_ROOT}/install.json`;
 
 /**
@@ -489,14 +490,57 @@ export function buildManualSnippet(projectRoot, detected, adapter) {
 }
 
 /**
- * 旧版工作区迁移：品牌中立化前的安装布局是 `<项目>/.zcode/web-annotations/`，
- * 现在是 `<项目>/.zw-web-annotations/`。tasks/（含归档与附件）必须整体搬移——
- * 任务数据是用户唯一不可再生数据，迁移是搬而不是删；构建配置与 .gitignore
- * 里的旧路径原位修正；旧 runtime 由安装流程在新位置重新生成。
+ * 旧版工作区迁移：品牌中立化前的安装布局有两代——
+ * `.zcode/web-annotations/`（≤0.11）与 `.zw-web-annotations/`（0.12 过渡版），
+ * 现在统一是 `<项目>/.zwa/`。tasks/（含归档与附件）必须整体搬移——
+ * 任务数据是用户唯一不可再生数据，迁移是搬而不是删；构建配置优先还原
+ * 安装器留下的干净备份后由安装流程重新注入（首版迁移只换路径前缀，会
+ * 在配置里留下新旧两份插件注册，其中旧函数名在新运行时里已不存在，
+ * 会让 dev server 起不来），没有备份才做原位替换与去重。
  */
+const LEGACY_WORKSPACES = ['.zcode/web-annotations', '.zw-web-annotations'];
+const LEGACY_CONFIG_PREFIXES = ['.zcode/web-annotations', '.zw-web-annotations'];
+
+function normalizeLegacyConfigRefs(content) {
+  let out = String(content)
+    .split('zcodeAnnotations')
+    .join('zwAnnotations');
+  for (const legacy of LEGACY_CONFIG_PREFIXES) {
+    out = out.split(legacy).join(WORK_ROOT);
+  }
+  // 去重 import 行：迁移可能同时留下旧名与新名两行
+  const seen = new Set();
+  out = out
+    .split('\n')
+    .filter(line => {
+      const m = line.match(/import \{ zwAnnotations \} from '([^']+)';/);
+      if (!m) return true;
+      if (seen.has(m[1])) return false;
+      seen.add(m[1]);
+      return true;
+    })
+    .join('\n');
+  // 去重插件调用：保留第一个 zwAnnotations({...})，其余连同前导逗号删除
+  const callMatches = [...out.matchAll(/zwAnnotations\(\{[^}]*\}\)/g)].map(m => m[0]);
+  if (callMatches.length > 1) {
+    const drop = new Set(callMatches.slice(1));
+    let seenCalls = 0;
+    out = out
+      .replace(/,?\s*zwAnnotations\(\{[^}]*\}\)/g, m => {
+        const bare = m.replace(/^[,\s]+/, '');
+        seenCalls += 1;
+        return seenCalls === 1 ? bare : drop.has(bare) ? '' : bare;
+      })
+      .replace(/,\s*,/g, ',')
+      .replace(/\[\s*,/g, '[')
+      .replace(/,\s*\]/g, ']');
+  }
+  return out;
+}
+
 async function migrateLegacyWorkspace(root) {
-  const legacyRoot = path.join(root, '.zcode', 'web-annotations');
-  if (!(await exists(legacyRoot))) return { migrated: false };
+  const legacyRoot = LEGACY_WORKSPACES.map(dir => path.join(root, dir)).find(dir => existsSync(dir));
+  if (!legacyRoot) return { migrated: false };
 
   const modernRoot = path.join(root, WORK_ROOT);
   await fs.mkdir(modernRoot, { recursive: true });
@@ -517,23 +561,36 @@ async function migrateLegacyWorkspace(root) {
     tasksMigrated = true;
   }
 
-  // 2) 构建配置原位替换旧路径：注入行同时包含 import 路径与 dir 参数
+  // 2) 构建配置修正：有备份先还原（回到未注入的干净原文，安装流程随后
+  //    重新注入新路径），否则原位替换 + 去重
   const patched = [];
   for (const name of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
     const cfgPath = path.join(root, name);
     if (!(await exists(cfgPath))) continue;
     const content = await fs.readFile(cfgPath, 'utf8');
-    if (!content.includes('.zcode/web-annotations')) continue;
-    await fs.writeFile(cfgPath, content.split('.zcode/web-annotations').join('.zw-web-annotations'), 'utf8');
+    if (!LEGACY_CONFIG_PREFIXES.some(prefix => content.includes(prefix))) continue;
+    const backup = [`${cfgPath}.zw-backup`, `${cfgPath}.zcode-backup`].find(p => existsSync(p));
+    if (backup) {
+      await fs.copyFile(backup, cfgPath);
+      patched.push(`${name}（自备份还原）`);
+      continue;
+    }
+    await fs.writeFile(cfgPath, normalizeLegacyConfigRefs(content), 'utf8');
     patched.push(name);
   }
 
-  // 3) .gitignore 旧条目换成新条目
+  // 3) .gitignore 旧条目移除（新条目由 initWorkspace 追加），其余内容原样保留
   const gitignore = path.join(root, '.gitignore');
   if (await exists(gitignore)) {
     const current = await fs.readFile(gitignore, 'utf8');
-    const updated = current.split('.zcode/web-annotations/tasks/').join('.zw-web-annotations/tasks/');
-    if (updated !== current) await fs.writeFile(gitignore, updated, 'utf8');
+    const legacyEntries = new Set(LEGACY_WORKSPACES.map(dir => `${dir}/tasks/`));
+    const updated = current
+      .split('\n')
+      .filter(line => !legacyEntries.has(line.trim()))
+      .join('\n');
+    if (updated !== current) {
+      await fs.writeFile(gitignore, updated.endsWith('\n') ? updated : `${updated}\n`, 'utf8');
+    }
   }
 
   // 4) 旧目录移除（数据已搬走，runtime 由安装流程在新位置重新生成）
@@ -541,6 +598,7 @@ async function migrateLegacyWorkspace(root) {
 
   return {
     migrated: true,
+    legacyRoot: path.relative(root, legacyRoot),
     tasksMigrated,
     patched,
     previousSkillVersion: legacyMeta?.skillVersion || null,
