@@ -544,6 +544,11 @@ export function mountAnnotator(options = {}) {
           <span>复制</span>
         </button>
       </div>
+      <!-- 收起态的进度条：展开面板时刻意不显示（面板顶部已有完整的一根，
+           两处同时出现是重复信息）。全部任务验收完成后自动消失。 -->
+      <div class="dock-progress" data-el="dockProgress">
+        <div class="dock-progress-fill" data-el="dockProgressFill"></div>
+      </div>
     </div>
     <section class="panel hidden" data-el="panel">
       <header>
@@ -930,25 +935,54 @@ export function mountAnnotator(options = {}) {
    * 总体进度条。统计范围是**整个项目**（当前页 + 其它页面的全部任务），
    * 因为用户关心的是「这批活干完多少」，而不是当前页那几项。
    */
-  function renderProgress() {
-    const all = [
+  /** 项目全部任务（当前页 + 其它页面），进度统计的输入。 */
+  function allProjectTasks() {
+    return [
       ...state.tasks,
       ...state.groups.flatMap(g => (Array.isArray(g?.tasks) ? g.tasks : [])),
     ].filter(t => t && t.id);
-    const p = computeProgress(all);
+  }
+
+  /**
+   * 进度条。面板展开时是顶部那根，收起时是胶囊上方的细条——两处同一份数据，
+   * 但不同时显示（展开时刻意隐藏细条，避免同一信息出现两次）。
+   */
+  function renderProgress() {
+    const p = computeProgress(allProjectTasks());
+    renderDockProgress(p);
     const fill = $('[data-el="progressFill"]');
-    const track = fill.parentElement;
     fill.style.width = `${p.percent}%`;
     $('[data-el="progressPct"]').textContent = p.total ? `${p.percent}%` : '';
     $('[data-el="progressLabel"]').textContent = p.total
       ? `待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
       : '还没有任务';
-    track.title = p.total
+    fill.parentElement.title = p.total
       ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
         + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）`
       : '';
     // 全部完成时换成绿色，作为「这批活收工」的收尾信号
     fill.dataset.done = p.total && p.percent >= 100 ? 'on' : 'off';
+  }
+
+  /**
+   * 收起态胶囊上方的细进度条。
+   *
+   * 三条显示规则：
+   * - 没有任务 → 不显示（空条无意义，且会占住悬浮按钮的位置）；
+   * - 全部完成（100%）→ 不显示。用户明确要求「全部完成之后消失」，
+   *   任务都归档后这条一直在反而干扰；
+   * - 面板展开 → 不显示，改由面板顶部那根完整进度条承担。
+   */
+  function renderDockProgress(p) {
+    const box = $('[data-el="dockProgress"]');
+    const fill = $('[data-el="dockProgressFill"]');
+    const stat = p || computeProgress(allProjectTasks());
+    const show = stat.total > 0 && stat.percent < 100 && state.collapsed;
+    box.classList.toggle('hidden', !show);
+    if (!show) return;
+    fill.style.width = `${stat.percent}%`;
+    fill.dataset.done = 'off';
+    box.title = `进度 ${stat.percent}%（待验收 ${stat.counts.review || 0} · 已完成 ${stat.counts.done || 0} / 共 ${stat.total}）`;
   }
 
   function renderPanelMeta() {
@@ -2267,6 +2301,9 @@ export function mountAnnotator(options = {}) {
     $('[data-el="panel"]').classList.toggle('hidden', state.collapsed);
     if (!state.collapsed) renderList();
     renderCapsule();
+    // 收起态不跑 renderList（不做列表渲染），收起条必须在这里单独刷新，
+    // 否则「展开→收起」后细条不会出现，或收起时仍残留上次的宽度。
+    renderProgress();
     // 展开/收起只切换承载位置，文案与回执优先级仍交给 renderMessage 统一决定，
     // 否则展开面板时会把压在回执下面的后台消息提前显示出来。
     renderMessage();
@@ -2895,10 +2932,11 @@ const CSS_TEXT = `
 .dock-float {
   position: absolute; left: 4px; bottom: 100%;
   display: flex; align-items: flex-start; gap: 6px;
-  /* 用自身的下内边距填满与胶囊之间的空隙，而不是另加一个 ::before 桥：
-     空隙属于浮层盒子的一部分，指针从胶囊上移到按钮途中始终在浮层内，
-     不会在中途丢失 hover 导致浮层闪烁。 */
-  padding-bottom: 12px;
+  /* 边框盒底边贴住胶囊顶边，下内边距 16px 把「胶囊顶 → 按钮底」整段
+     （其中 4~9px 处会叠着进度条）都纳入浮层盒子，指针上移途中始终在浮层内，
+     不会丢 hover 导致闪烁。16px 是常量：进度条全部完成后会隐藏，
+     这段桥仍在，hover 不会因为进度条消失而断路。 */
+  padding-bottom: 16px;
   opacity: 0; visibility: hidden; transform: translateY(6px);
   transition: opacity .16s ease, transform .16s ease, visibility .16s;
   pointer-events: none;
@@ -2922,6 +2960,24 @@ const CSS_TEXT = `
 .dock-float-btn svg { width: 14px; height: 14px; flex: none; }
 .dock-float-btn:hover { background: #2f2f2f; color: #fff; border-color: #5a5a5a; }
 .dock-float-btn:focus-visible { outline: 2px solid #8d7bff; outline-offset: 1px; }
+
+/* ---- 收起态进度条 ---- */
+/* 贴在胶囊正上方，与胶囊同宽（用绝对定位 + left/right 0 跟随 .dock 宽度），
+   细条不抢视觉。全部任务验收完成时整条淡出（见 renderDockProgress）。 */
+.dock-progress {
+  position: absolute; left: 4px; right: 4px; bottom: calc(100% + 6px);
+  height: 4px; border-radius: 999px;
+  background: #2b2b2b; overflow: hidden;
+  opacity: 1; transition: opacity .3s ease;
+}
+.dock-progress.hidden { display: none; }
+.dock-progress-idle { opacity: 0; pointer-events: none; }
+.dock-progress-fill {
+  height: 100%; width: 0; border-radius: 999px;
+  background: linear-gradient(90deg, #6f7cf0, #9a7cf0);
+  transition: width .28s ease, background .28s ease;
+}
+.dock-progress-fill[data-done="on"] { background: linear-gradient(90deg, #4fbf7a, #6fd39a); }
 
 /* ---- 收起状态的操作反馈浮条 ---- */
 /* 位置必须让开上方的悬浮按钮层（y 708~738），否则会盖住「手动/复制」并挡住点击；
