@@ -1,0 +1,14 @@
+{
+  "name": "zcode-web-annotations",
+  "version": "0.10.8",
+  "private": true,
+  "type": "module",
+  "description": "Z Code skill: install web element batch-annotation into a frontend project with framework auto-detection. This directory is the single maintained copy (component source included).",
+  "scripts": {
+    "test": "node --test tests/*.test.mjs",
+    "install:runtime": "node scripts/cli.mjs install"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
