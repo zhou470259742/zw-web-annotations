@@ -451,3 +451,29 @@ test('purgeArchive without a group clears the whole archive directory', async ()
   assert.equal(purged.filesRemoved, 2);
   await assert.rejects(() => fs.stat(store.archiveDir), /ENOENT/);
 });
+
+/** SSE 实时推送的驱动源：任务数据的每次变更都要触发 onChange 回调。 */
+test('store notifies onChange after every task mutation (doing 锁照常生效)', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-annot-'));
+  let calls = 0;
+  const store = createStore(dir, { onChange: () => { calls++; } });
+
+  await store.appendTasks({ page, tasks: [task()] });
+  await store.updateTask(pageKey(page.url), { taskId: 'task_abc', status: 'doing' });
+  assert.equal(calls, 2, 'append 与 doing 回写各触发一次');
+
+  // doing 锁：无 force 的删除会重写文件保留处理中任务，同样触发通知
+  const kept = await store.removeTasks(pageKey(page.url), { all: true });
+  assert.deepEqual(kept.skipped, ['task_abc']);
+  assert.equal(calls, 3);
+  await fs.access(store.fileFor(pageKey(page.url)));
+
+  // force 删除真正移除文件，触发最后一次通知
+  await store.removeTasks(pageKey(page.url), { all: true, force: true });
+  assert.equal(calls, 4);
+  await assert.rejects(() => fs.access(store.fileFor(pageKey(page.url))), /ENOENT/);
+
+  // 幂等的重复删除没有写出任何文件，不应触发通知
+  await store.removeTasks(pageKey(page.url), { all: true });
+  assert.equal(calls, 4);
+});

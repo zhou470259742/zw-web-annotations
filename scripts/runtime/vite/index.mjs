@@ -13,7 +13,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { createStore, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
+import { createStore, createTaskChangeHub, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
@@ -78,7 +78,10 @@ export function zwAnnotations(options = {}) {
 
   /** @type {import('../core/store.mjs').createStore extends (...a:any)=>infer R ? R : never} */
   let store = null;
-  const getStore = () => (store ||= createStore(config.workspace, { dir: config.dir }));
+  let hub = null;
+  const getHub = () => (hub ||= createTaskChangeHub());
+  const getStore = () =>
+    (store ||= createStore(config.workspace, { dir: config.dir, onChange: () => getHub().notify() }));
 
   const clientRoute = `${config.endpoint}/client.js`;
 
@@ -147,6 +150,21 @@ export function zwAnnotations(options = {}) {
       server.watcher.on('change', invalidate);
       server.watcher.on('add', invalidate);
 
+      if (config.enabled) {
+        // 任务文件变化（含 MCP 等进程外写入）→ 推送 SSE，页面立即拉取。
+        // 进程内写入由 store 的 onChange 回调覆盖，这里补进程外的部分。
+        const hub = getHub();
+        const taskDirRoot = path.resolve(getStore().taskDir);
+        server.watcher.add(taskDirRoot);
+        const onTaskFile = changed => {
+          const p = path.resolve(String(changed));
+          if (p.startsWith(taskDirRoot) && p.endsWith('.json')) hub.notify();
+        };
+        server.watcher.on('change', onTaskFile);
+        server.watcher.on('add', onTaskFile);
+        server.watcher.on('unlink', onTaskFile);
+      }
+
       server.middlewares.use(async (req, res, next) => {
         if (!req.url || !req.url.startsWith(ROUTE_PREFIX)) return next();
         // 关闭时不注册任何接口：留着接口会出现「界面没了但还在写文件」，
@@ -154,6 +172,18 @@ export function zwAnnotations(options = {}) {
         if (!config.enabled) return sendJson(res, 404, { error: 'annotations disabled', hint: 'ZW_ANNOTATIONS=off' });
         const url = new URL(req.url, 'http://localhost');
         const route = url.pathname.slice(ROUTE_PREFIX.length) || '/';
+
+        if (req.method === 'GET' && route === '/events') {
+          // SSE 实时推送：任务文件变化时通知页面立即拉取，轮询（10s）作为兜底。
+          // 长连接不进入 try/catch，也绝不调用 next()/sendJson()。
+          res.writeHead(200, {
+            'content-type': 'text/event-stream; charset=utf-8',
+            'cache-control': 'no-store',
+            connection: 'keep-alive',
+          });
+          getHub().add(res);
+          return;
+        }
 
         try {
           if (req.method === 'GET' && (route === '/' || route === '/health')) {
@@ -165,6 +195,7 @@ export function zwAnnotations(options = {}) {
               workspace: getStore().workspace,
               taskDir: getStore().taskDir,
               endpoint: config.endpoint,
+              eventClients: getHub().clientCount,
             });
           }
 

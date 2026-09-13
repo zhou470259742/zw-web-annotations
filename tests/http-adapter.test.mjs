@@ -256,3 +256,38 @@ test('instruction edit for another page task lands in that page group, not the c
     assert.equal(groupB.tasks.length, 1, '同一任务的重复同步必须幂等，不得重复生成');
   });
 });
+
+test('events endpoint pushes tasks-changed to SSE clients on task writes', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
+  await withServer(dir, async port => {
+    const stream = await new Promise((resolve, reject) => {
+      let buf = '';
+      const req = http.request({ host: '127.0.0.1', port, path: '/__zw-web-annotations/events' }, res => {
+        res.setEncoding('utf8');
+        res.on('data', c => {
+          buf += c;
+          if (buf.includes('tasks-changed')) {
+            req.destroy();
+            resolve(buf);
+          }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+      // 连接建立后写入一条任务：store onChange → hub 推送 tasks-changed
+      setTimeout(() => {
+        request(port, {
+          method: 'POST',
+          path: '/__zw-web-annotations/append',
+          body: { page, tasks: [makeTask()] },
+        }).catch(() => {});
+      }, 150);
+      setTimeout(() => {
+        req.destroy();
+        reject(new Error('SSE 未在 5s 内推送 tasks-changed'));
+      }, 5000);
+    });
+    assert.match(stream, /retry: 3000/);
+    assert.match(stream, /tasks-changed/);
+  });
+});

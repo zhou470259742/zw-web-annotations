@@ -17,7 +17,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createStore, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
+import { watchTaskDir, createTaskChangeHub, createStore, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
@@ -68,7 +68,19 @@ export function createAnnotationsMiddleware(options = {}) {
     // （React/Vue + webpack 等）只需挂中间件，UI 就会自己出现。
     injectHtml: options.injectHtml !== false,
   };
-  const store = createStore(config.workspace, { dir: config.dir });
+  const hub = createTaskChangeHub();
+  const store = createStore(config.workspace, { dir: config.dir, onChange: () => hub.notify() });
+  // 监听任务目录，覆盖 MCP 等进程外写入；目录尚未建立或平台不支持时静默
+  // 退化为轮询兜底。ensureWatcher 幂等：首个请求时目录多半已存在。
+  let dirWatcher = null;
+  const ensureWatcher = () => {
+    if (dirWatcher) return;
+    try {
+      dirWatcher = watchTaskDir(store.taskDir, () => hub.notify());
+    } catch {
+      /* 目录不存在等：只靠轮询兜底 */
+    }
+  };
 
   /** 组件脚本 + 自动挂载引导，与 Vite 插件的做法保持一致。 */
   async function clientSource() {
@@ -105,9 +117,21 @@ export function createAnnotationsMiddleware(options = {}) {
     }
 
     const route = pathname.slice(config.route.length) || '/';
+    if (req.method === 'GET' && route === '/events') {
+      // SSE 实时推送：任务文件变化时通知页面立即拉取，轮询（10s）作为兜底
+      ensureWatcher();
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store',
+        connection: 'keep-alive',
+      });
+      hub.add(res);
+      return;
+    }
+    ensureWatcher();
     try {
       if (req.method === 'GET' && (route === '/' || route === '/health')) {
-        return sendJson(res, 200, { ok: true, version: RUNTIME_VERSION, workspace: store.workspace, taskDir: store.taskDir, clientPath: config.clientPath });
+        return sendJson(res, 200, { ok: true, version: RUNTIME_VERSION, workspace: store.workspace, taskDir: store.taskDir, clientPath: config.clientPath, eventClients: hub.clientCount });
       }
       if (req.method === 'GET' && route === '/tasks') {
         const groups = await store.listGroups();

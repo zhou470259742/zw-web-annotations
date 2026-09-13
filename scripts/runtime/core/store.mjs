@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
@@ -24,7 +25,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.12.0';
+export const RUNTIME_VERSION = '0.13.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -138,6 +139,80 @@ export function buildSendPayload(group) {
   ].join('\n');
 }
 
+/**
+ * 任务变更广播器（SSE）。页面通过 /events 长连接订阅；任何任务写入
+ * （模型回写、归档、删除）都会合并去抖后向所有连接推送一条
+ * `tasks-changed`，客户端收到后立即拉取最新任务。连接本身近乎零开销，
+ * 常开即可；推送只带事件名不带数据，客户端自行拉取，避免大包与乱序。
+ */
+export function createTaskChangeHub() {
+  const clients = new Set();
+  const state = { announceTimer: null, heartbeatTimer: null };
+
+  const safeWrite = (res, payload) => {
+    try {
+      res.write(payload);
+    } catch {
+      clients.delete(res);
+    }
+  };
+
+  return {
+    /** 建立一条 SSE 连接：下发重连间隔，之后交给心跳与广播维护。 */
+    add(res) {
+      clients.add(res);
+      if (!state.heartbeatTimer) {
+        // 注释行心跳：防止代理掐断空闲长连接；unref 不阻止进程退出
+        state.heartbeatTimer = setInterval(() => {
+          for (const res of [...clients]) safeWrite(res, ': ping\n\n');
+        }, 25000);
+        state.heartbeatTimer.unref?.();
+      }
+      safeWrite(res, 'retry: 3000\n\n');
+      res.on('close', () => clients.delete(res));
+      res.on('error', () => clients.delete(res));
+    },
+    /** 防抖合并：短时间内多次写入（一次修复常连改数项）只推一条。 */
+    notify() {
+      if (state.announceTimer) return;
+      state.announceTimer = setTimeout(() => {
+        state.announceTimer = null;
+        for (const res of [...clients]) {
+          // 必须带 event: 行——裸 data: 会作为 message 事件派发，
+          // 客户端按具名事件监听时永远收不到（实测踩过）
+          safeWrite(res, 'event: tasks-changed\ndata: {}\n\n');
+        }
+      }, 200);
+      state.announceTimer.unref?.();
+    },
+    get clientCount() {
+      return clients.size;
+    },
+    stop() {
+      if (state.announceTimer) clearTimeout(state.announceTimer);
+      if (state.heartbeatTimer) clearInterval(state.heartbeatTimer);
+      state.announceTimer = null;
+      state.heartbeatTimer = null;
+      clients.clear();
+    },
+  };
+}
+
+/**
+ * 监听任务目录变化，覆盖 MCP 等**进程外**写入（进程内的写入走 onChange 回调）。
+ * 目录不存在或平台不支持递归 watch 时抛错，调用方决定退化为轮询兜底。
+ */
+export function watchTaskDir(taskDir, onChange) {
+  const watcher = fsSync.watch(taskDir, { recursive: true }, (event, filename) => {
+    if (filename && !String(filename).endsWith('.json')) return;
+    onChange();
+  });
+  // 目录被删除等异常时关闭监听，由轮询兜底
+  watcher.unref?.();
+  watcher.on('error', () => watcher.close());
+  return { close: () => watcher.close() };
+}
+
 export function createStore(workspace, options = {}) {
   const root = path.resolve(workspace);
   // 相对 dir 一律相对工作区根目录解析，而不是相对进程 CWD，
@@ -154,6 +229,16 @@ export function createStore(workspace, options = {}) {
 
   const attachmentsDir = path.join(taskDir, ATTACHMENTS_DIRNAME);
   const archiveDir = path.join(taskDir, ARCHIVE_DIRNAME);
+
+  // 任务数据变更回调：宿主用它驱动 SSE 实时推送（见 createTaskChangeHub）。
+  // 回调抛错绝不影响写盘本身的数据一致性。
+  const notifyChange = () => {
+    try {
+      options.onChange?.();
+    } catch {
+      /* 通知失败不影响数据 */
+    }
+  };
 
   /**
    * 把任务里的 data URL 图片落盘为真实文件，并替换成相对路径。
@@ -362,6 +447,7 @@ export function createStore(workspace, options = {}) {
     const attachments = await persistAttachments(group, freshTasks);
 
     await writeGroup(group);
+    notifyChange();
     return { group, file: `${id}.json`, path: fileFor(id), added, updated, attachments };
   };
 
@@ -385,6 +471,7 @@ export function createStore(workspace, options = {}) {
     task.updatedAt = at;
     group.updatedAt = at;
     await writeGroup(group);
+    notifyChange();
     return { group, task };
   };
 
@@ -484,12 +571,14 @@ export function createStore(workspace, options = {}) {
     if (!group.tasks.length) {
       await fs.rm(fileFor(groupId), { force: true });
       const attachmentsRemoved = await pruneAttachments();
+      notifyChange();
       return { groupId, removed, remaining: 0, fileRemoved: true, attachmentsRemoved, skipped };
     }
 
     group.updatedAt = nowIso();
     await writeGroup(group);
     const attachmentsRemoved = await pruneAttachments();
+    notifyChange();
     return { groupId, removed, remaining: group.tasks.length, fileRemoved: false, attachmentsRemoved, skipped };
   };
 
@@ -556,6 +645,7 @@ export function createStore(workspace, options = {}) {
       await writeGroup(group);
     }
     await pruneAttachments();
+    notifyChange();
     return { groupId, archived: hits.length, remaining: rest.length, fileRemoved, archiveFile: file };
   };
 

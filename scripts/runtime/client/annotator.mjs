@@ -364,6 +364,8 @@ export function mountAnnotator(options = {}) {
     /** 定时从工作区刷新任务的句柄；只在有任务且面板挂载期间保持。 */
     refreshTimer: null,
     refreshPending: false,
+    /** SSE 长连接（/events），实时接收任务变更通知。 */
+    eventSource: null,
   };
 
   try {
@@ -604,14 +606,40 @@ export function mountAnnotator(options = {}) {
 
   function startRemoteRefresh() {
     if (!config.autoSync || state.refreshTimer) return;
-    // 8 秒：落在用户要求的 5–10 秒范围内；不依赖页面获得焦点。
-    state.refreshTimer = setInterval(() => loadRemoteTasks({ quiet: true }), 8000);
+    // 10 秒兜底轮询：正常情况下任务变化由 SSE 实时推送（events 长连接），
+    // 轮询只兜住推送缺席的场景（如 SSE 被代理拦截、事件竞态遗漏）。
+    state.refreshTimer = setInterval(() => loadRemoteTasks({ quiet: true }), 10000);
   }
 
   function stopRemoteRefresh() {
     if (!state.refreshTimer) return;
     clearInterval(state.refreshTimer);
     state.refreshTimer = null;
+  }
+
+  /**
+   * SSE 实时推送：模型回写状态/归档时，服务端经 /events 广播 tasks-changed，
+   * 页面立即拉取最新任务，列表与图钉几乎零延迟。EventSource 断线由浏览器
+   * 自动重连；连接常开即可，开销只有一条空闲 socket + 25s 一次的心跳注释。
+   */
+  function startEventStream() {
+    if (!config.autoSync || state.eventSource || typeof EventSource === 'undefined') return;
+    try {
+      const es = new EventSource(`${config.endpoint}/events`);
+      es.addEventListener('tasks-changed', () => loadRemoteTasks({ quiet: true }));
+      es.onerror = () => {
+        /* 断线由 EventSource 自动重连，轮询兜底；不打扰用户 */
+      };
+      state.eventSource = es;
+    } catch {
+      /* 环境不支持 EventSource 时仅用轮询兜底 */
+    }
+  }
+
+  function stopEventStream() {
+    if (!state.eventSource) return;
+    state.eventSource.close();
+    state.eventSource = null;
   }
 
   /** 合并连续确认，避免每条标注都打一次接口。 */
@@ -2174,6 +2202,7 @@ export function mountAnnotator(options = {}) {
   // localStorage 先用于首屏占位，随后以工作区 JSON 为权威刷新；
   // 定时器会继续处理模型在其它终端的状态回写、删除与归档。
   startRemoteRefresh();
+  startEventStream();
   loadRemoteTasks({ quiet: true });
 
   const api = {
@@ -2258,6 +2287,8 @@ export function mountAnnotator(options = {}) {
     sync: syncNow,
     refresh: () => loadRemoteTasks({ quiet: false }),
     copyPrompt,
+    /** SSE 连接状态（0 连接中 / 1 已打开 / 2 已关闭），用于排查实时推送。 */
+    eventStreamReady: () => (state.eventSource ? state.eventSource.readyState : null),
     deleteRemote,
     askConfirm,
     resolveConfirm,
@@ -2315,6 +2346,7 @@ export function mountAnnotator(options = {}) {
     pinTitle: id => shadow.querySelector(`[data-pin="${cssEscape(id)}"]`)?.title || null,
     destroy() {
       stopRemoteRefresh();
+      stopEventStream();
       for (const timer of remoteSyncTimers.values()) clearTimeout(timer);
       remoteSyncTimers.clear();
       document.removeEventListener('mousemove', onMove, true);
