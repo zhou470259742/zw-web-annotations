@@ -172,3 +172,26 @@ test('the annotator\'s own UI is never blocked', () => {
 test('page stays fully interactive when idle', () => {
   assert.equal(shouldBlockPageEvent({ ownUi: false, editing: false, active: false }), false);
 });
+
+/**
+ * 回归：编辑器开着时，页面必须真正被「挡住」，包括 hover。
+ *
+ * 这里记录的是 0.20.0 的教训——hover 由浏览器命中测试决定，JS 的
+ * preventDefault 拦不住它（实测遮罩可见时鼠标划过页面按钮仍会 :hover）。
+ * 因此改用真实元素 .click-shield 参与命中测试，而不是靠事件拦截。
+ * 层序很关键，写错会连带把自己的 UI 挡死。
+ */
+test('click shield sits below the annotator UI and above the page', () => {
+  // 数值取自 annotator.mjs 的 CSS。写死在这里是为了在有人调整层级时失败，
+  // 层级错了的后果很具体：要么页面仍可交互，要么面板/图钉全点不动。
+  const PAGE = 0;
+  const SHIELD = 2147483643;
+  const PINS = 2147483645;
+  const PANEL = 2147483646;
+  const EDITOR = 2147483647;
+
+  assert.ok(SHIELD > PAGE, '拦截层必须在页面之上，否则拦不住');
+  assert.ok(PINS > SHIELD, '图钉必须在拦截层之上，否则编辑器开着时点不到图钉');
+  assert.ok(PANEL > SHIELD, '面板必须在拦截层之上，否则按钮点不动');
+  assert.ok(EDITOR > SHIELD, '编辑器必须在拦截层之上，否则输入框无法聚焦');
+});

@@ -609,6 +609,19 @@ export function mountAnnotator(options = {}) {
   toast.className = 'toast hidden';
   toast.setAttribute('data-el', 'toast');
 
+  // 编辑器打开期间的「事件拦截层」。
+  //
+  // 为什么必须是真实元素而不是靠 JS preventDefault：hover 由浏览器的命中测试
+  // 决定，它发生在脚本之前，preventDefault 对它完全无效。所以只要指针还在
+  // 页面元素上，:hover 样式、CSS 动画、title 提示照旧触发——遮罩看起来盖住了
+  // 页面，鼠标划过却仍会高亮。只有让一个真实层挡住命中测试才能根治。
+  //
+  // 它透明、不显示任何视觉（压暗仍交给 veil/spotlight），只负责吃掉指针事件；
+  // z-index 高于页面但低于组件自己的 UI，因此面板/编辑器/图钉照常可交互。
+  const clickShield = document.createElement('div');
+  clickShield.className = 'click-shield hidden';
+  clickShield.setAttribute('data-el', 'clickShield');
+
   // 二次确认对话框
   const confirmBox = document.createElement('div');
   confirmBox.className = 'confirm-layer hidden';
@@ -624,7 +637,7 @@ export function mountAnnotator(options = {}) {
     </div>
   `;
 
-  shadow.append(outline, sizeBadge, veil, spotlight, pins, editor, confirmBox, bar, toast);
+  shadow.append(outline, sizeBadge, veil, spotlight, pins, clickShield, editor, confirmBox, bar, toast);
 
   const $ = sel => shadow.querySelector(sel);
   const $$ = sel => Array.from(shadow.querySelectorAll(sel));
@@ -1334,6 +1347,14 @@ export function mountAnnotator(options = {}) {
       pin.addEventListener('click', event => {
         event.preventDefault();
         event.stopPropagation();
+        // 图钉的 z-index 高于事件拦截层，所以编辑器开着时它仍可点到。
+        // 此时直接切走会把未确认的草稿丢掉，必须先让用户确认或取消——
+        // 与「编辑器开着时点页面」保持同一套语义。
+        if (isEditing() && state.editingId !== task.id) {
+          state.syncMessage = '请先按 Enter 确认或 Esc 取消当前输入。';
+          renderMessage();
+          return;
+        }
         openEditorFor(task.id);
       });
       pins.append(pin);
@@ -1736,14 +1757,19 @@ export function mountAnnotator(options = {}) {
    */
   function updateFocusFx() {
     if (editor.classList.contains('hidden')) {
+      clickShield.classList.add('hidden');
       if (!spotlight.classList.contains('on') && !veil.classList.contains('on')) return;
       spotlight.classList.remove('on');
       veil.classList.remove('on');
       return;
     }
-    // 手动任务不加任何遮罩：这个弹窗的典型用法是「截个图粘进来」，
+    // 编辑器打开期间挡住整个页面。只有这个时机才拦：**标注模式下不拦**，
+    // 因为「点选元素」正是靠页面自己接到点击来完成的，拦住就没法标注了。
+    clickShield.classList.remove('hidden');
+    // 手动任务不加任何视觉遮罩：这个弹窗的典型用法是「截个图粘进来」，
     // 遮罩会把要截的页面压暗，截出来的图自带一层灰。而且手动任务本来
     // 就没有可聚焦的目标元素，挖孔高亮无从谈起。
+    // （拦截层是透明的，不影响截图，所以照常启用。）
     if (state.manualMode || (!state.editingId && !state.pendingElement)) {
       spotlight.classList.remove('on');
       veil.classList.remove('on');
@@ -2759,6 +2785,16 @@ const CSS_TEXT = `
   transition: opacity .18s ease, visibility .18s ease;
 }
 .veil.on { opacity: 1; visibility: visible; }
+/* 事件拦截层：完全透明，只参与命中测试，不产生任何视觉。
+   z-index 取 2147483643（与 veil 同级）——必须低于组件自己的 UI：
+   图钉 645、面板 646、编辑器/确认框 647。高于它们就会把自己人一起挡住，
+   面板按钮和图钉全都点不动。 */
+.click-shield {
+  position: fixed; inset: 0; z-index: 2147483643;
+  background: transparent;
+  cursor: default;
+}
+.click-shield.hidden { display: none; }
 .spotlight {
   position: fixed; z-index: 2147483644;
   pointer-events: none;
