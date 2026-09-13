@@ -16,6 +16,24 @@
  *   mountAnnotator();
  */
 
+/**
+ * 页面上的指针事件是否应当被拦下（不穿透到页面控件）。
+ *
+ * 抽成纯函数以便直接测试：这个判断出错的后果很具体——遮罩看起来盖住了页面，
+ * 但点击仍然生效（实测点复选框会被真的勾上），或者反过来把组件自己的 UI
+ * 也一起拦死。两种都不能靠肉眼看出来。
+ *
+ * @param {object} s
+ * @param {boolean} s.ownUi   事件目标是否属于组件自身 UI（面板/编辑器/图钉）
+ * @param {boolean} s.editing 编辑器是否开着
+ * @param {boolean} s.active  是否处于标注模式
+ */
+export function shouldBlockPageEvent({ ownUi, editing, active }) {
+  // 组件自己的 UI 永远放行，否则面板按钮、编辑器输入会全部点不动
+  if (ownUi) return false;
+  return !!(editing || active);
+}
+
 const STATUS_LABELS = {
   todo: '待处理',
   doing: '进行中',
@@ -2186,18 +2204,48 @@ export function mountAnnotator(options = {}) {
     showSizeBadge(target);
   }
 
-  function onClick(event) {
-    if (!state.active) return;
+  /** 编辑器是否开着（编辑已有任务、点选新元素、手动任务都算）。 */
+  function isEditing() {
+    return !!(state.editingId || state.editingIsNew);
+  }
+
+  /**
+   * mousedown 的默认行为是「激活控件 + 聚焦 + 起拖选择」，且发生在 click 之前。
+   *
+   * 只拦 click 是不够的：点页面输入框时它已经在 mousedown 阶段拿到焦点了，
+   * click 才被拦下——用户此时已经开始往页面里打字。所以这里也要拦。
+   *
+   * 拦截范围是「编辑器开着」或「标注模式开着」这两种情况，而不只是标注模式：
+   * 点图钉、点「手动」都会在非标注模式下打开编辑器，那时光标下仍有遮罩
+   * （手动任务除外），若只按 state.active 判断，那条路径依旧完全穿透。
+   */
+  function onMouseDown(event) {
     const target = event.target;
-    if (isOwnUi(target)) return;
     if (!target || target.nodeType !== 1) return;
+    if (!shouldBlockPageEvent({ ownUi: isOwnUi(target), editing: isEditing(), active: state.active })) return;
+    event.preventDefault();
+    if (isEditing()) event.stopPropagation();
+  }
+
+  function onClick(event) {
+    const target = event.target;
+    if (!target || target.nodeType !== 1) return;
+    if (!shouldBlockPageEvent({ ownUi: isOwnUi(target), editing: isEditing(), active: state.active })) return;
 
     // 编辑器已打开时忽略页面点击，避免未确认的输入被静默丢弃。
-    if (state.editingId || state.editingIsNew) {
+    if (isEditing()) {
+      // 必须真的把事件拦下，而不只是弹一句提示。此前这里只写消息就 return，
+      // 没调 preventDefault，于是页面默认行为照常发生——实测遮罩可见时点
+      // 页面复选框，勾选状态真的被切换了（遮罩只是视觉层，本身不拦事件）。
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
       state.syncMessage = '请先按 Enter 确认或 Esc 取消当前输入。';
       renderMessage();
       return;
     }
+
+    if (!state.active) return;
 
     event.preventDefault();
     event.stopPropagation();
@@ -2420,6 +2468,9 @@ export function mountAnnotator(options = {}) {
 
   document.addEventListener('paste', onPaste, true);
   document.addEventListener('mousemove', onMove, true);
+  // mousedown 必须早于 click 拦下：页面控件的聚焦发生在 mousedown 阶段，
+  // 只拦 click 的话输入框已经拿到焦点了。
+  document.addEventListener('mousedown', onMouseDown, true);
   document.addEventListener('click', onClick, true);
   document.addEventListener('keydown', onKeydown, true);
   window.addEventListener('scroll', () => {

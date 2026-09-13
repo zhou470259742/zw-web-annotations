@@ -6,7 +6,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { stableTaskId, canonicalPageUrl } from '../scripts/runtime/client/annotator.mjs';
+import { stableTaskId, canonicalPageUrl, shouldBlockPageEvent } from '../scripts/runtime/client/annotator.mjs';
 
 /** 复刻组件的编号分配规则：按已存在的最大编号递增，删除后不重排。 */
 function nextSeq(tasks) {
@@ -140,4 +140,35 @@ test('nested buttons resolve to the nearest action', () => {
   const outer = makeEl({ 'data-act': 'expand' });
   const inner = makeEl({ 'data-act': 'collapse' }, [outer]);
   assert.equal(resolveAction(inner), 'collapse');
+});
+
+/**
+ * 回归：遮罩可见时页面点击不得穿透。
+ *
+ * 遮罩（.veil / .spotlight）是纯视觉层，两层都写着 pointer-events:none，
+ * 本身不拦任何事件。真正的拦截靠 document 上的 mousedown/click 处理器，
+ * 而它此前只在「标注模式」下生效、且编辑中那条分支只弹提示没 preventDefault，
+ * 于是实测「遮罩可见时点页面复选框，勾选状态真的被改了」。
+ *
+ * 判断逻辑抽成 shouldBlockPageEvent 以便在这里直接锁定行为契约。
+ */
+test('page events are blocked while editing, even outside annotation mode', () => {
+  // 编辑器开着（点图钉或「手动」都会这样，此时并不一定处于标注模式）
+  assert.equal(shouldBlockPageEvent({ ownUi: false, editing: true, active: false }), true);
+  assert.equal(shouldBlockPageEvent({ ownUi: false, editing: true, active: true }), true);
+});
+
+test('page events are blocked while in annotation mode', () => {
+  assert.equal(shouldBlockPageEvent({ ownUi: false, editing: false, active: true }), true);
+});
+
+test('the annotator\'s own UI is never blocked', () => {
+  // 拦到自己头上会让面板按钮、编辑器输入、图钉全部点不动
+  assert.equal(shouldBlockPageEvent({ ownUi: true, editing: true, active: true }), false);
+  assert.equal(shouldBlockPageEvent({ ownUi: true, editing: false, active: true }), false);
+});
+
+/** 既不在标注模式也没开编辑器时，页面必须完全恢复可交互。 */
+test('page stays fully interactive when idle', () => {
+  assert.equal(shouldBlockPageEvent({ ownUi: false, editing: false, active: false }), false);
 });
