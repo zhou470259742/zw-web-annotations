@@ -2087,7 +2087,7 @@ export function mountAnnotator(options = {}) {
     // 删除信号，会发出整组删除请求。其它页面是否有待处理由后面的组列表判断。
     const saved = state.tasks.length ? await syncNow() : null;
     if (state.tasks.length && !saved) {
-      setReceipt('提示词未复制：任务尚未成功同步到工作区，无法确定文件地址。', 6000);
+      setReceipt('任务尚未成功同步到工作区，无法确定文件地址。', 6000);
       return null;
     }
     const fallbackPath = saved?.absolutePath || saved?.relativePath || saved?.file || '';
@@ -2104,13 +2104,13 @@ export function mountAnnotator(options = {}) {
       pendingGroups = null;
     }
     if (!pendingGroups && !fallbackPath) {
-      setReceipt('提示词未复制：无法读取工作区任务列表。', 6000);
+      setReceipt('无法读取工作区任务列表。', 6000);
       return null;
     }
     if (pendingGroups && !pendingGroups.length) {
       setReceipt(saved?.skipped
-        ? '提示词未复制：当前标注均已归档，工作区中没有待处理文件。重新标注后即可复制。'
-        : '提示词未复制：工作区里没有待处理的标注任务（可能均已完成或归档）。', 6000);
+        ? '当前标注均已归档，工作区中没有待处理文件。重新标注后即可复制。'
+        : '工作区里没有待处理的标注任务（可能均已完成或归档）。', 6000);
       return null;
     }
 
@@ -2131,7 +2131,7 @@ export function mountAnnotator(options = {}) {
       const [group] = pendingGroups;
       const jsonPath = group.absolutePath || (group.page?.url === pageUrl ? fallbackPath : '');
       if (!jsonPath) {
-        setReceipt('提示词未复制：无法确定任务文件地址。', 6000);
+        setReceipt('无法确定任务文件地址。', 6000);
         return null;
       }
       prompt = singleFilePrompt(jsonPath);
