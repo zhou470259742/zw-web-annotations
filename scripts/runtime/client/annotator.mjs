@@ -2204,9 +2204,9 @@ export function mountAnnotator(options = {}) {
       if (state.active) {
         event.preventDefault();
         event.stopPropagation();
+        // 只负责切换，退出文案由 setActive 统一写。之前在这里再赋一次
+        // （带「再按 Esc 收起面板」后缀），会覆盖掉 setActive 里的消息。
         setActive(false);
-        state.syncMessage = '已退出标注模式（再按 Esc 收起面板）。';
-        renderMessage();
         return;
       }
       if (!state.collapsed) {
@@ -2242,6 +2242,11 @@ export function mountAnnotator(options = {}) {
       hideSizeBadge();
       closeEditor();
     }
+    // 进/出标注模式各自给一条提示。之前只在 Esc 退出分支里写消息，
+    // 点「标注」进入时消息不变，于是上一条（比如上一轮的「已退出…」）
+    // 会一直挂着，看起来像操作没生效。放在这里可保证两条路径一致，
+    // 也覆盖 API 调用的 start/stop。
+    state.syncMessage = next ? '已进入标注模式（按 Esc 可退出）。' : '已退出标注模式。';
     renderCapsule();
     renderPanelMeta();
     renderMessage();
@@ -2250,6 +2255,10 @@ export function mountAnnotator(options = {}) {
   function setCollapsed(next) {
     state.collapsed = next;
     persistCollapsed();
+    // 收起是「面板自己消失」这种自明的动作，不该再复用上一条消息。
+    // 不清的话，Esc 两级操作（先退出标注模式、再收起面板）会在收起时
+    // 把「已退出标注模式。」当成收起动作的回执再弹一次，看起来像重复执行。
+    if (next) state.syncMessage = '';
     renderBar();
   }
 
@@ -2894,10 +2903,14 @@ const CSS_TEXT = `
   transition: opacity .16s ease, transform .16s ease, visibility .16s;
   pointer-events: none;
 }
+/* 用 :has(:focus-visible) 而不是 :focus-within：鼠标点「标注」后焦点留在该按钮上，
+   :focus-within 会让浮层一直显示、鼠标移开也不收起（用户实测反馈）。
+   :focus-visible 只在键盘聚焦时命中，鼠标点击不会触发，两种输入方式各得其所。
+   .dock-float:focus-within 保留——Tab 进入浮层按钮时它必须保持可见，否则焦点会落在看不见的按钮上。 */
 .dock:hover .dock-float,
 .dock-float:hover,
 .dock-float:focus-within,
-.dock:focus-within .dock-float {
+.dock:has(:focus-visible) .dock-float {
   opacity: 1; visibility: visible; transform: translateY(0); pointer-events: auto;
 }
 .dock-float-btn {
