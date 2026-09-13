@@ -317,7 +317,9 @@ async function integrateVite(root, detected) {
       return result;
     }
     const backupPath = `${cfgPath}.zw-backup`;
-    await fs.copyFile(cfgPath, backupPath);
+    // 备份只在首次接入时写：重复安装/升级会走到这里，无条件覆盖会把
+    // 最初的干净原文换成已注入的内容，备份从此失去回滚价值。
+    if (!(await exists(backupPath))) await fs.copyFile(cfgPath, backupPath);
     await fs.writeFile(cfgPath, patched, 'utf8');
     const check = await validateSyntax(cfgPath);
     if (!check.ok) {
@@ -489,18 +491,10 @@ export function buildManualSnippet(projectRoot, detected, adapter) {
   };
 }
 
-/**
- * 旧版工作区迁移：品牌中立化前的安装布局有两代——
- * `.zcode/web-annotations/`（≤0.11）与 `.zw-web-annotations/`（0.12 过渡版），
- * 现在统一是 `<项目>/.zwa/`。tasks/（含归档与附件）必须整体搬移——
- * 任务数据是用户唯一不可再生数据，迁移是搬而不是删；构建配置优先还原
- * 安装器留下的干净备份后由安装流程重新注入（首版迁移只换路径前缀，会
- * 在配置里留下新旧两份插件注册，其中旧函数名在新运行时里已不存在，
- * 会让 dev server 起不来），没有备份才做原位替换与去重。
- */
 const LEGACY_WORKSPACES = ['.zcode/web-annotations', '.zw-web-annotations'];
 const LEGACY_CONFIG_PREFIXES = ['.zcode/web-annotations', '.zw-web-annotations'];
 
+/** 旧配置规范化：函数名更名、旧工作区路径映射到当前 WORK_ROOT、去重。 */
 function normalizeLegacyConfigRefs(content) {
   let out = String(content)
     .split('zcodeAnnotations')
@@ -538,70 +532,84 @@ function normalizeLegacyConfigRefs(content) {
   return out;
 }
 
+/**
+ * 旧版工作区迁移：品牌中立化前的安装布局有两代——
+ * `.zcode/web-annotations/`（≤0.11）与 `.zw-web-annotations/`（0.12 过渡版），
+ * 现在统一是 `<项目>/.zwa/`。tasks/（含归档与附件）必须整体搬移——
+ * 任务数据是用户唯一不可再生数据，迁移是搬而不是删；构建配置原位规范化
+ * （函数名更名 + 旧路径映射 + 去重），旧 runtime 由安装流程重新生成。
+ */
 async function migrateLegacyWorkspace(root) {
-  const legacyRoot = LEGACY_WORKSPACES.map(dir => path.join(root, dir)).find(dir => existsSync(dir));
-  if (!legacyRoot) return { migrated: false };
-
   const modernRoot = path.join(root, WORK_ROOT);
+  const legacyRoots = LEGACY_WORKSPACES.map(dir => path.join(root, dir)).filter(dir => existsSync(dir));
+  if (!legacyRoots.length) return { migrated: false };
   await fs.mkdir(modernRoot, { recursive: true });
-  const legacyMeta = await readJsonSafe(path.join(legacyRoot, 'install.json'));
 
-  // 1) 任务数据整体搬移（含 tasks/archive、tasks/attachments）。
-  //    新目录已有 tasks（理论上只在异常中断后出现）时，把旧数据挪进带
-  //    时间戳的抢救目录，绝不覆盖任何一方。
-  const legacyTasks = path.join(legacyRoot, 'tasks');
-  const modernTasks = path.join(modernRoot, 'tasks');
+  let previousSkillVersion = null;
   let tasksMigrated = false;
-  if (await exists(legacyTasks)) {
-    if (!(await exists(modernTasks))) {
-      await fs.rename(legacyTasks, modernTasks);
-    } else {
-      await fs.rename(legacyTasks, path.join(modernRoot, `tasks-legacy-${Date.now()}`));
-    }
-    tasksMigrated = true;
-  }
-
-  // 2) 构建配置修正：有备份先还原（回到未注入的干净原文，安装流程随后
-  //    重新注入新路径），否则原位替换 + 去重
   const patched = [];
-  for (const name of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
-    const cfgPath = path.join(root, name);
-    if (!(await exists(cfgPath))) continue;
-    const content = await fs.readFile(cfgPath, 'utf8');
-    if (!LEGACY_CONFIG_PREFIXES.some(prefix => content.includes(prefix))) continue;
-    const backup = [`${cfgPath}.zw-backup`, `${cfgPath}.zcode-backup`].find(p => existsSync(p));
-    if (backup) {
-      await fs.copyFile(backup, cfgPath);
-      patched.push(`${name}（自备份还原）`);
-      continue;
-    }
-    await fs.writeFile(cfgPath, normalizeLegacyConfigRefs(content), 'utf8');
-    patched.push(name);
-  }
 
-  // 3) .gitignore 旧条目移除（新条目由 initWorkspace 追加），其余内容原样保留
-  const gitignore = path.join(root, '.gitignore');
-  if (await exists(gitignore)) {
-    const current = await fs.readFile(gitignore, 'utf8');
-    const legacyEntries = new Set(LEGACY_WORKSPACES.map(dir => `${dir}/tasks/`));
-    const updated = current
-      .split('\n')
-      .filter(line => !legacyEntries.has(line.trim()))
-      .join('\n');
-    if (updated !== current) {
-      await fs.writeFile(gitignore, updated.endsWith('\n') ? updated : `${updated}\n`, 'utf8');
-    }
-  }
+  for (const legacyRoot of legacyRoots) {
+    const legacyMeta = await readJsonSafe(path.join(legacyRoot, 'install.json'));
+    previousSkillVersion = previousSkillVersion || legacyMeta?.skillVersion || null;
 
-  // 4) 旧目录移除（数据已搬走，runtime 由安装流程在新位置重新生成）
-  await fs.rm(legacyRoot, { recursive: true, force: true });
+    // 1) 任务数据整体搬移（含 tasks/archive、tasks/attachments）。
+    //    现代目录还是空壳（只有 .gitkeep，没有任何任务与归档）时直接顶替；
+    //    现代目录已有真实数据（理论上只在异常中断后出现）时，把旧数据挪进
+    //    带时间戳的抢救目录，绝不覆盖任何一方。
+    const legacyTasks = path.join(legacyRoot, 'tasks');
+    const modernTasks = path.join(modernRoot, 'tasks');
+    if (await exists(legacyTasks)) {
+      const modernHasContent =
+        (await countTaskGroupFiles(root)) > 0 || existsSync(path.join(modernTasks, 'archive'));
+      if (!modernHasContent) {
+        await fs.rm(modernTasks, { recursive: true, force: true });
+        await fs.rename(legacyTasks, modernTasks);
+      } else {
+        await fs.rename(legacyTasks, path.join(modernRoot, `tasks-legacy-${Date.now()}`));
+      }
+      tasksMigrated = true;
+    }
+
+    // 2) 构建配置原位规范化：旧函数名更名、旧路径映射到 .zwa、去重 import
+    //    与插件调用。不做"还原备份"——重复安装会把备份覆盖成过期内容，
+    //    规范化对任意混乱程度都能收敛到唯一正确形态。
+    for (const name of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+      const cfgPath = path.join(root, name);
+      if (!(await exists(cfgPath))) continue;
+      const content = await fs.readFile(cfgPath, 'utf8');
+      const needsFix =
+        LEGACY_CONFIG_PREFIXES.some(prefix => content.includes(prefix)) || content.includes('zcodeAnnotations');
+      if (!needsFix) continue;
+      const normalized = normalizeLegacyConfigRefs(content);
+      if (normalized !== content) await fs.writeFile(cfgPath, normalized, 'utf8');
+      patched.push(name);
+    }
+
+    // 3) .gitignore 旧条目移除（新条目由 initWorkspace 追加），其余内容原样保留
+    const gitignore = path.join(root, '.gitignore');
+    if (await exists(gitignore)) {
+      const current = await fs.readFile(gitignore, 'utf8');
+      const legacyEntries = new Set(LEGACY_WORKSPACES.map(dir => `${dir}/tasks/`));
+      const updated = current
+        .split('\n')
+        .filter(line => !legacyEntries.has(line.trim()))
+        .join('\n');
+      if (updated !== current) {
+        await fs.writeFile(gitignore, updated.endsWith('\n') ? updated : `${updated}\n`, 'utf8');
+      }
+    }
+
+    // 4) 旧目录移除（数据已搬走，runtime 由安装流程在新位置重新生成）
+    await fs.rm(legacyRoot, { recursive: true, force: true });
+  }
 
   return {
     migrated: true,
-    legacyRoot: path.relative(root, legacyRoot),
+    legacyRoots: legacyRoots.map(dir => path.relative(root, dir)),
     tasksMigrated,
     patched,
-    previousSkillVersion: legacyMeta?.skillVersion || null,
+    previousSkillVersion: previousSkillVersion || null,
   };
 }
 
