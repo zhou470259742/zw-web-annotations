@@ -592,6 +592,7 @@ export function mountAnnotator(options = {}) {
       <div class="panel-progress" data-el="progress">
         <div class="progress-head">
           <span class="progress-label" data-el="progressLabel"></span>
+          <button type="button" class="archive-btn hidden" data-act="archive-round" data-el="archiveBtn" title="把本轮已完成的任务移入归档（交付）">归档本轮</button>
           <span class="progress-pct" data-el="progressPct"></span>
         </div>
         <div class="progress-track" title="">
@@ -975,44 +976,64 @@ export function mountAnnotator(options = {}) {
   }
 
   /**
+   * 进度统计的范围与排队情况。
+   *
+   * 进度条只统计**已定稿**（有轮次号）的任务：轮次在第一个任务被置为 doing
+   * 时定稿，定稿之后新增的批注自动排队下一轮——若把排队中的也计入分母，
+   * 用户一边标注一边处理时进度条会倒退（实测 24%→20%）。
+   * 尚未开轮（无任何轮次号）→ 没有可统计的进度，进度条隐藏，
+   * 面板上以「下一轮 N 条 · 复制提示词开始」提示。
+   */
+  function roundScope() {
+    const all = allProjectTasks();
+    const hasRounds = all.some(t => t.round != null);
+    const dispatched = all.filter(t => t.round != null);
+    const queued = all.filter(t => t.round == null && (t.status === 'todo' || t.status === 'doing')).length;
+    return { all, dispatched, queued, hasRounds };
+  }
+
+  /**
    * 进度条。面板展开时是顶部那根，收起时是胶囊上方的细条——两处同一份数据，
    * 但不同时显示（展开时刻意隐藏细条，避免同一信息出现两次）。
    */
   function renderProgress() {
-    const p = computeProgress(allProjectTasks());
-    renderDockProgress(p);
+    const scope = roundScope();
+    const p = computeProgress(scope.dispatched);
+    renderDockProgress(p, scope);
     const fill = $('[data-el="progressFill"]');
     fill.style.width = `${p.percent}%`;
     $('[data-el="progressPct"]').textContent = p.total ? `${p.percent}%` : '';
     $('[data-el="progressLabel"]').textContent = p.total
       ? `待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
-      : '还没有任务';
+        + (scope.queued ? ` · 下一轮 ${scope.queued}` : '')
+      : (scope.queued ? `下一轮 ${scope.queued} 条 · 复制提示词开始` : '还没有任务');
     fill.parentElement.title = p.total
       ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
-        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）`
+        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 与未定稿的排队任务不计入）`
       : '';
-    // 全部完成时换成绿色，作为「这批活收工」的收尾信号
+    // 全部完成时换成绿色并常驻，直到归档（交付）——这是「本轮收工」的信号
     fill.dataset.done = p.total && p.percent >= 100 ? 'on' : 'off';
+    $('[data-el="archiveBtn"]').classList.toggle('hidden', !(p.total && p.percent >= 100));
   }
 
   /**
    * 收起态胶囊上方的细进度条。
    *
-   * 三条显示规则：
-   * - 没有任务 → 不显示（空条无意义，且会占住悬浮按钮的位置）；
-   * - 全部完成（100%）→ 不显示。用户明确要求「全部完成之后消失」，
-   *   任务都归档后这条一直在反而干扰；
+   * 显示规则：
+   * - 本轮无任务（尚未开轮，或已交付归档）→ 不显示；
+   * - 100% 时**不隐藏**、绿色常驻——这是显式的「本轮完成」状态，
+   *   直到归档才消失（交付时机由用户掌控）；
    * - 面板展开 → 不显示，改由面板顶部那根完整进度条承担。
    */
-  function renderDockProgress(p) {
+  function renderDockProgress(p, scope) {
     const box = $('[data-el="dockProgress"]');
     const fill = $('[data-el="dockProgressFill"]');
-    const stat = p || computeProgress(allProjectTasks());
-    const show = stat.total > 0 && stat.percent < 100 && state.collapsed;
+    const stat = p || computeProgress((scope || roundScope()).dispatched);
+    const show = stat.total > 0 && state.collapsed;
     box.classList.toggle('hidden', !show);
     if (!show) return;
     fill.style.width = `${stat.percent}%`;
-    fill.dataset.done = 'off';
+    fill.dataset.done = stat.percent >= 100 ? 'on' : 'off';
     box.title = `进度 ${stat.percent}%（待验收 ${stat.counts.review || 0} · 已完成 ${stat.counts.done || 0} / 共 ${stat.total}）`;
   }
 
@@ -1146,6 +1167,8 @@ export function mountAnnotator(options = {}) {
     // 或删掉它都是合理的；锁住会让改动静默失效，比放行更糟。
     const locked = task.status === 'doing';
     const review = task.status === 'review';
+    // 处理开始后新增的批注没有轮次号 → 排队下一轮（有轮次在身时才显示徽标）
+    const queued = state.roundQueued && task.round == null;
     const thumbs = (task.images || []).length
       ? `<div class="item-thumbs">${task.images
           .map(img => (img.dataUrl ? `<img src="${img.dataUrl}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`))
@@ -1168,7 +1191,7 @@ export function mountAnnotator(options = {}) {
       </label>
       <div class="item-foot">
         <code>${escapeHtml(sub)}</code>
-        <span class="tag${empty ? ' warn' : review ? ' review' : ''}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>
+        <span class="tag${empty ? ' warn' : review ? ' review' : ''}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
       </div>
     </article>`;
   }
@@ -1204,6 +1227,8 @@ export function mountAnnotator(options = {}) {
    */
   function renderList() {
     const list = $('[data-el="list"]');
+    // 卡片上的「下一轮」徽标需要知道当前是否有轮次在身（含排队数）
+    state.roundQueued = roundScope().queued;
     const otherGroups = state.groups.filter(g => g && Array.isArray(g.tasks) && g.tasks.length);
     if (!state.tasks.length && !otherGroups.length) {
       list.innerHTML = '<p class="empty">还没有标注。点击“标注”后点选元素，或用“手动”添加任务。</p>';
@@ -2115,6 +2140,35 @@ export function mountAnnotator(options = {}) {
   }
 
   /**
+   * 归档本轮：把全部任务组里已完成（done/cancelled）的任务移入归档。
+   * 这是轮次的「交付」动作——验收通过后 100% 绿条常驻，由用户点此按钮
+   * （或下一轮复制提示词时自动）完成交付。只动已完成任务，
+   * 排队中的下一轮任务不受影响。
+   */
+  async function archiveRound() {
+    const groups = await fetchRemoteGroups();
+    let tasksArchived = 0;
+    for (const g of groups) {
+      const done = (g.tasks || []).filter(t => t.status === 'done' || t.status === 'cancelled');
+      if (!done.length) continue;
+      try {
+        const res = await fetch(`${config.endpoint}/archive`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ groupId: g.id }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (data.ok) tasksArchived += data.archived || 0;
+      } catch (error) {
+        setReceipt(`归档失败：${error.message}`, 6000);
+        return;
+      }
+    }
+    setReceipt(tasksArchived ? `本轮已交付：${tasksArchived} 项已归档。` : '没有可归档的任务。');
+    await loadRemoteTasks({ quiet: true });
+  }
+
+  /**
    * 复制处理提示词。
    *
    * 提示词不嵌入任务明细，只给出任务清单 JSON 的文件地址，
@@ -2136,9 +2190,32 @@ export function mountAnnotator(options = {}) {
     }
     const fallbackPath = saved?.absolutePath || saved?.relativePath || saved?.file || '';
 
+    // 轮次交付：上一轮已全部完成（done/cancelled）→ 自动归档。
+    // 注意：复制提示词**不定稿轮次**——复制之后、模型开始处理之前，用户仍可
+    // 继续新增需求；轮次在首个任务被置为 doing 时才定稿（见 store 的
+    // enlistIntoRound），定稿时文件里当时的待处理任务就是确定派发的集合。
+    let groups = null;
+    try {
+      groups = await fetchRemoteGroups();
+      const dispatched = groups.flatMap(g => g.tasks || []).filter(t => t.round != null);
+      if (dispatched.length && dispatched.every(t => t.status === 'done' || t.status === 'cancelled')) {
+        for (const g of groups) {
+          if (!(g.tasks || []).some(t => t.status === 'done' || t.status === 'cancelled')) continue;
+          await fetch(`${config.endpoint}/archive`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ groupId: g.id }),
+          });
+        }
+        groups = await fetchRemoteGroups();
+      }
+    } catch {
+      // 轮次操作失败不阻塞复制
+    }
+
     let pendingGroups = null;
     try {
-      pendingGroups = (await fetchRemoteGroups())
+      pendingGroups = (groups || [])
         // review 也算「还没收尾」：它等着主线程验收，不能从清单里漏掉，
         // 否则一旦有任务进入待验收，复制出的提示词就会把它们当作已完成而略过。
         .map(group => ({ ...group, pending: (group.tasks || []).filter(t => t.status === 'todo' || t.status === 'doing' || t.status === 'review') }))
@@ -2184,13 +2261,15 @@ export function mountAnnotator(options = {}) {
       const lines = ['请处理以下网页标注任务（项目跨多个页面，任务已按页面分成多个任务文件）：'];
       pendingGroups.forEach((group, index) => {
         const isCurrent = group.page?.url === pageUrl;
-        lines.push(`${index + 1}. 页面：${group.page?.title || group.page?.url || '未命名页面'}${isCurrent ? '（当前页面）' : ''}，待处理 ${group.pending.length} 项`);
+        // 不写「待处理 N 项」：复制之后、开始处理之前用户仍可继续加需求，
+        // 实际数量以子 agent 读取任务文件时为准。
+        lines.push(`${index + 1}. 页面：${group.page?.title || group.page?.url || '未命名页面'}${isCurrent ? '（当前页面）' : ''}`);
         lines.push(`   任务文件：${group.absolutePath || '（地址未知）'}`);
       });
       lines.push('');
-      lines.push('请依次参考这些任务文件中的待处理工作，进行处理。');
-      lines.push('改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。已验收通过的任务请进行归档。');
-      lines.push('请按任务文件并行处理：每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。子 agent 开始时把任务置为 doing，改完源码自测通过后自行把状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程浏览器复核后统一回写并归档。状态回写走标注接口（页面同源 /__zw-web-annotations），服务端已串行化，并发安全。');
+      lines.push('待处理项以任务文件内容为准（开始处理后新增的标注会自动排队下一轮，本轮无需处理）。');
+      lines.push('每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆；浏览器验收统一在主线程完成，避免多个 agent 抢占同一个标签页。');
+      lines.push('子 agent 开始时把任务置为 doing，改完源码自测通过后自行把状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程浏览器复核后统一回写并归档。状态回写走标注接口（页面同源 /__zw-web-annotations），服务端已串行化，并发安全。');
       prompt = lines.join('\n');
       summary = `覆盖 ${pendingGroups.length} 个页面的待处理任务`;
     }
@@ -2476,6 +2555,7 @@ export function mountAnnotator(options = {}) {
           }
         }
       } else if (act === 'copy') copyPrompt();
+      else if (act === 'archive-round') archiveRound();
       else if (act === 'manual') {
         openEditorForManual();
         state.syncMessage = '手动任务：可直接写要求，也可粘贴图片。';
@@ -3206,6 +3286,14 @@ const CSS_TEXT = `
 .panel .item-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .panel .item-foot code { color: #8f8f8f; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel .tag { flex: none; font-size: 10px; color: #8fd6a0; }
+/* 处理开始后新增的批注：琥珀描边（与待验收的状态标签区分开） */
+.panel .tag.queued { color: #c9a35a; border: 1px dashed #8a6d35; padding: 0 5px; border-radius: 4px; }
+/* 归档本轮按钮：仅在本轮 100% 完成时出现 */
+.progress-head .archive-btn {
+  border: 1px solid #4fbf7a; border-radius: 5px; padding: 2px 8px; cursor: pointer;
+  background: transparent; color: #6fd39a; font-family: inherit; font-size: 11px; font-weight: 600;
+}
+.progress-head .archive-btn:hover { background: #1f3d2b; }
 .panel .tag.warn { color: #d8a45a; }
 /* 待验收：代码已改、主线程还没验，用琥珀色与「已完成」的绿色区分开 */
 .panel .tag.review { color: #e0b464; }

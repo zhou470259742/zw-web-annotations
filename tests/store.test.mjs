@@ -624,3 +624,80 @@ test('a failed write does not block the following writes', async () => {
   const group = await store.readGroup(id);
   assert.equal(group.tasks[0].status, 'review', '前一个写失败后，后续写入仍应生效');
 });
+
+/* ---------------- 轮次（round）定稿与排队 ---------------- */
+
+/**
+ * 轮次定稿的时刻是「模型开始处理」（首个 doing 写入），不是复制提示词：
+ * 复制之后、开始处理之前，用户仍可继续新增需求——定稿时文件里的全部
+ * 待处理任务一并纳入本轮。
+ */
+test('first doing freezes the round: whole pending set joins at once', async () => {
+  const store = await tempStore();
+  const id = pageKey(page.url);
+  await store.appendTasks({ page, tasks: [
+    task({ id: 'task_A', element: { ...task().element, selector: '#a' } }),
+    task({ id: 'task_B', instruction: 'B', element: { ...task().element, selector: '#b' } }),
+  ] });
+
+  await store.updateTask(id, { taskId: 'task_A', status: 'doing' });
+
+  const group = await store.readGroup(id);
+  const a = group.tasks.find(t => t.id === 'task_A');
+  const b = group.tasks.find(t => t.id === 'task_B');
+  assert.equal(a.round, 1);
+  assert.equal(b.round, 1, '定稿时全部待处理任务一并纳入本轮（模型读取的就是这个集合）');
+  assert.equal(group.meta.round, 1);
+});
+
+test('annotations added after the freeze stay queued for the next round', async () => {
+  const store = await tempStore();
+  const id = pageKey(page.url);
+  await store.appendTasks({ page, tasks: [task({ instruction: '首轮', element: { ...task().element, selector: '#a' } })] });
+  await store.updateTask(id, { taskId: 'task_abc', status: 'doing' }); // 定稿
+
+  // 定稿之后新增的批注（模拟处理中新增标注）
+  await store.appendTasks({ page, tasks: [
+    task({ id: 'task_late', instruction: '后加的', element: { ...task().element, selector: '#late' } }),
+  ] });
+
+  const group = await store.readGroup(id);
+  const late = group.tasks.find(t => t.id === 'task_late');
+  assert.equal(late.round, undefined, '后加的批注不带轮次号（排队下一轮）');
+});
+
+test('a round-less task picked up mid-round joins the current round', async () => {
+  const store = await tempStore();
+  const id = pageKey(page.url);
+  await store.appendTasks({ page, tasks: [task({ instruction: '首轮', element: { ...task().element, selector: '#a' } })] });
+  await store.updateTask(id, { taskId: 'task_abc', status: 'doing' }); // 定稿，round=1
+  await store.appendTasks({ page, tasks: [
+    task({ id: 'task_late', instruction: '处理中新增', element: { ...task().element, selector: '#late' } }),
+  ] });
+
+  // 某 agent 实际接手了这条后加任务（置为 doing）→ 并入当前轮，进度如实反映
+  await store.updateTask(id, { taskId: 'task_late', status: 'doing' });
+  const group = await store.readGroup(id);
+  assert.equal(group.tasks.find(t => t.id === 'task_late').round, 1);
+});
+
+test('round numbering is monotonically increasing across rounds', async () => {
+  const store = await tempStore();
+  const id = pageKey(page.url);
+  await store.appendTasks({ page, tasks: [task({ instruction: 'r1', element: { ...task().element, selector: '#a' } })] });
+  await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
+  const first = (await store.readGroup(id)).tasks[0].round;
+
+  // 第一轮完成并归档，随后重新标注同一元素进入第二轮。
+  // fixture 必须在归档**之后**构造：真实用户是处理完成后才重新标注的，
+  // updatedAt 一定晚于归档副本；若在归档前构造（timestamp 早于 done 写入），
+  // 会被「防复活」正确拦下——那是另一条逻辑，不是本用例要测的。
+  await store.updateTask(id, { taskId: 'task_abc', status: 'done' });
+  await store.archiveTasks(id);
+  const fresh = { ...task({ instruction: 'r2', element: { ...task().element, selector: '#a' } }), updatedAt: new Date().toISOString() };
+  await store.appendTasks({ page, tasks: [fresh] });
+  await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
+  const second = (await store.readGroup(id)).tasks[0].round;
+
+  assert.ok(second > first, '第二轮的轮次号必须大于第一轮');
+});

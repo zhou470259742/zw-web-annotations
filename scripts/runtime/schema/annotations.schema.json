@@ -3,106 +3,345 @@
   "title": "AI agent Web Annotation Group",
   "type": "object",
   "additionalProperties": false,
-  "required": ["version", "id", "createdAt", "updatedAt", "page", "tasks"],
+  "required": [
+    "version",
+    "id",
+    "createdAt",
+    "updatedAt",
+    "page",
+    "tasks"
+  ],
   "properties": {
-    "version": { "type": "string", "const": "1.0" },
-    "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
-    "createdAt": { "type": "string", "format": "date-time" },
-    "updatedAt": { "type": "string", "format": "date-time" },
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updatedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
     "page": {
-      "type": "object", "additionalProperties": false, "required": ["url", "title", "capturedAt"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "url",
+        "title",
+        "capturedAt"
+      ],
       "properties": {
-        "url": { "type": "string", "format": "uri" },
-        "title": { "type": "string" },
-        "capturedAt": { "type": "string", "format": "date-time" }
+        "url": {
+          "type": "string",
+          "format": "uri"
+        },
+        "title": {
+          "type": "string"
+        },
+        "capturedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
       }
     },
-    "tasks": { "type": "array", "items": { "$ref": "#/$defs/task" } }
+    "tasks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/task"
+      }
+    }
   },
   "$defs": {
     "task": {
-      "type": "object", "additionalProperties": false,
-      "required": ["id", "instruction", "status", "createdAt", "updatedAt", "history"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "instruction",
+        "status",
+        "createdAt",
+        "updatedAt",
+        "history"
+      ],
       "properties": {
-        "id": { "type": "string", "pattern": "^[A-Za-z0-9._-]+$" },
-        "seq": { "type": "integer", "minimum": 1, "description": "按添加时间分配的稳定编号，删除后不重排。" },
-        "instruction": { "type": "string", "description": "用户的调整要求；确认录入时保证非空。" },
-        "kind": { "type": "string", "enum": ["element", "manual"], "description": "element=点选网页元素；manual=手动添加的任务。" },
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "seq": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "按添加时间分配的稳定编号，删除后不重排。"
+        },
+        "instruction": {
+          "type": "string",
+          "description": "用户的调整要求；确认录入时保证非空。"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "element",
+            "manual"
+          ],
+          "description": "element=点选网页元素；manual=手动添加的任务。"
+        },
         "images": {
           "type": "array",
           "description": "图片附件。运行时把 dataUrl 落盘为文件并替换为 file 相对路径。",
           "items": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["id"],
+            "required": [
+              "id"
+            ],
             "properties": {
-              "id": { "type": "string" },
-              "name": { "type": "string" },
-              "file": { "type": "string" },
-              "bytes": { "type": "number" },
-              "width": { "type": "number" },
-              "height": { "type": "number" }
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "file": {
+                "type": "string"
+              },
+              "bytes": {
+                "type": "number"
+              },
+              "width": {
+                "type": "number"
+              },
+              "height": {
+                "type": "number"
+              }
             }
           }
         },
-        "status": { "type": "string", "enum": ["todo", "doing", "done", "blocked", "cancelled"] },
-        "createdAt": { "type": "string", "format": "date-time" },
-        "updatedAt": { "type": "string", "format": "date-time" },
-        "confirmedAt": { "type": ["string", "null"], "format": "date-time" },
-        "startedAt": { "type": ["string", "null"], "format": "date-time" },
-        "completedAt": { "type": ["string", "null"], "format": "date-time" },
-        "element": { "$ref": "#/$defs/element" },
-        "history": { "type": "array", "items": { "$ref": "#/$defs/history" } },
-        "result": { "type": ["string", "null"] }
+        "status": {
+          "type": "string",
+          "enum": [
+            "todo",
+            "doing",
+            "done",
+            "blocked",
+            "cancelled"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "confirmedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "startedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "completedAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "element": {
+          "$ref": "#/$defs/element"
+        },
+        "history": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/history"
+          }
+        },
+        "result": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reviewAt": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "待验收提交时刻"
+        },
+        "round": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "所属轮次号（复制/派发后定稿；处理开始后新增的批注为 null，排队下一轮）"
+        }
       }
     },
     "element": {
-      "type": "object", "additionalProperties": false, "required": ["tagName", "selector", "xpath", "text", "domSnippet", "rect"],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "tagName",
+        "selector",
+        "xpath",
+        "text",
+        "domSnippet",
+        "rect"
+      ],
       "properties": {
-        "tagName": { "type": "string" }, "accessibleName": { "type": "string" }, "text": { "type": "string" },
-        "id": { "type": "string" },
-        "classList": { "type": "array", "items": { "type": "string" } },
+        "tagName": {
+          "type": "string"
+        },
+        "accessibleName": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "classList": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "attributes": {
           "type": "object",
           "description": "元素的原始 HTML 属性（type/name/href/data-* 等）。语义性属性无法由标签名或计算样式推出，是判断表单元素身份的关键；value 因可能含用户输入被排除。"
         },
-        "selector": { "type": "string" },
-        "xpath": { "type": "string" },
-        "parentSummary": { "type": "string" },
-        "parentSelector": { "type": "string" },
+        "selector": {
+          "type": "string"
+        },
+        "xpath": {
+          "type": "string"
+        },
+        "parentSummary": {
+          "type": "string"
+        },
+        "parentSelector": {
+          "type": "string"
+        },
         "componentFile": {
           "type": "string",
           "description": "元素所属框架组件源文件的绝对路径（Vue 3 由 __vueParentComponent.type.__file 取得）。有值时优先打开该文件定位，比按类名在 src/ 里搜索可靠。非 Vue 环境为空串。"
         },
-        "componentName": { "type": "string", "description": "所属组件名，取不到时为空串。" },
+        "componentName": {
+          "type": "string",
+          "description": "所属组件名，取不到时为空串。"
+        },
         "domSnippet": {
           "type": "string",
           "description": "元素的 outerHTML 片段。超长时按标签边界截断并附「已截断」标记与完整长度，保证始终是合法 HTML，不会切在属性中间。"
         },
-        "rect": { "type": "object", "additionalProperties": false, "required": ["x", "y", "width", "height"], "properties": { "x": { "type": "number" }, "y": { "type": "number" }, "width": { "type": "number" }, "height": { "type": "number" } } },
+        "rect": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "properties": {
+            "x": {
+              "type": "number"
+            },
+            "y": {
+              "type": "number"
+            },
+            "width": {
+              "type": "number"
+            },
+            "height": {
+              "type": "number"
+            }
+          }
+        },
         "metrics": {
-          "type": ["object", "null"],
+          "type": [
+            "object",
+            "null"
+          ],
           "description": "仅当内容区尺寸与渲染尺寸不同（存在边框或滚动条）时才有值，此时含 clientWidth/clientHeight。",
           "additionalProperties": false,
-          "properties": { "clientWidth": { "type": "number" }, "clientHeight": { "type": "number" } }
+          "properties": {
+            "clientWidth": {
+              "type": "number"
+            },
+            "clientHeight": {
+              "type": "number"
+            }
+          }
         },
         "styles": {
           "type": "object",
           "description": "计算样式；这是继承后的最终值。font-family 未记录（恒为 body 的系统字体栈，无指导意义）。"
         },
-        "ownStyles": { "type": "array", "items": { "type": "string" }, "description": "styles 中由本元素自身规则声明的属性名。" },
+        "ownStyles": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "styles 中由本元素自身规则声明的属性名。"
+        },
         "inheritedStyles": {
-          "type": "array", "items": { "type": "string" },
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
           "description": "styles 中可继承、但本元素未声明的属性名——取值来自祖先。要改这些属性须改祖先规则或主题变量，改本元素选择器无效。"
         },
-        "frame": { "type": "string" },
-        "uniqueMatch": { "type": "boolean", "description": "selector 在页面中是否唯一命中。为 false 时说明该选择器有歧义，需结合其它线索区分。" },
-        "screenshot": { "type": ["string", "null"] }
+        "frame": {
+          "type": "string"
+        },
+        "uniqueMatch": {
+          "type": "boolean",
+          "description": "selector 在页面中是否唯一命中。为 false 时说明该选择器有歧义，需结合其它线索区分。"
+        },
+        "screenshot": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       }
     },
     "history": {
-      "type": "object", "additionalProperties": false, "required": ["at", "event"],
-      "properties": { "at": { "type": "string", "format": "date-time" }, "event": { "type": "string" }, "detail": { "type": "string" } }
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "at",
+        "event"
+      ],
+      "properties": {
+        "at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      }
     }
   }
 }

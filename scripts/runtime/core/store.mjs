@@ -25,7 +25,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.21.0';
+export const RUNTIME_VERSION = '0.22.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -332,6 +332,93 @@ export function createStore(workspace, options = {}) {
 
   const archiveFileFor = id => path.join(archiveDir, `${safeId(id)}.json`);
 
+  /**
+   * 历史最大轮次号：活动组 + 归档一起扫。
+   * 归档也要计入——归档会删除组文件，若计数器只看活动组，
+   * 交付完成后轮次号会回退（实测第二轮又从 1 开始）。
+   */
+  const maxRoundEver = async () => {
+    let max = 0;
+    const consider = t => { if (Number.isFinite(t?.round)) max = Math.max(max, t.round); };
+    for (const g of await listGroups()) {
+      for (const t of g.tasks) consider(t);
+      consider({ round: g.meta?.round });
+    }
+    try {
+      const names = (await fs.readdir(archiveDir)).filter(n => n.endsWith('.json'));
+      for (const name of names) {
+        try {
+          const raw = JSON.parse(await fs.readFile(path.join(archiveDir, name), 'utf8'));
+          for (const t of raw.tasks || []) consider(t);
+          consider({ round: raw.meta?.round });
+        } catch {
+          // 单个损坏的归档文件不计入，但不能中断整体
+        }
+      }
+    } catch {
+      // 归档目录不存在时没有可扫描的归档
+    }
+    return max;
+  };
+
+  /**
+   * 轮次（round）的定稿与并入。
+   *
+   * 轮次的定稿时刻是「模型开始处理任务」——本系统里可观察的信号是第一次
+   * 状态写入 doing（模型直接读取任务文件，服务端感知不到那次读取）。
+   * 定稿时，任务文件里当时的全部待处理任务就是确定派发的集合，一并纳入
+   * 本轮；**在此之后新增的批注不带轮次号，自动排队下一轮**。
+   *
+   * 已有进行中的轮次时（存在 doing/review 的已派发任务），个别任务开始推进
+   * 则并入当前轮次——它确实正在被处理，进度应当如实反映。
+   *
+   * ⚠️ 调用约定：本函数只写 **currentGroup 之外的组**。currentGroup 的任务
+   * 由调用方（updateTask 等）在自己那份「读—改—写」里一并打标并写回——
+   * 若这里也写 currentGroup，调用方稍后用自己的旧快照整份写回，会把本次
+   * 定稿覆盖掉（实测 round 字段因此丢失）。
+   *
+   * 返回 { round, froze }：froze=true 表示本次是「定稿」（开启了新一轮），
+   * 调用方需把当前组内其余待处理任务一并打上同一轮次号。
+   */
+  const resolveRound = async (exceptGroupId, pendingTasks) => {
+    const groups = await listGroups();
+    let inFlight = false;
+    for (const g of groups) {
+      for (const t of g.tasks) {
+        if ((t.status === 'doing' || t.status === 'review') && Number.isFinite(t.round)) inFlight = true;
+      }
+      if (g.id === exceptGroupId) {
+        for (const t of pendingTasks || []) {
+          if ((t.status === 'doing' || t.status === 'review') && Number.isFinite(t.round)) inFlight = true;
+        }
+      }
+    }
+    // 轮次号必须连归档一起扫：归档会删除组文件，若只看活动组，
+    // 交付完成后计数器回退（实测第二轮又从 1 开始）
+    const max = await maxRoundEver();
+    // 有在途任务：并入当前轮次（它正在被处理，进度应如实计入）
+    if (inFlight) return { round: max, froze: false };
+    // 定稿：开启新一轮，把**其它组**里尚未分派的待处理任务一并纳入
+    const round = max + 1;
+    for (const g of groups) {
+      if (g.id === exceptGroupId) continue;
+      let changed = false;
+      for (const t of g.tasks) {
+        if (t.round == null && (t.status === 'todo' || t.status === 'doing')) {
+          t.round = round;
+          t.history.push({ at: nowIso(), event: 'round_assigned', detail: `第 ${round} 轮` });
+          changed = true;
+        }
+      }
+      if (changed) {
+        g.meta = { ...(g.meta || {}), round };
+        g.updatedAt = nowIso();
+        await writeGroup(g);
+      }
+    }
+    return { round, froze: true };
+  };
+
   /** 读取某任务组的归档索引（task id → 已归档任务）。目录不存在或文件损坏时视为空。 */
   const readArchiveTasks = async groupId => {
     const byId = new Map();
@@ -501,6 +588,26 @@ export function createStore(workspace, options = {}) {
       // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
       if (patch.status === 'review') task.reviewAt = at;
       if (patch.status === 'done') task.completedAt = at;
+      // 没有轮次号的任务一旦开始推进（模型派发时读取的就是当时文件里的
+      // 任务集合），自动定稿/并入轮次，保证进度条能跟踪到它。
+      if (!task.round && (patch.status === 'doing' || patch.status === 'review')) {
+        // 顺序：先解析轮次号（可能写其它组的文件），再把本组内的待处理任务
+        // 一并打标——它们随后随本函数的 writeGroup 一次性落盘。
+        const { round, froze } = await resolveRound(groupId, group.tasks);
+        task.round = round;
+        task.history.push({ at, event: 'round_assigned', detail: `第 ${round} 轮` });
+        if (froze) {
+          // 定稿：本组内其余无轮次的待处理任务一并纳入（同一份写回，
+          // 避免被本函数稍后的整份写回覆盖）。并入轮次时其余任务不动。
+          for (const t of group.tasks) {
+            if (t !== task && t.round == null && (t.status === 'todo' || t.status === 'doing')) {
+              t.round = round;
+              t.history.push({ at, event: 'round_assigned', detail: `第 ${round} 轮` });
+            }
+          }
+          group.meta = { ...(group.meta || {}), round };
+        }
+      }
     }
     if (typeof patch.result === 'string' && patch.result !== task.result) {
       task.result = patch.result;
