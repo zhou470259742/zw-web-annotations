@@ -19,10 +19,51 @@
 const STATUS_LABELS = {
   todo: '待处理',
   doing: '进行中',
+  // 子 agent 改完源码、等主线程验收。与 done 的区别是「代码已改但还没验」：
+  // 主线程验收通过后再回写 done，进度条的最后一段才会推进。
+  review: '待验收',
   done: '已完成',
   blocked: '已阻塞',
   cancelled: '已取消',
 };
+
+/**
+ * 总体进度权重（百分比）。
+ *
+ * 需求原文是「分派 10% + 开发 70% + 验收 30%」，但三者相加为 110%，
+ * 进度条会溢出。这里把验收压到 20% 使总和为 100——之所以动验收而不是动开发，
+ * 是因为需求里给了「7 个小任务每完成 1 个增加 10%」这个明确例子，
+ * 只有开发占 70% 才能让每项正好 +10%，破坏它用户一眼就能看出不对。
+ * 分派是一次性关卡（有任务离开 todo 即算完成整个 10%），不按比例摊薄，
+ * 否则每个任务的涨幅就不再是整数 10%。
+ */
+export const PROGRESS_WEIGHTS = { dispatch: 10, dev: 70, verify: 20 };
+
+/**
+ * 项目总体进度。
+ *
+ * 三段按「已达成该阶段的任务数 / 有效任务数」计分：
+ * - 分派：任一任务离开 todo 即得满分 10%（它是关卡，不是斜坡）；
+ * - 开发：到达 review 或 done 即算开发完成，每项贡献 70/total；
+ * - 验收：只有 done 才算验收通过，每项贡献 20/total。
+ * cancelled 不计入分母——用户主动取消的任务不该把进度永远压住。
+ */
+export function computeProgress(tasks = []) {
+  const active = (Array.isArray(tasks) ? tasks : []).filter(t => t && t.status !== 'cancelled');
+  const total = active.length;
+  const counts = {};
+  for (const t of active) counts[t.status] = (counts[t.status] || 0) + 1;
+  if (!total) return { percent: 0, total: 0, counts, started: 0, devDone: 0, verified: 0 };
+  const started = total - (counts.todo || 0);
+  const devDone = (counts.review || 0) + (counts.done || 0);
+  const verified = counts.done || 0;
+  const percent = Math.round(
+    (started > 0 ? PROGRESS_WEIGHTS.dispatch : 0)
+      + PROGRESS_WEIGHTS.dev * (devDone / total)
+      + PROGRESS_WEIGHTS.verify * (verified / total),
+  );
+  return { percent, total, counts, started, devDone, verified };
+}
 
 const HOST_ID = 'zw-annotation-host';
 const SOURCE = 'zw-web-annotations';
@@ -523,6 +564,17 @@ export function mountAnnotator(options = {}) {
         <button type="button" class="primary" data-act="copy" title="复制处理提示词">复制提示词</button>
         <button type="button" class="ghost-danger push-right" data-act="clear" title="清空全部标注">清空</button>
       </div>
+      <!-- 总体进度：分派 10% + 开发 70% + 验收 20%，跨越所有页面统计。
+           放在操作区下方、列表上方——用户点开面板第一眼就想知道"改到哪了"。 -->
+      <div class="panel-progress" data-el="progress">
+        <div class="progress-head">
+          <span class="progress-label" data-el="progressLabel"></span>
+          <span class="progress-pct" data-el="progressPct"></span>
+        </div>
+        <div class="progress-track" title="">
+          <div class="progress-fill" data-el="progressFill"></div>
+        </div>
+      </div>
       <div class="panel-list" data-el="list"></div>
       <footer><span class="panel-msg" data-el="msg"></span></footer>
     </section>
@@ -874,6 +926,31 @@ export function mountAnnotator(options = {}) {
     $('[data-el="dockDot"]').dataset.active = state.active ? 'on' : 'off';
   }
 
+  /**
+   * 总体进度条。统计范围是**整个项目**（当前页 + 其它页面的全部任务），
+   * 因为用户关心的是「这批活干完多少」，而不是当前页那几项。
+   */
+  function renderProgress() {
+    const all = [
+      ...state.tasks,
+      ...state.groups.flatMap(g => (Array.isArray(g?.tasks) ? g.tasks : [])),
+    ].filter(t => t && t.id);
+    const p = computeProgress(all);
+    const fill = $('[data-el="progressFill"]');
+    const track = fill.parentElement;
+    fill.style.width = `${p.percent}%`;
+    $('[data-el="progressPct"]').textContent = p.total ? `${p.percent}%` : '';
+    $('[data-el="progressLabel"]').textContent = p.total
+      ? `待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
+      : '还没有任务';
+    track.title = p.total
+      ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
+        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）`
+      : '';
+    // 全部完成时换成绿色，作为「这批活收工」的收尾信号
+    fill.dataset.done = p.total && p.percent >= 100 ? 'on' : 'off';
+  }
+
   function renderPanelMeta() {
     const filled = state.tasks.filter(t => String(t.instruction || '').trim()).length;
     const otherTotal = state.groups.reduce((sum, g) => sum + ((g.tasks || []).length), 0);
@@ -888,6 +965,8 @@ export function mountAnnotator(options = {}) {
     const toggle = $('[data-el="toggleBtn"]');
     toggle.textContent = state.active ? '结束' : '标注';
     toggle.dataset.active = state.active ? 'on' : 'off';
+    // 进度与元信息同源（都依赖任务列表），一并刷新，避免两处各自漏调
+    renderProgress();
   }
 
   /**
@@ -998,7 +1077,10 @@ export function mountAnnotator(options = {}) {
       : `${truncate(task.element.selector, 40)} · ${task.element.rect.width}×${task.element.rect.height}`;
     // doing = 已被处理者领取、正在改代码。此时锁住不可改不可删：
     // 中途换指令或删任务，会让处理者回写的 done/结果与记录对不上。
+    // review（待验收）**不锁**：代码已改完等验收，用户此时看到效果想补一句
+    // 或删掉它都是合理的；锁住会让改动静默失效，比放行更糟。
     const locked = task.status === 'doing';
+    const review = task.status === 'review';
     const thumbs = (task.images || []).length
       ? `<div class="item-thumbs">${task.images
           .map(img => (img.dataUrl ? `<img src="${img.dataUrl}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`))
@@ -1021,7 +1103,7 @@ export function mountAnnotator(options = {}) {
       </label>
       <div class="item-foot">
         <code>${escapeHtml(sub)}</code>
-        <span class="tag${empty ? ' warn' : ''}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>
+        <span class="tag${empty ? ' warn' : review ? ' review' : ''}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>
       </div>
     </article>`;
   }
@@ -1030,6 +1112,9 @@ export function mountAnnotator(options = {}) {
   function renderGroupSection({ id, current, title, path, tasks }) {
     const open = isGroupOpen(id, current);
     const doing = tasks.filter(t => t.status === 'doing').length;
+    // 待验收单独标出：它是「子 agent 交活了、等人看」的状态，
+    // 混在总数里用户看不出这页有没有东西等着自己确认。
+    const review = tasks.filter(t => t.status === 'review').length;
     const body = tasks.length
       ? tasks.map((task, index) => taskCardHtml(task, index, current)).join('')
       : '<p class="empty">当前页面暂无标注。</p>';
@@ -1039,6 +1124,7 @@ export function mountAnnotator(options = {}) {
           <span class="group-chevron" data-open="${open ? 'on' : 'off'}">▶</span>
           <span class="group-name">${escapeHtml(truncate(title || '未命名页面', 16))}</span>
           ${current ? '<span class="group-badge">当前</span>' : ''}
+          ${review ? `<span class="group-badge review" title="${review} 项待验收">待验${review}</span>` : ''}
           <span class="group-sub">${escapeHtml(truncate(path, 24))}</span>
           <span class="group-count">${tasks.length}${doing ? ` · 🔒${doing}` : ''}</span>
         </header>
@@ -1603,6 +1689,14 @@ export function mountAnnotator(options = {}) {
       veil.classList.remove('on');
       return;
     }
+    // 手动任务不加任何遮罩：这个弹窗的典型用法是「截个图粘进来」，
+    // 遮罩会把要截的页面压暗，截出来的图自带一层灰。而且手动任务本来
+    // 就没有可聚焦的目标元素，挖孔高亮无从谈起。
+    if (state.manualMode || (!state.editingId && !state.pendingElement)) {
+      spotlight.classList.remove('on');
+      veil.classList.remove('on');
+      return;
+    }
     const el = (() => {
       const selector = focusSelectorForEditor();
       return selector ? resolveElement(selector) : null;
@@ -1967,7 +2061,9 @@ export function mountAnnotator(options = {}) {
     let pendingGroups = null;
     try {
       pendingGroups = (await fetchRemoteGroups())
-        .map(group => ({ ...group, pending: (group.tasks || []).filter(t => t.status === 'todo' || t.status === 'doing') }))
+        // review 也算「还没收尾」：它等着主线程验收，不能从清单里漏掉，
+        // 否则一旦有任务进入待验收，复制出的提示词就会把它们当作已完成而略过。
+        .map(group => ({ ...group, pending: (group.tasks || []).filter(t => t.status === 'todo' || t.status === 'doing' || t.status === 'review') }))
         .filter(group => group.pending.length);
     } catch {
       // 组列表读不到时退回单文件提示词：当前页任务刚刚同步成功，地址可靠
@@ -1987,7 +2083,8 @@ export function mountAnnotator(options = {}) {
     const singleFilePrompt = jsonPath =>
       [
         `请参考 ${jsonPath} 中的待处理工作，进行处理。`,
-        '处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。',
+        '改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。',
+        '已验收通过的任务请进行归档。',
         '同一任务文件是唯一写入目标：如需并行，请由主线程统一回写任务状态，子 agent 只负责改源码并回报结果，且不要让多个 agent 同时改同一份源码。',
       ].join('\n');
 
@@ -2014,7 +2111,7 @@ export function mountAnnotator(options = {}) {
       });
       lines.push('');
       lines.push('请依次参考这些任务文件中的待处理工作，进行处理。');
-      lines.push('处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。');
+      lines.push('改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。已验收通过的任务请进行归档。');
       lines.push('请按任务文件并行处理：每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。子 agent 只修改自己页面的源码，并回报改动的文件与验证证据；浏览器验收请统一在主线程完成，避免多个 agent 抢占同一个标签页。');
       prompt = lines.join('\n');
       summary = `覆盖 ${pendingGroups.length} 个页面的待处理任务`;
@@ -2399,7 +2496,9 @@ export function mountAnnotator(options = {}) {
       const el = resolveElement(selector);
       if (!el) throw new Error(`element not found: ${selector}`);
       const element = describeElement(el);
-      const existing = state.tasks.find(t => t.element.selector === element.selector);
+      // 手动任务的 element 为 null，直接取 .selector 会抛 TypeError，
+      // 导致页面上只要有一条手动任务，api.add 就再也标不了元素。
+      const existing = state.tasks.find(t => t.element?.selector === element.selector);
       if (existing) {
         if (instruction != null) {
           existing.instruction = instruction;
@@ -2425,7 +2524,9 @@ export function mountAnnotator(options = {}) {
       const el = resolveElement(selector);
       if (!el) throw new Error(`element not found: ${selector}`);
       const element = describeElement(el);
-      const existing = state.tasks.find(t => t.element.selector === element.selector);
+      // 手动任务的 element 为 null，直接取 .selector 会抛 TypeError，
+      // 导致页面上只要有一条手动任务，api.add 就再也标不了元素。
+      const existing = state.tasks.find(t => t.element?.selector === element.selector);
       if (existing) {
         openEditorFor(existing.id);
         return { mode: 'edit', id: existing.id };
@@ -2878,6 +2979,28 @@ const CSS_TEXT = `
 /* 清空是危险操作，推到最右侧与常用操作拉开距离 */
 .panel-tools button.push-right { margin-left: auto; }
 .panel-list { flex: 1; overflow: auto; padding: 6px 9px 9px; }
+
+/* ---- 总体进度条 ---- */
+/* 三段权重（分派 10 / 开发 70 / 验收 20）已折算进 fill 的宽度，条上不再分段，
+   避免用户误以为每一段可单独点击或拖拽。 */
+.panel-progress { padding: 8px 11px 9px; border-bottom: 1px solid #333; }
+.progress-head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
+  margin-bottom: 6px;
+}
+.progress-label { color: #9a9a9a; font-size: 11px; }
+.progress-pct { color: #dedaff; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.progress-track {
+  position: relative; height: 6px; border-radius: 999px;
+  background: #2b2b2b; overflow: hidden;
+}
+.progress-fill {
+  height: 100%; width: 0; border-radius: 999px;
+  background: linear-gradient(90deg, #6f7cf0, #9a7cf0);
+  transition: width .28s ease, background .28s ease;
+}
+/* 全部验收通过：整条转绿，作为收尾信号 */
+.progress-fill[data-done="on"] { background: linear-gradient(90deg, #4fbf7a, #6fd39a); }
 /* ---- 内部滚动条统一美化：默认浅色滚动条在深色面板上不搭。
    规则只作用于组件 Shadow DOM 内部，页面自身的滚动条不受影响。 ---- */
 *::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -2928,6 +3051,8 @@ const CSS_TEXT = `
 .panel .item-foot code { color: #8f8f8f; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .panel .tag { flex: none; font-size: 10px; color: #8fd6a0; }
 .panel .tag.warn { color: #d8a45a; }
+/* 待验收：代码已改、主线程还没验，用琥珀色与「已完成」的绿色区分开 */
+.panel .tag.review { color: #e0b464; }
 .panel button.link { border: 0; background: none; cursor: pointer; padding: 0; color: #c9c9c9; font: inherit; }
 .panel button.link.danger { color: #e07a7a; font-size: 12px; }
 /* 处理中的任务：整条降饱和 + 输入框禁改，明确传达「已锁定，别动」 */
@@ -2961,6 +3086,8 @@ const CSS_TEXT = `
   flex: none; padding: 0 5px; border-radius: 999px;
   background: #dedaff; color: #29215e; font-size: 9px; font-weight: 700;
 }
+/* 「当前」用靛蓝、待验收用琥珀，避免两个徽标同色分不清含义 */
+.group-badge.review { background: #4a3a1c; color: #e8c176; }
 .group-sub {
   flex: 1; min-width: 0; color: #6f6f6f; font-size: 10px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

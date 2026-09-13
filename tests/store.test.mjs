@@ -477,3 +477,75 @@ test('store notifies onChange after every task mutation (doing 锁照常生效)'
   await store.removeTasks(pageKey(page.url), { all: true });
   assert.equal(calls, 4);
 });
+
+/* ---------------- 待验收（review）状态 ---------------- */
+
+test('updateTask accepts review and records reviewAt without completing', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+
+  const { task: t2 } = await store.updateTask(id, { taskId: 'task_abc', status: 'review', result: '已改 Home.vue:3' });
+
+  assert.equal(t2.status, 'review');
+  assert.ok(t2.reviewAt, '待验收应记录提交时刻');
+  assert.equal(t2.completedAt, null, '待验收不等于完成，不能写 completedAt');
+  assert.ok(t2.history.some(h => h.event === 'status_changed' && h.detail === 'review'));
+});
+
+test('review then done completes the task and keeps both timestamps', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+
+  await store.updateTask(id, { taskId: 'task_abc', status: 'review' });
+  const { task: t2 } = await store.updateTask(id, { taskId: 'task_abc', status: 'done' });
+
+  assert.equal(t2.status, 'done');
+  assert.ok(t2.reviewAt, '验收过程不应抹掉提交时刻');
+  assert.ok(t2.completedAt);
+});
+
+/**
+ * 待验收的任务被改了要求：已改的代码是按旧要求做的，不再作数，
+ * 必须退回 todo 重新走一遍。否则进度条会一直把这份「开发完成」算进去，
+ * 而它对应的需求其实已经变了。
+ */
+test('changing the instruction of a review task sends it back to todo', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task({ instruction: '改成：登录' })] });
+  const id = pageKey(page.url);
+  await store.updateTask(id, { taskId: 'task_abc', status: 'review' });
+
+  const synced = await store.appendTasks({ page, tasks: [task({ instruction: '改成：注册' })] });
+  const t2 = synced.group.tasks[0];
+
+  assert.equal(t2.instruction, '改成：注册', '待验收的任务允许改要求');
+  assert.equal(t2.status, 'todo', '需求变了就得重做，不能继续算作已完成');
+  assert.equal(t2.reviewAt, null, '退回后清掉提交时刻');
+  assert.ok(
+    t2.history.some(h => h.event === 'status_changed' && h.detail === 'todo' && h.reason === 'instruction changed'),
+    '退回原因要留在历史里，便于回溯',
+  );
+});
+
+test('a review task keeps its status when the instruction is unchanged', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task({ instruction: '改成：登录' })] });
+  const id = pageKey(page.url);
+  await store.updateTask(id, { taskId: 'task_abc', status: 'review' });
+
+  const synced = await store.appendTasks({ page, tasks: [task({ instruction: '改成：登录' })] });
+  assert.equal(synced.group.tasks[0].status, 'review', '重同步同一内容不得把待验收打回待处理');
+});
+
+test('a done task is not resurrected by re-sync after a review round trip', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+  await store.updateTask(id, { taskId: 'task_abc', status: 'review' });
+  await store.updateTask(id, { taskId: 'task_abc', status: 'done' });
+
+  const synced = await store.appendTasks({ page, tasks: [task()] });
+  assert.equal(synced.group.tasks[0].status, 'done', 'done 不得被浏览器同步冲回 todo');
+});

@@ -3,7 +3,7 @@ import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-export const STATUSES = ['todo', 'doing', 'done', 'blocked', 'cancelled'];
+export const STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'cancelled'];
 export const STATUS_SET = new Set(STATUSES);
 export const MAX_BODY_BYTES = 24 * 1024 * 1024;
 /**
@@ -25,7 +25,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.15.0';
+export const RUNTIME_VERSION = '0.16.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -397,6 +397,16 @@ export function createStore(workspace, options = {}) {
           if (incoming.instruction !== existing.instruction) {
             existing.history.push({ at, event: 'instruction_updated', detail: incoming.instruction });
             existing.instruction = incoming.instruction;
+            // 待验收的任务被改了要求：已改的代码是按旧要求做的，不再作数。
+            // 必须退回 todo 重新走一遍，否则进度条会把这份「开发完成」
+            // 一直算作已完成，而实际上它对应的需求已经变了。
+            // 注意 review 不像 doing 那样锁指令——锁住会让用户新写的要求
+            // 静默失效（元素上还挂着图钉，人却看不到改动），那是更糟的失败。
+            if (existing.status === 'review') {
+              existing.status = 'todo';
+              existing.reviewAt = null;
+              existing.history.push({ at, event: 'status_changed', detail: 'todo', reason: 'instruction changed' });
+            }
           }
         }
         // 职责划分：任务「内容」（element/instruction）由浏览器拥有，
@@ -462,6 +472,8 @@ export function createStore(workspace, options = {}) {
       task.status = patch.status;
       task.history.push({ at, event: 'status_changed', detail: patch.status });
       if (patch.status === 'doing') task.startedAt = task.startedAt || at;
+      // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
+      if (patch.status === 'review') task.reviewAt = at;
       if (patch.status === 'done') task.completedAt = at;
     }
     if (typeof patch.result === 'string' && patch.result !== task.result) {
