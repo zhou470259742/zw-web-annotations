@@ -25,7 +25,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.18.1';
+export const RUNTIME_VERSION = '0.19.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -238,6 +238,32 @@ export function createStore(workspace, options = {}) {
     } catch {
       /* 通知失败不影响数据 */
     }
+  };
+
+  /**
+   * 写操作串行队列。
+   *
+   * 每个变更都是「读文件 → 改内存 → 写回整份文件」，中间没有任何版本校验。
+   * 两个变更并发时会各自基于同一份旧快照写回，后写的把先写的成果整个覆盖——
+   * 典型场景是用户正标注时子 agent 回写状态：一次并发就可能让 agent 的 review
+   * 被回退成 doing（实测 30/30），或让用户刚加的标注整条消失（实测低频但存在）。
+   * 这两种后果分别是「处理者工作标记丢失」和「用户输入丢失」，都不可接受。
+   *
+   * 因此把所有变更串到一条 promise 链上，使「读—改—写」成为临界区。
+   * 用**全局**单条队列而不是按 groupId 分锁：pruneAttachments 会扫描全部任务组
+   * 与归档来决定附件保活，跨组操作与单组写入并发时仍会误删附件。
+   * 本机小文件写入是毫秒级，全局串行的代价可忽略。
+   *
+   * 边界：这只覆盖**同一进程内**的并发。若另有进程（如另一个 agent 直接改 JSON）
+   * 同时写同一文件，需要跨进程文件锁，不在本队列职责内。
+   */
+  let writeChain = Promise.resolve();
+  const queueWrite = fn => {
+    // 前一个写失败也不能堵塞队列，因此两个分支都继续执行下一个
+    const result = writeChain.then(() => fn(), () => fn());
+    // 链上只保留「是否结束」，避免异常沿链冒泡成未处理的 rejection
+    writeChain = result.then(() => undefined, () => undefined);
+    return result;
   };
 
   /**
@@ -709,6 +735,9 @@ export function createStore(workspace, options = {}) {
     return { purged, filesRemoved, attachmentsRemoved };
   };
 
+  // 写操作在**对外边界**统一排队，内部实现之间仍直连（见上方 queueWrite 注释）。
+  // 只包对外这几个：内部 appendTasks 会调 writeGroup，若把内部调用也排队，
+  // 就会在等待自己所属的那个队列任务时自我死锁。
   return {
     workspace: root,
     taskDir,
@@ -716,13 +745,13 @@ export function createStore(workspace, options = {}) {
     archiveDir,
     fileFor,
     readGroup,
-    writeGroup,
+    writeGroup: group => queueWrite(() => writeGroup(group)),
     listGroups,
-    appendTasks,
-    updateTask,
-    removeTasks,
-    archiveTasks,
-    purgeArchive,
+    appendTasks: input => queueWrite(() => appendTasks(input)),
+    updateTask: (groupId, patch) => queueWrite(() => updateTask(groupId, patch)),
+    removeTasks: (groupIdOrUrl, options) => queueWrite(() => removeTasks(groupIdOrUrl, options)),
+    archiveTasks: (groupIdOrUrl, options) => queueWrite(() => archiveTasks(groupIdOrUrl, options)),
+    purgeArchive: (groupIdOrUrl, options) => queueWrite(() => purgeArchive(groupIdOrUrl, options)),
     groupIdForPage,
     pruneAttachments,
     persistAttachments,

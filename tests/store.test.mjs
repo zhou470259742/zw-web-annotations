@@ -549,3 +549,78 @@ test('a done task is not resurrected by re-sync after a review round trip', asyn
   const synced = await store.appendTasks({ page, tasks: [task()] });
   assert.equal(synced.group.tasks[0].status, 'done', 'done 不得被浏览器同步冲回 todo');
 });
+
+/* ---------------- 并发写串行化 ---------------- */
+
+/**
+ * 回归：用户标注与子 agent 回写状态并发的丢写。
+ *
+ * 每个变更原本是「读文件 → 改内存 → 写回整份文件」，无版本校验。并发时
+ * 两者基于同一份旧快照各写各的，后写的覆盖先写的——实测 30/30 会让 agent
+ * 回写的 done 被回退成 doing（另有一种较低频的失败是用户新标注整条消失）。
+ * 修复方式是把对外写操作串到同一条 promise 链上（见 store.mjs queueWrite）。
+ */
+test('concurrent updateTask and appendTasks do not lose each other\'s writes', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task({ instruction: '改A', status: 'doing' })] });
+  const id = pageKey(page.url);
+
+  // 模拟「agent 回写 done」与「用户新增标注 B」几乎同时到达
+  await Promise.all([
+    store.updateTask(id, { taskId: 'task_abc', status: 'done', result: 'A 改完了' }),
+    store.appendTasks({
+      page,
+      tasks: [
+        task({ instruction: '改A', status: 'doing' }),
+        task({ id: 'task_new', instruction: '新增B', element: { ...task().element, selector: '#new' } }),
+      ],
+    }),
+  ]);
+
+  const group = await store.readGroup(id);
+  const a = group.tasks.find(t => t.id === 'task_abc');
+  const b = group.tasks.find(t => t.id === 'task_new');
+
+  assert.equal(a.status, 'done', 'agent 回写的 done 不得被并发的 append 回退');
+  assert.ok(a.result, 'agent 写的结果不得丢失');
+  assert.ok(b, '用户并发新增的标注不得被吞掉');
+  assert.equal(b.instruction, '新增B');
+});
+
+/** 反复并发，确认串行化稳定（单次通过可能只是调度巧合）。 */
+test('write serialization holds across repeated concurrent rounds', async () => {
+  const store = await tempStore();
+  const id = pageKey(page.url);
+  await store.appendTasks({ page, tasks: [task({ instruction: '改A' })] });
+
+  for (let round = 0; round < 12; round++) {
+    await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
+    await Promise.all([
+      store.updateTask(id, { taskId: 'task_abc', status: 'done' }),
+      store.appendTasks({ page, tasks: [task({ instruction: '改A', status: 'doing' })] }),
+    ]);
+    const group = await store.readGroup(id);
+    assert.equal(
+      group.tasks.find(t => t.id === 'task_abc').status,
+      'done',
+      `第 ${round + 1} 轮并发后状态被回退`,
+    );
+    await store.updateTask(id, { taskId: 'task_abc', status: 'todo' });
+  }
+});
+
+/** 队列不能让失败卡住后续写入：前一个写抛错后，后面的仍要正常完成。 */
+test('a failed write does not block the following writes', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+
+  const failed = store.updateTask(id, { taskId: '不存在的任务', status: 'done' }).catch(e => e);
+  const ok = store.updateTask(id, { taskId: 'task_abc', status: 'review' });
+  // 两个都要先 await：队列是异步的，读文件必须等后续写入真正落盘。
+  await failed;
+  await ok;
+
+  const group = await store.readGroup(id);
+  assert.equal(group.tasks[0].status, 'review', '前一个写失败后，后续写入仍应生效');
+});
