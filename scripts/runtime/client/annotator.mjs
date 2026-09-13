@@ -1889,7 +1889,7 @@ export function mountAnnotator(options = {}) {
       [
         `请参考 ${jsonPath} 中的待处理工作，进行处理。`,
         '处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。',
-        '如果工作内容较多，请合理通过多 agent 进行并行处理。',
+        '同一任务文件是唯一写入目标：如需并行，请由主线程统一回写任务状态，子 agent 只负责改源码并回报结果，且不要让多个 agent 同时改同一份源码。',
       ].join('\n');
 
     let prompt;
@@ -1917,7 +1917,7 @@ export function mountAnnotator(options = {}) {
       lines.push('');
       lines.push('请依次参考这些任务文件中的待处理工作，进行处理。');
       lines.push('处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。');
-      lines.push('如果工作内容较多，请合理通过多 agent 进行并行处理。');
+      lines.push('请按任务文件并行处理：每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。子 agent 只修改自己页面的源码，并回报改动的文件与验证证据；浏览器验收请统一在主线程完成，避免多个 agent 抢占同一个标签页。');
       prompt = lines.join('\n');
       summary = `覆盖 ${pendingGroups.length} 个页面的待处理任务`;
     }
