@@ -52,7 +52,7 @@ export const META_FILE = `${WORK_ROOT}/install.json`;
  * 项目就静默停留在旧代码上。
  */
 export const SKILL_NAME = 'zcode-web-annotations';
-export const SKILL_VERSION = '0.10.8';
+export const SKILL_VERSION = '0.11.0';
 
 /**
  * 任务目录。
@@ -566,6 +566,113 @@ export async function installProject(projectRoot, options = {}) {
       recommendation: detected.recommendation,
       entryCandidates: detected.frontend.entryCandidates,
     },
+  };
+}
+
+/** 语义化版本比较：a<b 返回 -1，a>b 返回 1，相等返回 0。只比较数字段。 */
+export function compareVersions(a, b) {
+  const pa = String(a || '').split('.').map(n => parseInt(n, 10) || 0);
+  const pb = String(b || '').split('.').map(n => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d !== 0) return d < 0 ? -1 : 1;
+  }
+  return 0;
+}
+
+/**
+ * 版本体检（只读）：技能每次被调用时的第一步。
+ *
+ * 技能自带运行时的更新不会自动传导到项目里——项目里跑的是安装时拷贝的
+ * 副本。这里判断项目里的组件是「未安装 / 落后于技能 / 已是最新」，由技能
+ * 据此决定走安装流程，还是**先询问用户**是否兼容升级：升级必须征得用户
+ * 同意，不允许静默替换项目里的运行时代码。
+ */
+export async function checkStatus(projectRoot) {
+  const root = path.resolve(projectRoot);
+  const detected = await detectProject(root);
+  const installedVersion = detected.meta?.skillVersion || null;
+  const versionKnown = !!installedVersion && installedVersion !== '0.0.0';
+  let action;
+  if (!detected.frontend.isFrontend) action = 'not-frontend';
+  else if (!detected.installed || !versionKnown) action = 'install';
+  else if (installedVersion !== SKILL_VERSION) action = 'upgrade';
+  else action = 'current';
+  return {
+    root,
+    isFrontend: detected.frontend.isFrontend,
+    framework: detected.frontend.framework,
+    bundler: detected.frontend.bundler,
+    skillVersion: SKILL_VERSION,
+    installedVersion,
+    upToDate: action === 'current',
+    action,
+    runtimeInstalled: detected.installed,
+    metaFile: META_FILE,
+  };
+}
+
+/**
+ * 兼容升级：把项目里的运行时替换为技能当前版本。
+ *
+ * 只动 runtime/，绝不触碰 tasks/ 与归档——标注数据是用户唯一不可再生
+ * 数据，升级前后都会点数校验并在结果里如实上报。必须整目录删除后重拷
+ * 而不是增量覆盖：否则已废弃的旧运行时文件会残留在项目里被继续加载。
+ */
+export async function upgradeProject(projectRoot, options = {}) {
+  const root = path.resolve(projectRoot);
+  const detected = await detectProject(root);
+  if (!detected.installed || !detected.meta) {
+    throw new Error('该项目尚未安装标注组件，请先运行 install（status 的 action 为 install）。');
+  }
+  const from = detected.meta.skillVersion || '0.0.0';
+  if (from === SKILL_VERSION && !options.force) {
+    return {
+      ok: true,
+      root,
+      action: 'current',
+      from,
+      to: SKILL_VERSION,
+      message: `运行时已是 ${SKILL_VERSION}，无需升级。`,
+    };
+  }
+
+  const tasksDir = path.join(root, TASKS_DIR);
+  const countJson = async dir => {
+    try {
+      return (await fs.readdir(dir)).filter(name => name.endsWith('.json')).length;
+    } catch {
+      return 0;
+    }
+  };
+  const taskGroupsBefore = await countJson(tasksDir);
+
+  // 删旧运行时 → 整目录重拷 → 幂等重接入配置（已接入时结果为 patched）
+  await fs.rm(path.join(root, WORK_ROOT, 'runtime'), { recursive: true, force: true });
+  const result = await installProject(root, { ...options, force: true });
+
+  // installProject 重写了 meta，这里补记升级来源，供排查与回溯
+  const meta = JSON.parse(await fs.readFile(path.join(root, META_FILE), 'utf8'));
+  meta.previousSkillVersion = from === '0.0.0' ? null : from;
+  meta.upgradedAt = new Date().toISOString();
+  await fs.writeFile(path.join(root, META_FILE), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+
+  const taskGroupsAfter = await countJson(tasksDir);
+  return {
+    ok: true,
+    root,
+    action: 'upgraded',
+    from,
+    to: SKILL_VERSION,
+    runtimeFiles: result.runtimeFiles,
+    tasks: {
+      dir: TASKS_DIR,
+      before: taskGroupsBefore,
+      after: taskGroupsAfter,
+      preserved: taskGroupsBefore === taskGroupsAfter,
+    },
+    integration: result.integration,
+    metaFile: META_FILE,
   };
 }
 

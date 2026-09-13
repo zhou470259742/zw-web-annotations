@@ -8,6 +8,8 @@
  *   node scripts/cli.mjs plan    [--root <项目目录>]            先看将要改什么
  *   node scripts/cli.mjs install [--root <项目目录>] [--framework vite|manual|vue-plugin] [--force]
  *   node scripts/cli.mjs doctor  [--root <项目目录>]            安装后自检
+ *   node scripts/cli.mjs status  [--root <项目目录>]            只读版本体检（每次调用技能前先跑）
+ *   node scripts/cli.mjs upgrade [--root <项目目录>] [--force]  兼容升级：替换运行时，不动任务数据
  *
  * 输出统一为 JSON，方便 Agent 解析后向用户汇报。
  * 运行时位于技能自身的 scripts/runtime/，因此技能整个压缩发出去即可用。
@@ -20,6 +22,8 @@ import {
   inspectProject,
   runtimeFingerprint,
   discoverFrontends,
+  checkStatus,
+  upgradeProject,
   WORK_ROOT,
   TASKS_DIR,
   META_FILE,
@@ -149,7 +153,15 @@ async function main() {
       const result = await runDoctor(root);
       return { ok: result.ok, command, ...result };
     }
-    return { ok: false, error: `未知命令：${command}`, valid: ['detect', 'inspect', 'plan', 'install', 'doctor'] };
+    if (command === 'status') {
+      const result = await checkStatus(root);
+      return { ok: true, command, ...result };
+    }
+    if (command === 'upgrade') {
+      const result = await upgradeProject(root, options);
+      return { ok: true, command, ...result };
+    }
+    return { ok: false, error: `未知命令：${command}`, valid: ['detect', 'inspect', 'plan', 'install', 'doctor', 'status', 'upgrade'] };
   } catch (error) {
     return { ok: false, command, root, error: error.message };
   }
