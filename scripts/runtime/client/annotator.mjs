@@ -2163,7 +2163,7 @@ export function mountAnnotator(options = {}) {
         `请参考 ${jsonPath} 中的待处理工作，进行处理。`,
         '改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。',
         '已验收通过的任务请进行归档。',
-        '同一任务文件是唯一写入目标：如需并行，请由主线程统一回写任务状态，子 agent 只负责改源码并回报结果，且不要让多个 agent 同时改同一份源码。',
+        '同一任务文件的状态回写已由服务端串行化，多个 agent 并行安全；但同一批源码仍只交给一个 agent 改，不要让两个 agent 同时改同一份源码。',
       ].join('\n');
 
     let prompt;
@@ -2190,7 +2190,7 @@ export function mountAnnotator(options = {}) {
       lines.push('');
       lines.push('请依次参考这些任务文件中的待处理工作，进行处理。');
       lines.push('改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。已验收通过的任务请进行归档。');
-      lines.push('请按任务文件并行处理：每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。子 agent 只修改自己页面的源码，并回报改动的文件与验证证据；浏览器验收请统一在主线程完成，避免多个 agent 抢占同一个标签页。');
+      lines.push('请按任务文件并行处理：每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。子 agent 开始时把任务置为 doing，改完源码自测通过后自行把状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程浏览器复核后统一回写并归档。状态回写走标注接口（页面同源 /__zw-web-annotations），服务端已串行化，并发安全。');
       prompt = lines.join('\n');
       summary = `覆盖 ${pendingGroups.length} 个页面的待处理任务`;
     }
