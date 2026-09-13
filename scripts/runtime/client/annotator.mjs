@@ -366,6 +366,16 @@ export function mountAnnotator(options = {}) {
     refreshPending: false,
     /** SSE 长连接（/events），实时接收任务变更通知。 */
     eventSource: null,
+    /** 收起状态下提示的自动隐藏句柄 */
+    toastTimer: null,
+    /**
+     * 用户主动操作的「回执」（如点复制）。与后台同步消息是两条通道：
+     * 点复制时会先写文件，写入又触发 SSE 刷新并产生「已同步到 …」，
+     * 若共用一条通道，刚弹出的「提示词已复制」会被这条后台噪声顶掉。
+     * 因此回执在有效期内优先显示，过期后回落到后台消息。
+     */
+    receipt: null,
+    receiptTimer: null,
   };
 
   try {
@@ -474,6 +484,25 @@ export function mountAnnotator(options = {}) {
           <line x1="4" y1="17" x2="20" y2="17"></line>
         </svg>
       </button>
+      <!-- 悬浮快捷操作：手动添加与复制提示词原先必须展开面板才能点到，
+           这里做成悬停浮出，收起状态下也能一步完成。面板里的同名按钮保留，
+           键盘用户与需要看清文字的场景仍走面板。 -->
+      <div class="dock-float" data-el="dockFloat">
+        <button type="button" class="dock-float-btn" data-act="manual" title="手动添加任务">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+            <line x1="12" y1="5" x2="12" y2="19"></line>
+            <line x1="5" y1="12" x2="19" y2="12"></line>
+          </svg>
+          <span>手动</span>
+        </button>
+        <button type="button" class="dock-float-btn" data-act="copy" title="复制提示词">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="11" height="11" rx="2.5"></rect>
+            <path d="M6.5 15H5.5A1.5 1.5 0 0 1 4 13.5v-8A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5v1"></path>
+          </svg>
+          <span>复制</span>
+        </button>
+      </div>
     </div>
     <section class="panel hidden" data-el="panel">
       <header>
@@ -499,6 +528,12 @@ export function mountAnnotator(options = {}) {
     </section>
   `;
 
+  // 收起状态下面板底栏不可见，操作反馈（复制成功/失败等）改由这个浮条兜底，
+  // 否则点了「复制」没有任何可见回执。展开面板时不显示，避免两处重复。
+  const toast = document.createElement('div');
+  toast.className = 'toast hidden';
+  toast.setAttribute('data-el', 'toast');
+
   // 二次确认对话框
   const confirmBox = document.createElement('div');
   confirmBox.className = 'confirm-layer hidden';
@@ -514,7 +549,7 @@ export function mountAnnotator(options = {}) {
     </div>
   `;
 
-  shadow.append(outline, sizeBadge, veil, spotlight, pins, editor, confirmBox, bar);
+  shadow.append(outline, sizeBadge, veil, spotlight, pins, editor, confirmBox, bar, toast);
 
   const $ = sel => shadow.querySelector(sel);
   const $$ = sel => Array.from(shadow.querySelectorAll(sel));
@@ -855,16 +890,65 @@ export function mountAnnotator(options = {}) {
     toggle.dataset.active = state.active ? 'on' : 'off';
   }
 
-  function renderMessage() {
-    if (!state.syncMessage) {
-      $('[data-el="msg"]').textContent = state.active
-        ? '点击页面元素即可就地输入要求。'
-        : '点击“标注”后，在页面上点选元素。';
-      return;
-    }
-    $('[data-el="msg"]').textContent = state.syncMessage;
+  /**
+   * 记录一条用户主动操作的「回执」，在有效期内压过后台同步消息。
+   * 用于复制提示词这类「必须让用户看到结果」的动作。
+   */
+  function setReceipt(message, ms = 3200) {
+    if (state.receiptTimer) clearTimeout(state.receiptTimer);
+    // 记住创建回执时被压住的后台消息。点复制会先写文件，写入又触发
+    // 「已同步到 …」这类与本次操作无关的噪声；若不做记录，回执一到期
+    // 就会把这条噪声显示出来。所以到期时只在它未被新消息替换的情况下清掉。
+    const background = state.syncMessage;
+    state.receipt = { message, until: Date.now() + ms };
+    renderMessage();
+    state.receiptTimer = setTimeout(() => {
+      state.receipt = null;
+      state.receiptTimer = null;
+      if (state.syncMessage === background) state.syncMessage = '';
+      renderMessage();
+    }, ms);
   }
 
+  /** 当前应当显示的文案：回执在有效期内优先，否则用最近的后台消息。 */
+  function activeMessage() {
+    if (state.receipt && Date.now() < state.receipt.until) return state.receipt.message;
+    return state.syncMessage;
+  }
+
+  function renderMessage() {
+    const text = activeMessage() || (state.active
+      ? '点击页面元素即可就地输入要求。'
+      : '点击“标注”后，在页面上点选元素。');
+    $('[data-el="msg"]').textContent = text;
+    renderToast(activeMessage());
+  }
+
+  /**
+   * 收起状态下的浅色提示条：面板底栏此时不可见，用户点「复制」/「手动」后
+   * 需要看到回执。只在「面板收起 + 有真实消息」时出现，展开时由底栏承担，
+   * 避免同一句话在两处重复。
+   */
+  function renderToast(message) {
+    if (state.toastTimer) {
+      clearTimeout(state.toastTimer);
+      state.toastTimer = null;
+    }
+    // 编辑器打开时不弹：收起态下编辑器和浮条都停在胶囊上方，会互相压住；
+    // 而且「手动任务：可直接写要求，也可粘贴图片」这类提示，编辑器自己的
+    // 提示行（Enter 确认 · Esc 取消 · 可粘贴图片）已经写了一遍，属重复。
+    const editorOpen = !editor.classList.contains('hidden');
+    const show = !!message && state.collapsed && !editorOpen;
+    toast.classList.toggle('hidden', !show);
+    if (!show) return;
+    toast.textContent = message;
+    // 失败与「未复制」这类需要用户处理的消息停留久一点
+    const sticky = /失败|未复制|不能|无法/.test(message);
+    state.toastTimer = setTimeout(() => {
+      toast.classList.add('hidden');
+      state.toastTimer = null;
+    }, sticky ? 6000 : 3200);
+  }
   /* ---------------- 列表：按页面分组 ---------------- */
 
   function persistGroupOpenState() {
@@ -1547,6 +1631,21 @@ export function mountAnnotator(options = {}) {
    * - 有目标元素：贴元素下方，空间不足翻到上方，并夹在视口内；
    * - 无目标元素（手动任务、元素已从页面消失）：贴住右下角面板的上方。
    */
+  /**
+   * 收起态下编辑器可用的底边：胶囊与悬浮按钮这一簇的最上沿。
+   * 悬浮按钮层即使处于隐藏（opacity/visibility）状态也有布局几何，
+   * 因此可以直接测量，不用管此刻指针是否停在上面。
+   */
+  function editorClusterTop() {
+    const dock = $('[data-el="dock"]');
+    if (!dock || dock.classList.contains('hidden')) return null;
+    const dockTop = dock.getBoundingClientRect().top;
+    const float = $('[data-el="dockFloat"]');
+    const floatTop = float ? float.getBoundingClientRect().top : dockTop;
+    const top = Math.min(dockTop, floatTop);
+    return Number.isFinite(top) && top > 0 ? top : null;
+  }
+
   function placeEditor(selector, input) {
     editor.classList.remove('hidden');
     // 弹窗隐藏时 scrollHeight 恒为 0，openEditor* 在取消隐藏前调用的
@@ -1596,9 +1695,12 @@ export function mountAnnotator(options = {}) {
         left = panelRect.right - width;
         top = panelRect.top - height - GAP;
       } else {
-        // 面板不可见（已收起）时没有可对齐的参照，退回右下角
+        // 面板已收起：编辑器要落在胶囊与悬浮按钮之上，否则会压住刚点的
+        // 「手动/复制」按钮（收起态下这两个按钮正在悬停显示，被盖住会显得点不动）。
+        // 悬浮层隐藏时仍有布局几何，可直接测量，无需关心当前是否悬停。
         left = vw - width - 18;
-        top = vh - height - 72;
+        const clusterTop = editorClusterTop();
+        top = (clusterTop ?? vh - 72) - height - GAP;
       }
       // 与元素锚定同样的限高逻辑，避免面板上方空间不足时弹窗顶到视口顶端
       editor.style.maxHeight = `${Math.max(120, Math.min(height, top))}px`;
@@ -1857,8 +1959,7 @@ export function mountAnnotator(options = {}) {
     // 删除信号，会发出整组删除请求。其它页面是否有待处理由后面的组列表判断。
     const saved = state.tasks.length ? await syncNow() : null;
     if (state.tasks.length && !saved) {
-      state.syncMessage = '提示词未复制：任务尚未成功同步到工作区，无法确定文件地址。';
-      renderMessage();
+      setReceipt('提示词未复制：任务尚未成功同步到工作区，无法确定文件地址。', 6000);
       return null;
     }
     const fallbackPath = saved?.absolutePath || saved?.relativePath || saved?.file || '';
@@ -1873,15 +1974,13 @@ export function mountAnnotator(options = {}) {
       pendingGroups = null;
     }
     if (!pendingGroups && !fallbackPath) {
-      state.syncMessage = '提示词未复制：无法读取工作区任务列表。';
-      renderMessage();
+      setReceipt('提示词未复制：无法读取工作区任务列表。', 6000);
       return null;
     }
     if (pendingGroups && !pendingGroups.length) {
-      state.syncMessage = saved?.skipped
+      setReceipt(saved?.skipped
         ? '提示词未复制：当前标注均已归档，工作区中没有待处理文件。重新标注后即可复制。'
-        : '提示词未复制：工作区里没有待处理的标注任务（可能均已完成或归档）。';
-      renderMessage();
+        : '提示词未复制：工作区里没有待处理的标注任务（可能均已完成或归档）。', 6000);
       return null;
     }
 
@@ -1901,8 +2000,7 @@ export function mountAnnotator(options = {}) {
       const [group] = pendingGroups;
       const jsonPath = group.absolutePath || (group.page?.url === pageUrl ? fallbackPath : '');
       if (!jsonPath) {
-        state.syncMessage = '提示词未复制：无法确定任务文件地址。';
-        renderMessage();
+        setReceipt('提示词未复制：无法确定任务文件地址。', 6000);
         return null;
       }
       prompt = singleFilePrompt(jsonPath);
@@ -1923,11 +2021,10 @@ export function mountAnnotator(options = {}) {
     }
     try {
       await navigator.clipboard.writeText(prompt);
-      state.syncMessage = `提示词已复制，${summary}。`;
+      setReceipt(`提示词已复制，${summary}。`);
     } catch (error) {
-      state.syncMessage = `复制失败：${error.message}`;
+      setReceipt(`复制失败：${error.message}`, 6000);
     }
-    renderMessage();
     return prompt;
   }
 
@@ -2064,6 +2161,9 @@ export function mountAnnotator(options = {}) {
     $('[data-el="panel"]').classList.toggle('hidden', state.collapsed);
     if (!state.collapsed) renderList();
     renderCapsule();
+    // 展开/收起只切换承载位置，文案与回执优先级仍交给 renderMessage 统一决定，
+    // 否则展开面板时会把压在回执下面的后台消息提前显示出来。
+    renderMessage();
   }
 
   function expandBar() {
@@ -2653,6 +2753,7 @@ const CSS_TEXT = `
    会让展开详情的弹窗被标注列表盖住。面板必须在遮罩之上、弹窗之下。 */
 .bar { position: fixed; right: 18px; bottom: 18px; z-index: 2147483646; font: 13px/1.5 var(--zc-font); }
 .dock {
+  position: relative;
   display: flex; align-items: center; gap: 2px;
   padding: 4px; border: 1px solid #3f3f3f; border-radius: 999px;
   background: #1c1c1c; box-shadow: 0 8px 22px rgba(0,0,0,.4);
@@ -2676,6 +2777,53 @@ const CSS_TEXT = `
 .dock-dot[data-active="on"] { background: #5dcc81; }
 .dock[data-dirty="on"] .dock-dot { background: #d8a45a; }
 .dock-sep { width: 1px; height: 18px; background: #3a3a3a; flex: none; }
+
+/* ---- 收起胶囊的悬浮快捷操作 ---- */
+/* 左边缘与胶囊内的「标注」按钮对齐：.dock 有 1px 边框 + 4px 内边距，
+   绝对定位的包含块是内边距盒，所以 left:4px 恰好落在按钮左边缘上；
+   若用 right:0 会整体右对齐到胶囊右端，视觉上像是两个不相干的浮块。 */
+.dock-float {
+  position: absolute; left: 4px; bottom: 100%;
+  display: flex; align-items: flex-start; gap: 6px;
+  /* 用自身的下内边距填满与胶囊之间的空隙，而不是另加一个 ::before 桥：
+     空隙属于浮层盒子的一部分，指针从胶囊上移到按钮途中始终在浮层内，
+     不会在中途丢失 hover 导致浮层闪烁。 */
+  padding-bottom: 12px;
+  opacity: 0; visibility: hidden; transform: translateY(6px);
+  transition: opacity .16s ease, transform .16s ease, visibility .16s;
+  pointer-events: none;
+}
+.dock:hover .dock-float,
+.dock-float:hover,
+.dock-float:focus-within,
+.dock:focus-within .dock-float {
+  opacity: 1; visibility: visible; transform: translateY(0); pointer-events: auto;
+}
+.dock-float-btn {
+  display: flex; align-items: center; gap: 5px;
+  padding: 6px 11px; border: 1px solid #3f3f3f; border-radius: 999px; cursor: pointer;
+  background: #1c1c1c; color: #d8d8d8; font-family: inherit; font-weight: 600; font-size: 12px; line-height: normal;
+  box-shadow: 0 6px 18px rgba(0,0,0,.42);
+}
+.dock-float-btn svg { width: 14px; height: 14px; flex: none; }
+.dock-float-btn:hover { background: #2f2f2f; color: #fff; border-color: #5a5a5a; }
+.dock-float-btn:focus-visible { outline: 2px solid #8d7bff; outline-offset: 1px; }
+
+/* ---- 收起状态的操作反馈浮条 ---- */
+/* 位置必须让开上方的悬浮按钮层（y 708~738），否则会盖住「手动/复制」并挡住点击；
+   所以整条落在浮层之上，且加 pointer-events:none——它只是回执，不需要交互，
+   即使因长文案增高也不会吞掉按钮的点击。right 与胶囊同轴对齐。 */
+.toast {
+  position: fixed; right: 18px; bottom: 102px; z-index: 2147483646;
+  max-width: min(340px, calc(100vw - 36px));
+  padding: 9px 13px; border: 1px solid #3f3f3f; border-radius: 10px;
+  background: #1c1c1c; color: #ececec;
+  font: 600 12px/1.5 var(--zc-font);
+  box-shadow: 0 10px 26px rgba(0,0,0,.45);
+  pointer-events: none;
+  opacity: 1; transition: opacity .16s ease;
+}
+.toast.hidden { display: none; }
 
 /* ---- 侧栏：展开面板 ---- */
 .panel {

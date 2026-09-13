@@ -53,7 +53,7 @@ export const META_FILE = `${WORK_ROOT}/install.json`;
  * 项目就静默停留在旧代码上。
  */
 export const SKILL_NAME = 'zw-web-annotations';
-export const SKILL_VERSION = '0.14.0';
+export const SKILL_VERSION = '0.15.0';
 
 /**
  * 任务目录。
