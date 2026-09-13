@@ -1,8 +1,8 @@
 /**
- * Z Code 网页标注：项目安装器
+ * 网页标注：项目安装器
  *
  * 职责（全部为确定性文件操作，不依赖模型自由发挥）：
- * 1. 把运行时拷贝到目标项目的 .zcode/web-annotations/runtime/，使项目自包含；
+ * 1. 把运行时拷贝到目标项目的 .zw-web-annotations/runtime/，使项目自包含；
  * 2. 初始化工作区目录与忽略规则；
  * 3. 幂等接入构建配置（默认 Vite），写入前备份并做语法校验，失败自动回滚；
  * 4. 写入安装元数据，供后续检测、升级与卸载使用。
@@ -36,7 +36,7 @@ export const RUNTIME_FILES = [
   'schema/annotations.schema.json',
 ];
 
-export const WORK_ROOT = '.zcode/web-annotations';
+export const WORK_ROOT = '.zw-web-annotations';
 export const META_FILE = `${WORK_ROOT}/install.json`;
 
 /**
@@ -51,8 +51,8 @@ export const META_FILE = `${WORK_ROOT}/install.json`;
  * 检查靠它发现「技能升级了、项目里还是旧运行时」。版本不变时该检查会通过，
  * 项目就静默停留在旧代码上。
  */
-export const SKILL_NAME = 'zcode-web-annotations';
-export const SKILL_VERSION = '0.11.0';
+export const SKILL_NAME = 'zw-web-annotations';
+export const SKILL_VERSION = '0.12.0';
 
 /**
  * 任务目录。
@@ -64,7 +64,7 @@ export const SKILL_VERSION = '0.11.0';
 export const TASKS_DIR = `${WORK_ROOT}/tasks`;
 
 /**
- * 传给标注运行时（createStore / zcodeAnnotations）的任务目录。
+ * 传给标注运行时（createStore / zwAnnotations）的任务目录。
  * 与 TASKS_DIR 保持一致，避免安装器宣称的目录与实际落盘目录不一致。
  */
 export const RUNTIME_TASKS_DIR = TASKS_DIR;
@@ -223,7 +223,7 @@ async function initWorkspace(root, options) {
   const current = (await exists(gitignore)) ? await fs.readFile(gitignore, 'utf8') : '';
   if (!current.split('\n').some(line => line.trim() === entry)) {
     const prefix = current && !current.endsWith('\n') ? '\n' : '';
-    await fs.writeFile(gitignore, `${current}${prefix}\n# Z Code 网页标注产生的本地任务\n${entry}\n`, 'utf8');
+    await fs.writeFile(gitignore, `${current}${prefix}\n# 网页标注产生的本地任务\n${entry}\n`, 'utf8');
     gitignoreUpdated = true;
   }
   return { tasksDir: path.relative(root, tasksDir), gitignoreUpdated };
@@ -236,21 +236,21 @@ async function initWorkspace(root, options) {
  * 该相对路径由运行时按项目根目录（process.cwd）解析。
  */
 export function buildViteSnippet() {
-  const importLine = `import { zcodeAnnotations } from './${WORK_ROOT}/runtime/vite/index.mjs';`;
-  const pluginLine = `zcodeAnnotations({ dir: '${TASKS_DIR}' })`;
+  const importLine = `import { zwAnnotations } from './${WORK_ROOT}/runtime/vite/index.mjs';`;
+  const pluginLine = `zwAnnotations({ dir: '${TASKS_DIR}' })`;
   return { importLine, pluginLine };
 }
 
 /** 判断配置是否已接入。 */
 export function isPatched(content) {
-  return typeof content === 'string' && content.includes('zcodeAnnotations') && content.includes(WORK_ROOT);
+  return typeof content === 'string' && content.includes('zwAnnotations') && content.includes(WORK_ROOT);
 }
 
 /**
  * 在 Vite 配置源码中注入插件。
  * 只做最小、可预测的文本改写：
  * - 在最后一个 import 之后插入 import 语句；
- * - 在 plugins 数组开头插入 zcodeAnnotations()。
+ * - 在 plugins 数组开头插入 zwAnnotations()。
  * 无法安全改写时抛出错误，由调用方决定是否降级为手动接入。
  */
 export function patchViteConfigContent(content) {
@@ -315,7 +315,7 @@ async function integrateVite(root, detected) {
       result.file = name;
       return result;
     }
-    const backupPath = `${cfgPath}.zcode-backup`;
+    const backupPath = `${cfgPath}.zw-backup`;
     await fs.copyFile(cfgPath, backupPath);
     await fs.writeFile(cfgPath, patched, 'utf8');
     const check = await validateSyntax(cfgPath);
@@ -357,7 +357,7 @@ async function integrateVite(root, detected) {
  * 按检测结果生成手动接入片段。
  *
  * 接入一共需要两件事，缺一不可：
- * 1. 一个提供 /__zcode/annotations/* 接口的 dev server 中间件（负责写盘）；
+ * 1. 一个提供 /__zw-web-annotations/* 接口的 dev server 中间件（负责写盘）；
  * 2. 把标注 UI 挂到页面上——Vite 插件自动注入，其他情况用框架适配器或中间件注入。
  *
  * 因此非 Vite 项目的接入代码同时包含中间件与挂载两部分。
@@ -489,12 +489,83 @@ export function buildManualSnippet(projectRoot, detected, adapter) {
 }
 
 /**
+ * 旧版工作区迁移：品牌中立化前的安装布局是 `<项目>/.zcode/web-annotations/`，
+ * 现在是 `<项目>/.zw-web-annotations/`。tasks/（含归档与附件）必须整体搬移——
+ * 任务数据是用户唯一不可再生数据，迁移是搬而不是删；构建配置与 .gitignore
+ * 里的旧路径原位修正；旧 runtime 由安装流程在新位置重新生成。
+ */
+async function migrateLegacyWorkspace(root) {
+  const legacyRoot = path.join(root, '.zcode', 'web-annotations');
+  if (!(await exists(legacyRoot))) return { migrated: false };
+
+  const modernRoot = path.join(root, WORK_ROOT);
+  await fs.mkdir(modernRoot, { recursive: true });
+  const legacyMeta = await readJsonSafe(path.join(legacyRoot, 'install.json'));
+
+  // 1) 任务数据整体搬移（含 tasks/archive、tasks/attachments）。
+  //    新目录已有 tasks（理论上只在异常中断后出现）时，把旧数据挪进带
+  //    时间戳的抢救目录，绝不覆盖任何一方。
+  const legacyTasks = path.join(legacyRoot, 'tasks');
+  const modernTasks = path.join(modernRoot, 'tasks');
+  let tasksMigrated = false;
+  if (await exists(legacyTasks)) {
+    if (!(await exists(modernTasks))) {
+      await fs.rename(legacyTasks, modernTasks);
+    } else {
+      await fs.rename(legacyTasks, path.join(modernRoot, `tasks-legacy-${Date.now()}`));
+    }
+    tasksMigrated = true;
+  }
+
+  // 2) 构建配置原位替换旧路径：注入行同时包含 import 路径与 dir 参数
+  const patched = [];
+  for (const name of ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts']) {
+    const cfgPath = path.join(root, name);
+    if (!(await exists(cfgPath))) continue;
+    const content = await fs.readFile(cfgPath, 'utf8');
+    if (!content.includes('.zcode/web-annotations')) continue;
+    await fs.writeFile(cfgPath, content.split('.zcode/web-annotations').join('.zw-web-annotations'), 'utf8');
+    patched.push(name);
+  }
+
+  // 3) .gitignore 旧条目换成新条目
+  const gitignore = path.join(root, '.gitignore');
+  if (await exists(gitignore)) {
+    const current = await fs.readFile(gitignore, 'utf8');
+    const updated = current.split('.zcode/web-annotations/tasks/').join('.zw-web-annotations/tasks/');
+    if (updated !== current) await fs.writeFile(gitignore, updated, 'utf8');
+  }
+
+  // 4) 旧目录移除（数据已搬走，runtime 由安装流程在新位置重新生成）
+  await fs.rm(legacyRoot, { recursive: true, force: true });
+
+  return {
+    migrated: true,
+    tasksMigrated,
+    patched,
+    previousSkillVersion: legacyMeta?.skillVersion || null,
+  };
+}
+
+async function countTaskGroupFiles(root) {
+  const tasksDir = path.join(root, TASKS_DIR);
+  try {
+    return (await fs.readdir(tasksDir)).filter(name => name.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * 执行安装。幂等：重复执行为跳过而非报错。
  * @returns 安装结果摘要
  */
 export async function installProject(projectRoot, options = {}) {
   const root = path.resolve(projectRoot);
   if (!(await exists(root))) throw new Error(`项目目录不存在：${root}`);
+
+  // 旧布局迁移先行：任务数据必须先搬到新位置，安装才落到新目录
+  const migration = await migrateLegacyWorkspace(root);
 
   const detected = await detectProject(root);
 
@@ -554,6 +625,7 @@ export async function installProject(projectRoot, options = {}) {
     runtimeFiles: written,
     workspace,
     integration,
+    migration,
     metaFile: META_FILE,
     detected: {
       hasPackageJson: detected.hasPackageJson,
@@ -621,9 +693,40 @@ export async function checkStatus(projectRoot) {
  */
 export async function upgradeProject(projectRoot, options = {}) {
   const root = path.resolve(projectRoot);
+  // 旧布局先迁移（搬任务数据、修正配置与 gitignore），再按新布局判断安装状态
+  const migration = await migrateLegacyWorkspace(root);
   const detected = await detectProject(root);
   if (!detected.installed || !detected.meta) {
-    throw new Error('该项目尚未安装标注组件，请先运行 install（status 的 action 为 install）。');
+    // 旧布局迁移后项目在新位置是未安装状态：按全新安装落地，同样视为
+    // 一次升级（任务数据已由迁移整体搬移保留）。
+    if (!migration.migrated) {
+      throw new Error('该项目尚未安装标注组件，请先运行 install（status 的 action 为 install）。');
+    }
+    const taskGroupsBefore = await countTaskGroupFiles(root);
+    const result = await installProject(root, { ...options, force: true });
+    const taskGroupsAfter = await countTaskGroupFiles(root);
+    const meta = JSON.parse(await fs.readFile(path.join(root, META_FILE), 'utf8'));
+    meta.previousSkillVersion = migration.previousSkillVersion || null;
+    meta.upgradedAt = new Date().toISOString();
+    meta.migratedFromLegacy = true;
+    await fs.writeFile(path.join(root, META_FILE), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
+    return {
+      ok: true,
+      root,
+      action: 'upgraded',
+      from: migration.previousSkillVersion || 'unknown',
+      to: SKILL_VERSION,
+      migration,
+      runtimeFiles: result.runtimeFiles,
+      tasks: {
+        dir: TASKS_DIR,
+        before: taskGroupsBefore,
+        after: taskGroupsAfter,
+        preserved: taskGroupsBefore === taskGroupsAfter,
+      },
+      integration: result.integration,
+      metaFile: META_FILE,
+    };
   }
   const from = detected.meta.skillVersion || '0.0.0';
   if (from === SKILL_VERSION && !options.force) {
@@ -637,15 +740,7 @@ export async function upgradeProject(projectRoot, options = {}) {
     };
   }
 
-  const tasksDir = path.join(root, TASKS_DIR);
-  const countJson = async dir => {
-    try {
-      return (await fs.readdir(dir)).filter(name => name.endsWith('.json')).length;
-    } catch {
-      return 0;
-    }
-  };
-  const taskGroupsBefore = await countJson(tasksDir);
+  const taskGroupsBefore = await countTaskGroupFiles(root);
 
   // 删旧运行时 → 整目录重拷 → 幂等重接入配置（已接入时结果为 patched）
   await fs.rm(path.join(root, WORK_ROOT, 'runtime'), { recursive: true, force: true });
@@ -657,7 +752,7 @@ export async function upgradeProject(projectRoot, options = {}) {
   meta.upgradedAt = new Date().toISOString();
   await fs.writeFile(path.join(root, META_FILE), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
 
-  const taskGroupsAfter = await countJson(tasksDir);
+  const taskGroupsAfter = await countTaskGroupFiles(root);
   return {
     ok: true,
     root,

@@ -57,16 +57,16 @@ const makeTask = () => ({
 test('middleware writes annotations to the local workspace', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
   await withServer(dir, async port => {
-    const health = await request(port, { path: '/__zcode/annotations/health' });
+    const health = await request(port, { path: '/__zw-web-annotations/health' });
     assert.equal(health.status, 200);
     assert.equal(health.json().workspace, dir);
 
-    const saved = await request(port, { method: 'POST', path: '/__zcode/annotations/append', body: { page, tasks: [makeTask()] } });
+    const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
     assert.equal(saved.status, 200);
     assert.equal(saved.json().added, 1);
-    assert.match(saved.json().relativePath, /^\.zcode\/web-annotations\/tasks\//);
+    assert.match(saved.json().relativePath, /^\.zw-web-annotations\/tasks\//);
 
-    const listed = await request(port, { path: '/__zcode/annotations/tasks' });
+    const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     assert.equal(listed.json().groups.length, 1);
   });
 
@@ -78,11 +78,11 @@ test('middleware writes annotations to the local workspace', async () => {
 test('middleware serves the client script and rejects unknown routes', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
   await withServer(dir, async port => {
-    const client = await request(port, { path: '/__zcode/annotations/client.js' });
+    const client = await request(port, { path: '/__zw-web-annotations/client.js' });
     assert.equal(client.status, 200);
     assert.match(client.text, /mountAnnotator/);
 
-    const missing = await request(port, { path: '/__zcode/annotations/nope' });
+    const missing = await request(port, { path: '/__zw-web-annotations/nope' });
     assert.equal(missing.status, 404);
   });
 });
@@ -90,7 +90,7 @@ test('middleware serves the client script and rejects unknown routes', async () 
 test('middleware returns 400 for invalid payload instead of crashing', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
   await withServer(dir, async port => {
-    const bad = await request(port, { method: 'POST', path: '/__zcode/annotations/append', body: { tasks: [makeTask()] } });
+    const bad = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { tasks: [makeTask()] } });
     assert.equal(bad.status, 400);
     assert.match(bad.json().error, /page\.url/);
   });
@@ -99,7 +99,7 @@ test('middleware returns 400 for invalid payload instead of crashing', async () 
 test('injectAnnotatorScript adds the tag once', () => {
   const html = '<html><body><h1>x</h1></body></html>';
   const once = injectAnnotatorScript(html);
-  assert.match(once, /data-zcode-annotations/);
+  assert.match(once, /data-zw-annotations/);
   assert.equal(injectAnnotatorScript(once), once);
 });
 
@@ -121,14 +121,14 @@ test('middleware auto-injects the UI script into HTML responses', async () => {
   try {
     const page = await request(port, { path: '/' });
     // 只挂中间件也必须能出现标注 UI，否则 React/webpack 这类无适配器项目永远看不到面板
-    assert.match(page.text, /\/__zcode\/annotations\/client\.js/);
-    assert.match(page.text, /data-zcode-annotations/);
+    assert.match(page.text, /\/__zw-web-annotations\/client\.js/);
+    assert.match(page.text, /data-zw-annotations/);
     assert.match(page.text, /id="root"/, '原有内容不能被破坏');
 
     // client.js 必须是自带自动挂载的版本
-    const client = await request(port, { path: '/__zcode/annotations/client.js' });
+    const client = await request(port, { path: '/__zw-web-annotations/client.js' });
     assert.equal(client.status, 200);
-    assert.match(client.text, /__zcodeAutoMount/);
+    assert.match(client.text, /__zwAutoMount/);
     assert.match(client.text, /mountAnnotator/);
   } finally {
     await new Promise(resolve => server.close(resolve));
@@ -178,9 +178,9 @@ const pageA = { url: 'http://localhost:5173/', title: '首页' };
 const pageB = { url: 'http://localhost:5173/campus.html', title: '校园登录页' };
 
 async function seedTwoPages(port) {
-  await request(port, { method: 'POST', path: '/__zcode/annotations/append', body: { page: pageA, tasks: [makeTask()] } });
+  await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page: pageA, tasks: [makeTask()] } });
   const taskB = { ...makeTask(), id: 'task_b', element: { ...makeTask().element, selector: '#login-btn' } };
-  const savedB = await request(port, { method: 'POST', path: '/__zcode/annotations/append', body: { page: pageB, tasks: [taskB] } });
+  const savedB = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page: pageB, tasks: [taskB] } });
   return savedB.json().groupId;
 }
 
@@ -189,7 +189,7 @@ test('/tasks lists every page group with its absolute file path', async () => {
   await withServer(dir, async port => {
     await seedTwoPages(port);
 
-    const listed = await request(port, { path: '/__zcode/annotations/tasks' });
+    const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     const groups = listed.json().groups;
     assert.equal(groups.length, 2);
     for (const group of groups) {
@@ -211,14 +211,14 @@ test('cross-page delete by groupId only removes tasks from that page group', asy
     // 按组 id 删除 B 页任务（不带 pageUrl）：在其它页面的分组里点删除走的就是这条路
     const removed = await request(port, {
       method: 'POST',
-      path: '/__zcode/annotations/delete',
+      path: '/__zw-web-annotations/delete',
       body: { groupId: groupIdB, ids: ['task_b'] },
     });
     assert.equal(removed.status, 200);
     assert.equal(removed.json().removed, 1);
     assert.equal(removed.json().fileRemoved, true, 'B 页任务清空后组文件应被移除');
 
-    const listed = await request(port, { path: '/__zcode/annotations/tasks' });
+    const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     const groups = listed.json().groups;
     assert.equal(groups.length, 1, 'A 页任务组不受影响');
     assert.equal(groups[0].page.url, pageA.url);
@@ -241,13 +241,13 @@ test('instruction edit for another page task lands in that page group, not the c
     // 若按页面归组出错，任务会被错误写进 A 页的组文件或凭空新建组。
     const edited = await request(port, {
       method: 'POST',
-      path: '/__zcode/annotations/append',
+      path: '/__zw-web-annotations/append',
       body: { page: pageB, tasks: [{ ...taskB, instruction: '改为主色按钮' }] },
     });
     assert.equal(edited.status, 200);
     assert.equal(edited.json().groupId, groupIdB, '必须写回 B 页自己的组');
 
-    const listed = await request(port, { path: '/__zcode/annotations/tasks' });
+    const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     const groups = listed.json().groups;
     const groupA = groups.find(g => g.page.url === pageA.url);
     const groupB = groups.find(g => g.page.url === pageB.url);

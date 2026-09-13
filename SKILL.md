@@ -1,11 +1,11 @@
 ---
-name: zcode-web-annotations
-description: 在当前工作区的前端项目里安装网页元素批量标注能力。自动检测工作区中的前端项目、识别框架与构建器（Vue 3 / Vue 2 / React 等，Vite / Vue CLI / webpack），把自包含运行时安装进项目并初始化标注工作空间；技能更新后调用时会自动体检项目里的组件版本，征得用户同意后完成兼容升级。适用于用户要求「安装标注插件」「给项目接入网页标注」「初始化标注工作空间」「升级标注组件」「检查标注组件版本」「在项目里加一个元素标注工具」，或用 /zcode-web-annotations 直接触发安装。
+name: zw-web-annotations
+description: 在当前工作区的前端项目里安装网页元素批量标注能力。自动检测工作区中的前端项目、识别框架与构建器（Vue 3 / Vue 2 / React 等，Vite / Vue CLI / webpack），把自包含运行时安装进项目并初始化标注工作空间；技能更新后调用时会自动体检项目里的组件版本，征得用户同意后完成兼容升级。适用于用户要求「安装标注插件」「给项目接入网页标注」「初始化标注工作空间」「升级标注组件」「检查标注组件版本」「在项目里加一个元素标注工具」，或用 /zw-web-annotations 直接触发安装。
 ---
 
 # 在项目里安装网页元素批量标注能力
 
-把标注能力装进**当前工作区里的前端项目**：用户打开本地开发页面后，可以批量点选元素、就地写调整要求，任务自动存成 JSON，之后交给 Z Code 处理。
+把标注能力装进**当前工作区里的前端项目**：用户打开本地开发页面后，可以批量点选元素、就地写调整要求，任务自动存成 JSON，之后交给 AI agent 处理。
 
 本技能自带运行时（`scripts/runtime/`），**不依赖任何别的仓库或环境变量**，因此可以直接把技能目录压缩分享给他人使用（打包时排除 `.git/`）。
 
@@ -14,7 +14,7 @@ description: 在当前工作区的前端项目里安装网页元素批量标注�
 技能不会自己运行，需要用户发起：
 
 - **自然语言**：「初始化网页标注」「给项目接入标注」「安装标注插件」等；
-- **显式调用**：`/zcode-web-annotations`。
+- **显式调用**：`/zw-web-annotations`。
 
 用户只说「初始化」这类含糊说法时，先确认是不是要装标注能力，不要猜测后直接改他的项目配置。
 
@@ -27,7 +27,7 @@ description: 在当前工作区的前端项目里安装网页元素批量标注�
 下文命令里的 `<技能目录>` 指的就是这个绝对路径，例如：
 
 ```bash
-node ~/.zcode/skills/zcode-web-annotations/scripts/cli.mjs detect --root "$PWD"
+node ~/.zcode/skills/zw-web-annotations/scripts/cli.mjs detect --root "$PWD"
 ```
 
 ## 第零步：版本体检（每次调用都先做，包括处理任务时）
@@ -119,10 +119,10 @@ node "<技能目录>/scripts/cli.mjs" install --root "<项目目录>"
 
 安装器会：
 
-1. 拷贝运行时到 `<项目>/.zcode/web-annotations/runtime/`，项目因此**自包含**；
-2. 创建 `<项目>/.zcode/web-annotations/tasks/` 并追加 `.gitignore` 忽略规则；
-3. 幂等接入构建配置：写入前备份为 `*.zcode-backup`，写入后 `node --check` 校验语法，失败自动回滚；
-4. 写元数据 `<项目>/.zcode/web-annotations/install.json`。
+1. 拷贝运行时到 `<项目>/.zw-web-annotations/runtime/`，项目因此**自包含**；
+2. 创建 `<项目>/.zw-web-annotations/tasks/` 并追加 `.gitignore` 忽略规则；
+3. 幂等接入构建配置：写入前备份为 `*.zw-backup`，写入后 `node --check` 校验语法，失败自动回滚；
+4. 写元数据 `<项目>/.zw-web-annotations/install.json`。
 
 ## 第四步：自检并汇报
 
@@ -136,7 +136,7 @@ node "<技能目录>/scripts/cli.mjs" doctor --root "<项目目录>"
 - 接入动作是 `created` / `patched` / `manual` 中的哪一种，改了哪个文件；
 - 若是 `manual`，把 `integration.snippet.files[]` 里的代码**原样**给出，并说明每个代码块粘到哪个文件；
 - 若是 `patched`，说明备份文件位置与回滚方式；
-- 任务 JSON 的落盘位置：`<项目>/.zcode/web-annotations/tasks/`。
+- 任务 JSON 的落盘位置：`<项目>/.zw-web-annotations/tasks/`。
 
 其中 `runtime-version` 检查项意在发现**技能已升级、项目里还是旧运行时**的情况。它不通过时按第零步的升级询问流程征得用户同意后执行：
 
@@ -155,7 +155,7 @@ node "<技能目录>/scripts/cli.mjs" upgrade --root "<项目目录>"
 5. 确认后弹窗关闭、元素上出现编号图钉，标注模式保持开启，可连续标注；
 6. 标注会自动存到 `tasks/` 下的 JSON；刷新页面不丢。
 
-之后可以用「复制提示词」按钮生成处理指令，或直接让 Z Code 读 `tasks/*.json` 处理任务。
+之后可以用「复制提示词」按钮生成处理指令，或直接让 AI agent 读 `tasks/*.json` 处理任务。
 
 ## 处理任务（安装后）
 

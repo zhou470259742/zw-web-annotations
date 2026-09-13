@@ -3,12 +3,12 @@
 安装完成后，标注任务以 JSON 落在项目里：
 
 ```text
-<项目>/.zcode/web-annotations/tasks/<页面>-<哈希>.json
+<项目>/.zw-web-annotations/tasks/<页面>-<哈希>.json
 ```
 
 同一页面的标注归并到同一个文件；`attachments/` 存放粘贴的图片，JSON 里只存相对路径。
 
-**跨页面标注是常态**：一个项目里每个页面各有一个组文件，标注面板把全部页面分组展示（当前页置顶展开，其它页可折叠），切换页面不会清空其它页的任务。处理时按文件逐页领取即可，`GET /__zcode/annotations/tasks` 一次就能列出所有页面组（每组带 `absolutePath`）。
+**跨页面标注是常态**：一个项目里每个页面各有一个组文件，标注面板把全部页面分组展示（当前页置顶展开，其它页可折叠），切换页面不会清空其它页的任务。处理时按文件逐页领取即可，`GET /__zw-web-annotations/tasks` 一次就能列出所有页面组（每组带 `absolutePath`）。
 
 ## 任务结构
 
@@ -30,7 +30,7 @@
     "metrics": { "offsetWidth": 120, "offsetHeight": 32 },
     "styles": { "color": "rgb(255,255,255)", "fontSize": "14px" }
   },
-  "images": [{ "file": ".zcode/web-annotations/tasks/attachments/task_ab12cd34-i1.png" }],
+  "images": [{ "file": ".zw-web-annotations/tasks/attachments/task_ab12cd34-i1.png" }],
   "history": []
 }
 ```
@@ -64,7 +64,7 @@
 要解除需要**先回写状态**（`done` / `blocked` / `cancelled`），之后即可正常编辑或删除。确实需要强制清理时，接口支持显式 `force`：
 
 ```bash
-curl -X POST http://localhost:<端口>/__zcode/annotations/delete \
+curl -X POST http://localhost:<端口>/__zw-web-annotations/delete \
   -H 'content-type: application/json' \
   -d '{"pageUrl":"http://localhost:5173/<页面>.html","all":true,"force":true}'
 ```
@@ -91,7 +91,7 @@ curl -X POST http://localhost:<端口>/__zcode/annotations/delete \
 用户通常会用「复制提示词」生成一段指令，形如：
 
 ```text
-请参考 /绝对/路径/.zcode/web-annotations/tasks/<页面>-<哈希>.json 中的待处理工作，进行处理。
+请参考 /绝对/路径/.zw-web-annotations/tasks/<页面>-<哈希>.json 中的待处理工作，进行处理。
 处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。
 如果工作内容较多，请合理通过多 agent 进行并行处理。
 ```
@@ -103,9 +103,9 @@ curl -X POST http://localhost:<端口>/__zcode/annotations/delete \
 ```text
 请处理以下网页标注任务（项目跨多个页面，任务已按页面分成多个任务文件）：
 1. 页面：<标题>（当前页面），待处理 2 项
-   任务文件：/绝对/路径/<项目>/.zcode/web-annotations/tasks/<页面A>-<哈希>.json
+   任务文件：/绝对/路径/<项目>/.zw-web-annotations/tasks/<页面A>-<哈希>.json
 2. 页面：<标题>，待处理 3 项
-   任务文件：/绝对/路径/<项目>/.zcode/web-annotations/tasks/<页面B>-<哈希>.json
+   任务文件：/绝对/路径/<项目>/.zw-web-annotations/tasks/<页面B>-<哈希>.json
 
 请依次参考这些任务文件中的待处理工作，进行处理。
 处理过程中和处理完毕要更新任务状态。已处理的任务请进行归档。
@@ -121,7 +121,7 @@ curl -X POST http://localhost:<端口>/__zcode/annotations/delete \
 **HTTP**（开发服务器在运行时）：
 
 ```bash
-curl -X POST http://localhost:<端口>/__zcode/annotations/archive \
+curl -X POST http://localhost:<端口>/__zw-web-annotations/archive \
   -H 'content-type: application/json' \
   -d '{"pageUrl":"http://localhost:5173/campus.html"}'
 ```
@@ -137,6 +137,6 @@ curl -X POST http://localhost:<端口>/__zcode/annotations/archive \
 任务全部处理完、不再需要留档时，清空归档目录：
 
 ```bash
-curl -X POST http://localhost:<端口>/__zcode/annotations/purge-archive \
+curl -X POST http://localhost:<端口>/__zw-web-annotations/purge-archive \
   -H 'content-type: application/json' -d '{"all":true}'
 ```

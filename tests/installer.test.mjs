@@ -61,7 +61,7 @@ test('install copies a self-contained runtime into the project', async () => {
   }
   // 运行时自包含：配置只引用项目内相对路径
   const cfg = await fs.readFile(path.join(dir, 'vite.config.mjs'), 'utf8');
-  assert.match(cfg, /\.\/\.zcode\/web-annotations\/runtime\/vite\/index\.mjs/);
+  assert.match(cfg, /\.\/\.zw-web-annotations\/runtime\/vite\/index\.mjs/);
   assert.doesNotMatch(cfg, /\/Users\//);
 });
 
@@ -70,7 +70,7 @@ test('install initializes workspace, metadata and gitignore', async () => {
   await installProject(dir);
   await fs.access(path.join(dir, WORK_ROOT, 'tasks'));
   const meta = JSON.parse(await fs.readFile(path.join(dir, META_FILE), 'utf8'));
-  assert.equal(meta.skill, 'zcode-web-annotations');
+  assert.equal(meta.skill, 'zw-web-annotations');
   // 版本必须真实落盘：曾因技能里没有 package.json 而永远写成 0.0.0，升级判断失效
   assert.equal(meta.skillVersion, SKILL_VERSION);
   assert.notEqual(meta.skillVersion, '0.0.0');
@@ -79,7 +79,7 @@ test('install initializes workspace, metadata and gitignore', async () => {
   assert.equal(meta.framework, 'vue');
   assert.equal(meta.frameworkMajor, 3);
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
-  assert.match(ignore, /\.zcode\/web-annotations\/tasks\//);
+  assert.match(ignore, /\.zw-web-annotations\/tasks\//);
 });
 
 test('githubignore is appended without clobbering existing content', async () => {
@@ -91,7 +91,7 @@ test('githubignore is appended without clobbering existing content', async () =>
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
   assert.match(ignore, /node_modules/);
   assert.match(ignore, /dist/);
-  assert.match(ignore, /\.zcode\/web-annotations\/tasks\//);
+  assert.match(ignore, /\.zw-web-annotations\/tasks\//);
 });
 
 test('declared tasks dir matches where the runtime actually writes', async () => {
@@ -141,15 +141,15 @@ test('install patches an existing config while preserving other plugins', async 
   });
   const result = await installProject(dir);
   assert.equal(result.integration.action, 'patched');
-  assert.equal(result.integration.backup, 'vite.config.ts.zcode-backup');
+  assert.equal(result.integration.backup, 'vite.config.ts.zw-backup');
 
   const patched = await fs.readFile(path.join(dir, 'vite.config.ts'), 'utf8');
-  assert.match(patched, /zcodeAnnotations/);
+  assert.match(patched, /zwAnnotations/);
   assert.match(patched, /react\(\)/); // 原有插件必须保留
   assert.match(patched, /port: 3000/); // 原有配置必须保留
   // 备份内容等于原始内容
-  const backup = await fs.readFile(path.join(dir, 'vite.config.ts.zcode-backup'), 'utf8');
-  assert.doesNotMatch(backup, /zcodeAnnotations/);
+  const backup = await fs.readFile(path.join(dir, 'vite.config.ts.zw-backup'), 'utf8');
+  assert.doesNotMatch(backup, /zwAnnotations/);
 });
 
 test('install is idempotent', async () => {
@@ -163,7 +163,7 @@ test('install is idempotent', async () => {
 
   const after = await fs.readFile(path.join(dir, 'vite.config.mjs'), 'utf8');
   assert.equal(before, after);
-  assert.equal((after.match(/zcodeAnnotations/g) || []).length, 2); // import + 调用，各一次
+  assert.equal((after.match(/zwAnnotations/g) || []).length, 2); // import + 调用，各一次
   assert.equal(first.integration.action, 'created');
 });
 
@@ -175,7 +175,7 @@ test('install fails safely when config has no plugins array, leaving it untouche
   assert.equal(after, original);
   // 不应留下备份残骸
   const entries = await fs.readdir(dir);
-  assert.equal(entries.filter(n => n.includes('zcode-backup')).length, 0);
+  assert.equal(entries.filter(n => n.includes('zw-backup')).length, 0);
 });
 
 test('install reports manual integration for non-Vite projects', async () => {
@@ -285,7 +285,7 @@ test('patchViteConfigContent is a pure, repeatable transform', () => {
   const input = "import { defineConfig } from 'vite';\n\nexport default defineConfig({\n  plugins: [],\n});\n";
   const once = patchViteConfigContent(input);
   assert.equal(once.changed, true);
-  assert.match(once.content, /zcodeAnnotations\(\{ dir:/);
+  assert.match(once.content, /zwAnnotations\(\{ dir:/);
   assert.equal(isPatched(once.content), true);
   const twice = patchViteConfigContent(once.content);
   assert.equal(twice.changed, false);
@@ -300,7 +300,7 @@ test('patchViteConfigContent inserts import after the last existing import', () 
     'export default defineConfig({ plugins: [react()] });',
   ].join('\n');
   const { content } = patchViteConfigContent(input);
-  const importIdx = content.indexOf('zcodeAnnotations }');
+  const importIdx = content.indexOf('zwAnnotations }');
   const reactImportIdx = content.indexOf('@vitejs/plugin-react');
   const exportIdx = content.indexOf('export default');
   assert.ok(importIdx > reactImportIdx, 'import 应放在已有 import 之后');

@@ -1,6 +1,6 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "Z Code Web Annotation Group",
+  "title": "AI agent Web Annotation Group",
   "type": "object",
   "additionalProperties": false,
   "required": ["version", "id", "createdAt", "updatedAt", "page", "tasks"],

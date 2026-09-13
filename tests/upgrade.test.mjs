@@ -40,7 +40,7 @@ const VITE_PKG = JSON.stringify({
 }, null, 2);
 
 async function seedTask(dir, instruction) {
-  const store = createStore(dir, { dir: '.zcode/web-annotations/tasks' });
+  const store = createStore(dir, { dir: '.zw-web-annotations/tasks' });
   await store.appendTasks({
     page: { url: 'http://example.test/', title: 't' },
     tasks: [{
@@ -100,7 +100,7 @@ test('upgrade replaces the runtime, clears stale files and preserves tasks', asy
   assert.equal(result.tasks.preserved, true, '任务组文件数升级前后必须一致');
 
   // 任务数据原样可读
-  const after = createStore(dir, { dir: '.zcode/web-annotations/tasks' });
+  const after = createStore(dir, { dir: '.zw-web-annotations/tasks' });
   const [group] = await after.listGroups();
   assert.equal(group.tasks[0].instruction, '升级期间数据必须原样保留');
   // 残留旧文件被清掉；新运行时完整

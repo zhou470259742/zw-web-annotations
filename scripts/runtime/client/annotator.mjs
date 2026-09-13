@@ -1,5 +1,5 @@
 /**
- * Z Code 网页标注组件（框架无关）
+ * 网页标注组件（框架无关）
  *
  * 交互模型：
  * - 点击元素 → 元素旁就地弹出编辑框 → Enter 确认即关闭并落盘 → 元素上出现编号图钉；
@@ -24,8 +24,8 @@ const STATUS_LABELS = {
   cancelled: '已取消',
 };
 
-const HOST_ID = 'zcode-annotation-host';
-const SOURCE = 'zcode-web-annotations';
+const HOST_ID = 'zw-annotation-host';
+const SOURCE = 'zw-web-annotations';
 const DRAFT_DELAY_MS = 900;
 
 /* ------------------------------------------------------------------ *
@@ -299,8 +299,23 @@ export function mountAnnotator(options = {}) {
   // 先清掉残留宿主再重新挂载，避免留下看得见却无法使用的面板。
   const existingHost = document.getElementById(HOST_ID);
   if (existingHost) {
-    if (window.__zcodeAnnotator) return window.__zcodeAnnotator;
+    if (window.__zwAnnotator) return window.__zwAnnotator;
     existingHost.remove();
+  }
+
+  // 旧键名一次性迁移（0.11.x 及更早的前缀是 zcode-web-annotations:*）：
+  // 折叠/分组偏好与未同步草稿搬到新前缀；服务端任务组始终是权威来源，
+  // 这里只增不减，搬完即删旧键。
+  try {
+    const legacyPrefix = 'zcode-web-annotations:';
+    for (const key of Object.keys(localStorage)) {
+      if (!key.startsWith(legacyPrefix)) continue;
+      const nextKey = `zw-web-annotations:${key.slice(legacyPrefix.length)}`;
+      if (localStorage.getItem(nextKey) == null) localStorage.setItem(nextKey, localStorage.getItem(key));
+      localStorage.removeItem(key);
+    }
+  } catch {
+    /* 存储被禁用时忽略 */
   }
 
   // 归组、任务 id 与缓冲键统一用去 hash 的规范地址：页内锚点变化
@@ -377,7 +392,7 @@ export function mountAnnotator(options = {}) {
 
   const host = document.createElement('div');
   host.id = HOST_ID;
-  host.setAttribute('data-zcode-annotations-ui', '');
+  host.setAttribute('data-zw-annotations-ui', '');
   const shadow = host.attachShadow({ mode: 'open' });
 
   const style = document.createElement('style');
@@ -1801,7 +1816,7 @@ export function mountAnnotator(options = {}) {
    * 复制处理提示词。
    *
    * 提示词不嵌入任务明细，只给出任务清单 JSON 的文件地址，
-   * 让 Z Code 自己去读取，避免提示词随任务增多而膨胀。
+   * 让 AI agent 自己去读取，避免提示词随任务增多而膨胀。
    * 地址必须来自同步成功后的真实文件路径，否则模型会去读一个不存在的文件。
    *
    * 存储按页面分成多个组文件，而标注是跨页面的：项目里有多个页面待处理时，
@@ -2308,12 +2323,12 @@ export function mountAnnotator(options = {}) {
       window.removeEventListener('scroll', repositionPins, true);
       document.documentElement.style.cursor = '';
       host.remove();
-      delete window.__zcodeAnnotator;
+      delete window.__zwAnnotator;
       return true;
     },
   };
 
-  window.__zcodeAnnotator = api;
+  window.__zwAnnotator = api;
   return api;
 }
 
@@ -2322,9 +2337,9 @@ export function detectEndpoint() {
   const script = typeof document !== 'undefined' ? document.currentScript : null;
   const fromScript = script && script.getAttribute && script.getAttribute('data-endpoint');
   if (fromScript) return fromScript;
-  const global = typeof window !== 'undefined' && window.__zcodeAnnotationsConfig && window.__zcodeAnnotationsConfig.endpoint;
+  const global = typeof window !== 'undefined' && window.__zwAnnotationsConfig && window.__zwAnnotationsConfig.endpoint;
   if (global) return global;
-  return '/__zcode/annotations';
+  return '/__zw-web-annotations';
 }
 
 /* ------------------------------------------------------------------ *
@@ -2778,7 +2793,7 @@ const CSS_TEXT = `
 /* 自动挂载在样式常量声明之后执行，避免初始化顺序导致的暂时性死区。 */
 if (typeof document !== 'undefined') {
   const script = document.currentScript;
-  const auto = script && script.hasAttribute && script.hasAttribute('data-zcode-annotations');
+  const auto = script && script.hasAttribute && script.hasAttribute('data-zw-annotations');
   if (auto) {
     const run = () => mountAnnotator({ collapsed: script.getAttribute('data-collapsed') !== 'false' });
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', run, { once: true });

@@ -11,7 +11,7 @@ export const MAX_BODY_BYTES = 24 * 1024 * 1024;
  * 任何一处写死别的路径，都会让「安装器说存在 tasks/，运行时却写到别处」
  * 这类不一致重新出现。
  */
-export const DEFAULT_DIR = '.zcode/web-annotations/tasks';
+export const DEFAULT_DIR = '.zw-web-annotations/tasks';
 export const ATTACHMENTS_DIRNAME = 'attachments';
 
 /**
@@ -24,7 +24,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.11.0';
+export const RUNTIME_VERSION = '0.12.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。

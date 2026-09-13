@@ -9,7 +9,7 @@
  * 用法（main.js）：
  *   import { createApp } from 'vue';
  *   import App from './App.vue';
- *   import { createAnnotations } from './.zcode/web-annotations/runtime/adapters/vue3.mjs';
+ *   import { createAnnotations } from './.zw-web-annotations/runtime/adapters/vue3.mjs';
  *
  *   const app = createApp(App);
  *   app.use(createAnnotations());

@@ -1,13 +1,13 @@
 /**
- * Z Code 网页标注 Vite 插件
+ * 网页标注 Vite 插件
  *
  * 作用：
  * 1. 仅在 dev 模式下把标注组件注入页面（构建产物不包含它）；
- * 2. 提供同源接口 /__zcode/annotations/*，直接把任务写入本地工作区。
+ * 2. 提供同源接口 /__zw-web-annotations/*，直接把任务写入本地工作区。
  *
  * 用法（vite.config.js）：
- *   import { zcodeAnnotations } from './.zcode/web-annotations/runtime/vite/index.mjs';
- *   export default { plugins: [zcodeAnnotations()] };
+ *   import { zwAnnotations } from './.zw-web-annotations/runtime/vite/index.mjs';
+ *   export default { plugins: [zwAnnotations()] };
  */
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -17,7 +17,7 @@ import { createStore, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
-const ROUTE_PREFIX = '/__zcode/annotations';
+const ROUTE_PREFIX = '/__zw-web-annotations';
 
 /**
  * 判断是否要临时关掉标注能力。
@@ -60,7 +60,7 @@ function parseBody(raw) {
   }
 }
 
-export function zcodeAnnotations(options = {}) {
+export function zwAnnotations(options = {}) {
   const config = {
     // 默认写入当前项目根目录；可显式指定其他工作区目录
     workspace: options.workspace || process.cwd(),
@@ -69,10 +69,10 @@ export function zcodeAnnotations(options = {}) {
     inject: options.inject !== false,
     collapsed: options.collapsed !== false,
     meta: options.meta,
-    // 临时关闭：enabled: false 或环境变量 ZCODE_ANNOTATIONS=off。
+    // 临时关闭：enabled: false 或环境变量 ZW_ANNOTATIONS=off。
     // 环境变量优先，便于不改配置文件就关掉（改配置要重启，改 env 也要重启，
     // 但 env 不必动仓库里被 git 跟踪的文件）。
-    enabled: options.enabled !== false && !isDisabled(process.env.ZCODE_ANNOTATIONS),
+    enabled: options.enabled !== false && !isDisabled(process.env.ZW_ANNOTATIONS),
     ...options,
   };
 
@@ -86,7 +86,7 @@ export function zcodeAnnotations(options = {}) {
     const source = await fs.readFile(CLIENT_FILE, 'utf8');
     const bootstrap = {
       endpoint: config.endpoint,
-      label: options.label || 'Z Code 标注',
+      label: options.label || '网页标注',
       collapsed: config.collapsed,
       // 版本随配置下发，供组件 API 与排查时确认"页面里跑的是哪一版运行时"。
       // 组件不自己写版本号，避免两处各自漂移。
@@ -96,19 +96,19 @@ export function zcodeAnnotations(options = {}) {
     // 不依赖组件内部的 data 属性自动挂载分支。
     return [
       source,
-      `const __zcodeConfig = ${JSON.stringify(bootstrap)};`,
-      `if (typeof window !== 'undefined') { window.__zcodeAnnotationsConfig = __zcodeConfig; }`,
-      `function __zcodeAutoMount() { if (typeof window !== 'undefined') mountAnnotator({ ...__zcodeConfig }); }`,
+      `const __zwConfig = ${JSON.stringify(bootstrap)};`,
+      `if (typeof window !== 'undefined') { window.__zwAnnotationsConfig = __zwConfig; }`,
+      `function __zwAutoMount() { if (typeof window !== 'undefined') mountAnnotator({ ...__zwConfig }); }`,
       `if (typeof document !== 'undefined') {`,
-      `  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', __zcodeAutoMount, { once: true });`,
-      `  else __zcodeAutoMount();`,
+      `  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', __zwAutoMount, { once: true });`,
+      `  else __zwAutoMount();`,
       `}`,
       `export default mountAnnotator;`,
     ].join('\n');
   }
 
   return {
-    name: 'zcode-web-annotations',
+    name: 'zw-web-annotations',
     apply: 'serve',
 
     async transformIndexHtml(html) {
@@ -128,7 +128,7 @@ export function zcodeAnnotations(options = {}) {
         attrs: {
           type: 'module',
           src: `${clientRoute}?v=${version}`,
-          'data-zcode-annotations': '',
+          'data-zw-annotations': '',
           'data-endpoint': config.endpoint,
           'data-collapsed': config.collapsed ? 'true' : 'false',
         },
@@ -151,7 +151,7 @@ export function zcodeAnnotations(options = {}) {
         if (!req.url || !req.url.startsWith(ROUTE_PREFIX)) return next();
         // 关闭时不注册任何接口：留着接口会出现「界面没了但还在写文件」，
         // 比明确 404 更让人困惑。
-        if (!config.enabled) return sendJson(res, 404, { error: 'annotations disabled', hint: 'ZCODE_ANNOTATIONS=off' });
+        if (!config.enabled) return sendJson(res, 404, { error: 'annotations disabled', hint: 'ZW_ANNOTATIONS=off' });
         const url = new URL(req.url, 'http://localhost');
         const route = url.pathname.slice(ROUTE_PREFIX.length) || '/';
 
@@ -302,4 +302,4 @@ export function zcodeAnnotations(options = {}) {
   };
 }
 
-export default zcodeAnnotations;
+export default zwAnnotations;

@@ -122,7 +122,7 @@ async function runDoctor(root) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   const command = args._[0] || 'detect';
-  const root = path.resolve(args.root || process.env.ZCODE_PROJECT_DIR || process.cwd());
+  const root = path.resolve(args.root || process.env.ZW_PROJECT_DIR || process.cwd());
   const options = {
     framework: args.framework,
     force: !!args.force,

@@ -8,7 +8,7 @@
  *
  * 以 Express 为例：
  *   import express from 'express';
- *   import { createAnnotationsMiddleware } from './.zcode/web-annotations/runtime/adapters/http.mjs';
+ *   import { createAnnotationsMiddleware } from './.zw-web-annotations/runtime/adapters/http.mjs';
  *   const app = express();
  *   app.use(createAnnotationsMiddleware({ workspace: process.cwd() }));
  *
@@ -55,12 +55,12 @@ function readBody(req) {
 
 /**
  * 创建一个 connect 风格中间件（Express/Connect/webpack-dev-server 通用）。
- * 只处理 /__zcode/annotations 前缀，其他请求交给 next()。
+ * 只处理 /__zw-web-annotations 前缀，其他请求交给 next()。
  */
 export function createAnnotationsMiddleware(options = {}) {
   const config = {
-    route: options.route || '/__zcode/annotations',
-    clientPath: options.clientPath || '/__zcode/annotations/client.js',
+    route: options.route || '/__zw-web-annotations',
+    clientPath: options.clientPath || '/__zw-web-annotations/client.js',
     workspace: options.workspace || process.cwd(),
     dir: options.dir,
     collapsed: options.collapsed !== false,
@@ -76,18 +76,18 @@ export function createAnnotationsMiddleware(options = {}) {
     const bootstrap = { endpoint: config.route, collapsed: config.collapsed, version: RUNTIME_VERSION };
     return [
       source,
-      `const __zcodeConfig = ${JSON.stringify(bootstrap)};`,
-      `if (typeof window !== 'undefined') { window.__zcodeAnnotationsConfig = __zcodeConfig; }`,
-      `function __zcodeAutoMount() { if (typeof window !== 'undefined') mountAnnotator({ ...__zcodeConfig }); }`,
+      `const __zwConfig = ${JSON.stringify(bootstrap)};`,
+      `if (typeof window !== 'undefined') { window.__zwAnnotationsConfig = __zwConfig; }`,
+      `function __zwAutoMount() { if (typeof window !== 'undefined') mountAnnotator({ ...__zwConfig }); }`,
       `if (typeof document !== 'undefined') {`,
-      `  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', __zcodeAutoMount, { once: true });`,
-      `  else __zcodeAutoMount();`,
+      `  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', __zwAutoMount, { once: true });`,
+      `  else __zwAutoMount();`,
       `}`,
       `export default mountAnnotator;`,
     ].join('\n');
   }
 
-  return async function zcodeAnnotationsMiddleware(req, res, next) {
+  return async function zwAnnotationsMiddleware(req, res, next) {
     const raw = req.url || '';
     const [pathname] = raw.split('?');
     const query = new URLSearchParams(raw.includes('?') ? raw.slice(raw.indexOf('?') + 1) : '');
@@ -212,9 +212,9 @@ export function createAnnotationsMiddleware(options = {}) {
  * 适用于任何能在响应 HTML 前改写的开发服务器。
  */
 export function injectAnnotatorScript(html, options = {}) {
-  const clientPath = options.clientPath || '/__zcode/annotations/client.js';
+  const clientPath = options.clientPath || '/__zw-web-annotations/client.js';
   if (html.includes(clientPath)) return html;
-  const tag = `<script type="module" src="${clientPath}" data-zcode-annotations data-endpoint="${options.route || '/__zcode/annotations'}" data-collapsed="${options.collapsed === false ? 'false' : 'true'}"></script>`;
+  const tag = `<script type="module" src="${clientPath}" data-zw-annotations data-endpoint="${options.route || '/__zw-web-annotations'}" data-collapsed="${options.collapsed === false ? 'false' : 'true'}"></script>`;
   return html.includes('</body>') ? html.replace('</body>', `${tag}\n</body>`) : `${html}\n${tag}`;
 }
 
@@ -227,7 +227,7 @@ export function injectAnnotatorScript(html, options = {}) {
  *    因此一旦发现 content-encoding，就原样放行已缓冲的数据。
  */
 function wrapHtmlResponse(req, res, options) {
-  const clientPath = options.clientPath || '/__zcode/annotations/client.js';
+  const clientPath = options.clientPath || '/__zw-web-annotations/client.js';
   const chunks = [];
   const originalWrite = res.write.bind(res);
   const originalEnd = res.end.bind(res);

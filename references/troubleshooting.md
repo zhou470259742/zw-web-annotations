@@ -33,7 +33,7 @@ node "<技能目录>/scripts/cli.mjs" install --root "<项目目录>" --force
 **接口不通**。先确认中间件/插件已生效：
 
 ```bash
-curl -s http://localhost:<端口>/__zcode/annotations/health
+curl -s http://localhost:<端口>/__zw-web-annotations/health
 ```
 
 应当返回 `{"ok":true,...}`。返回 HTML 说明请求被 dev server 的 fallback 接走了，即**插件没加载**。
@@ -49,7 +49,7 @@ lsof -nP -iTCP:<端口> -sTCP:LISTEN
 **插件没加载**。检查构建配置：
 
 ```bash
-grep -n "zcodeAnnotations" vite.config.* 2>/dev/null
+grep -n "zwAnnotations" vite.config.* 2>/dev/null
 ```
 
 没有输出说明没接上，重新执行 install。若有输出但仍不生效：
@@ -63,7 +63,7 @@ grep -n "zcodeAnnotations" vite.config.* 2>/dev/null
 
 UI 能显示说明脚本加载成功，问题在写盘接口。
 
-- 检查 Network 里 `POST /__zcode/annotations/append` 的状态码；
+- 检查 Network 里 `POST /__zw-web-annotations/append` 的状态码；
 - **404**：中间件没注册。Vue CLI / webpack 项目最常见的就是漏了 `setupMiddlewares` 那一段，见 `integration.md`；
 - **400** 且提示 `invalid annotation group`：payload 不完整，属于组件问题，请带上响应内容反馈；
 - **CORS 报错**：接口和页面不同源。确认访问页面的地址与接口地址同一 host:port。
@@ -73,17 +73,17 @@ UI 能显示说明脚本加载成功，问题在写盘接口。
 检查安装元数据里声明的目录：
 
 ```bash
-cat "<项目>/.zcode/web-annotations/install.json"
+cat "<项目>/.zw-web-annotations/install.json"
 ```
 
 对比 `tasksDir` 与实际落盘位置：
 
 ```bash
-find "<项目>/.zcode/web-annotations" -name "*.json" -not -path "*/runtime/*"
+find "<项目>/.zw-web-annotations" -name "*.json" -not -path "*/runtime/*"
 ```
 
-**常见原因**：中间件没传 `dir`，于是回退到默认目录 `.zcode/web-annotations/`，而安装器初始化的是 `.zcode/web-annotations/tasks/`。
-解决：给 `createAnnotationsMiddleware` 显式传 `dir: '.zcode/web-annotations/tasks'`。
+**常见原因**：中间件没传 `dir`，于是回退到默认目录 `.zw-web-annotations/`，而安装器初始化的是 `.zw-web-annotations/tasks/`。
+解决：给 `createAnnotationsMiddleware` 显式传 `dir: '.zw-web-annotations/tasks'`。
 
 ## 7. 图片附件打不开
 
@@ -97,11 +97,11 @@ ls "<项目>/<images[].file 的值>"
 
 ## 8. 配置被改坏了
 
-接入时备份为 `*.zcode-backup`：
+接入时备份为 `*.zw-backup`：
 
 ```bash
-ls vite.config.*.zcode-backup
-cp vite.config.ts.zcode-backup vite.config.ts
+ls vite.config.*.zw-backup
+cp vite.config.ts.zw-backup vite.config.ts
 ```
 
 安装器在写入前会做 `node --check` 语法校验，校验失败会自动回滚并报错，因此正常情况下不会留下坏配置。
@@ -112,7 +112,7 @@ cp vite.config.ts.zcode-backup vite.config.ts
 组件脚本带内容哈希（`?v=<sha1>`），源码变化时 URL 会变，浏览器必然重新拉取。
 Vite 插件同时监听文件变化并触发整页刷新。若仍不生效：
 
-- 确认改的是项目内 `.zcode/web-annotations/runtime/client/annotator.mjs`（运行时是副本，改仓库源码不会影响已安装的项目）；
+- 确认改的是项目内 `.zw-web-annotations/runtime/client/annotator.mjs`（运行时是副本，改仓库源码不会影响已安装的项目）；
 - 重启开发服务器。
 
 **升级运行时的正确方式是重新安装**：
@@ -133,25 +133,25 @@ node "<技能目录>/scripts/cli.mjs" install --root "<项目目录>" --force
 **环境变量**（推荐临时用，不必改仓库里的文件）：
 
 ```bash
-ZCODE_ANNOTATIONS=off npm run dev
+ZW_ANNOTATIONS=off npm run dev
 ```
 
 **插件选项**（适合长期关闭某个项目）：
 
 ```js
 // vite.config.mjs
-zcodeAnnotations({ dir: '.zcode/web-annotations/tasks', enabled: false })
+zwAnnotations({ dir: '.zw-web-annotations/tasks', enabled: false })
 ```
 
-关闭是**整条链路一起关**：页面不再注入组件，接口 `/__zcode/annotations/*` 也返回 404。
+关闭是**整条链路一起关**：页面不再注入组件，接口 `/__zw-web-annotations/*` 也返回 404。
 不会出现「界面没了但还在往工作区写文件」这种半关状态。
 
-辨认方法：`ZCODE_ANNOTATIONS` 只有明确写成 `0` / `off` / `false` / `no` / `disable` / `disabled` 才算关闭，
+辨认方法：`ZW_ANNOTATIONS` 只有明确写成 `0` / `off` / `false` / `no` / `disable` / `disabled` 才算关闭，
 其他值（含空值、`on`、随便一个字符串）都保持开启——避免环境里一个无关变量把功能误关掉。
 关闭状态访问接口会得到：
 
 ```json
-{ "error": "annotations disabled", "hint": "ZCODE_ANNOTATIONS=off" }
+{ "error": "annotations disabled", "hint": "ZW_ANNOTATIONS=off" }
 ```
 
 **生产构建不受此开关影响**：插件是 `apply: 'serve'`，只在开发模式生效，构建产物里本来就没有标注器（见下条）。
@@ -160,14 +160,14 @@ zcodeAnnotations({ dir: '.zcode/web-annotations/tasks', enabled: false })
 
 没有。插件声明了 `apply: 'serve'`，Vite 在 `build` 时不会加载它，因此：
 
-- 构建产物里**不会**有组件脚本，也不会有 `data-zcode-annotations` 注入标签；
+- 构建产物里**不会**有组件脚本，也不会有 `data-zw-annotations` 注入标签；
 - 接口只在 dev server 上存在，生产环境没有这个路由。
 
 想自己确认，构建后在产物里搜特征串：
 
 ```bash
 npm run build
-grep -rl "zcode-annotations\|__zcode\|mountAnnotator" dist/ || echo "✅ 无残留"
+grep -rl "zcode-annotations\|__zw\|mountAnnotator" dist/ || echo "✅ 无残留"
 ```
 
 有输出才说明出了问题，请带上输出反馈。注意 `--mode production` 之类的参数不影响这个结论，
