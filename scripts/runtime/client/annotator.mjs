@@ -709,6 +709,7 @@ export function mountAnnotator(options = {}) {
           <span class="panel-meta" data-el="panelMeta"></span>
         </div>
         <button type="button" class="panel-board" data-act="board" title="在新标签打开任务看板（按状态总览全部任务）">看板</button>
+        <button type="button" class="panel-theme" data-el="themeBtn" data-act="theme" title="切换明亮/暗色主题">🌙</button>
         <span class="panel-version" data-el="panelVersion" title="标注组件运行时版本"></span>
         <button type="button" class="panel-collapse" data-act="collapse" title="收起">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -1242,6 +1243,33 @@ export function mountAnnotator(options = {}) {
    * 首个 doing（定稿）到交付之间锁死，交付后自动恢复。以服务端摘要为准；
    * 摘要缺失（旧版运行时）时不锁——宁可宽松也不误锁。
    */
+  /* ---- 明亮/暗色主题：偏好记 localStorage，属性挂在宿主上随 CSS 生效 ---- */
+  const PANEL_THEME_KEY = 'zwa-panel-theme';
+
+  function applyPanelTheme(theme) {
+    const value = theme === 'light' ? 'light' : 'dark';
+    const host = document.getElementById(HOST_ID);
+    if (host) host.setAttribute('data-zwa-theme', value);
+    const btn = $('[data-el="themeBtn"]');
+    if (btn) {
+      btn.textContent = value === 'light' ? '☀️' : '🌙';
+      btn.title = value === 'light' ? '当前明亮主题，点击切换为暗色' : '当前暗色主题，点击切换为明亮';
+    }
+  }
+
+  function togglePanelTheme() {
+    const host = document.getElementById(HOST_ID);
+    const next = host && host.getAttribute('data-zwa-theme') === 'light' ? 'dark' : 'light';
+    try { localStorage.setItem(PANEL_THEME_KEY, next); } catch { /* 隐私模式等场景忽略 */ }
+    applyPanelTheme(next);
+  }
+
+  function restorePanelTheme() {
+    let saved = null;
+    try { saved = localStorage.getItem(PANEL_THEME_KEY); } catch { /* 忽略 */ }
+    applyPanelTheme(saved);
+  }
+
   function executionLocked() {
     return !!(state.serverRound
       && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound')
@@ -2904,6 +2932,7 @@ export function mountAnnotator(options = {}) {
       event.preventDefault();
       if (act === 'expand') expandBar();
       else if (act === 'collapse') setCollapsed(true);
+      else if (act === 'theme') togglePanelTheme();
       else if (act === 'board') window.open(`${config.endpoint}/board`, '_blank');
       else if (act === 'toggle') setActive(!state.active);
       else if (act === 'clear') {
@@ -2986,6 +3015,7 @@ export function mountAnnotator(options = {}) {
   document.documentElement.append(host);
   // 版本由宿主（Vite 插件 / http 适配器）随 bootstrap 注入，与技能版本同源
   $('[data-el="panelVersion"]').textContent = config.version ? `v${config.version}` : '';
+  restorePanelTheme();
   renderBar();
   renderPins();
   renderMessage();
@@ -3786,6 +3816,123 @@ const CSS_TEXT = `
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   color: #8fd6a0; font-size: 11px;
 }
+
+/* ------------------------------------------------------------------ *
+ * 明亮主题：宿主 data-zwa-theme="light" 时覆盖暗色基底。
+ * 只做加法覆盖，暗色规则保持原样；色板与看板明亮主题同一套语言。
+ * ------------------------------------------------------------------ */
+:host([data-zwa-theme="light"]) {
+  --zwa-surface: #ffffff;
+  --zwa-surface-soft: #f2f3f7;
+  --zwa-surface-hover: #e9ebf2;
+  --zwa-border: #e3e5ec;
+  --zwa-border-strong: #d5d8e2;
+  --zwa-text: #1f2430;
+  --zwa-text-secondary: #5b6472;
+  --zwa-text-muted: #8a92a3;
+  --zwa-shadow: rgba(15, 23, 42, .14);
+}
+:host([data-zwa-theme="light"]) .dock {
+  background: var(--zwa-surface); border-color: var(--zwa-border-strong);
+  box-shadow: 0 8px 22px var(--zwa-shadow);
+}
+:host([data-zwa-theme="light"]) .dock-btn { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .dock-btn:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .dock-count { color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .dock-count:hover { background: var(--zwa-surface-hover); }
+:host([data-zwa-theme="light"]) .dock-dot { background: #b9bfcc; }
+:host([data-zwa-theme="light"]) .dock-sep { background: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .panel {
+  background: var(--zwa-surface); color: var(--zwa-text);
+  border-color: var(--zwa-border-strong);
+  box-shadow: 0 16px 40px var(--zwa-shadow);
+}
+:host([data-zwa-theme="light"]) .panel-meta { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel-version { background: var(--zwa-surface-soft); color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel-collapse { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .panel-collapse:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .panel-theme {
+  flex: none; width: 24px; height: 24px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--zwa-text-secondary); font-size: 13px;
+}
+:host([data-zwa-theme="light"]) .panel-theme:hover { background: var(--zwa-surface-hover); }
+:host([data-zwa-theme="light"]) .panel-board { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel-board:hover { color: #4f5bd5; }
+:host([data-zwa-theme="light"]) .panel-tools { border-bottom-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .panel-tools button { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .panel-tools button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .panel-tools button[data-active="on"] { background: #dedaff; color: #29215e; }
+:host([data-zwa-theme="light"]) .panel-tools button.primary { background: #4f5bd5; color: #fff; }
+:host([data-zwa-theme="light"]) .panel-tools button.primary:hover { background: #5f6ae0; color: #fff; }
+:host([data-zwa-theme="light"]) .panel-tools button.ghost-danger { color: #c25656; }
+:host([data-zwa-theme="light"]) .panel-tools button.ghost-danger:hover { background: #fdeaea; color: #a83b3b; }
+:host([data-zwa-theme="light"]) .panel-progress { border-bottom-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .progress-label { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .progress-pct { color: #4f5bd5; }
+:host([data-zwa-theme="light"]) .progress-track { background: #e8eaf0; }
+:host([data-zwa-theme="light"]) .mode-switch { border-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .mode-switch button { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .mode-switch button + button { border-left-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .mode-switch button:hover { color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .mode-switch button[data-active="on"] { background: #e6e2ff; color: #3d3a8c; }
+:host([data-zwa-theme="light"]) .mode-switch button:disabled:hover { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .progress-head .archive-btn { border-color: #2e9e57; color: #2e9e57; }
+:host([data-zwa-theme="light"]) .progress-head .archive-btn:hover { background: #e7f6ee; }
+:host([data-zwa-theme="light"]) *::-webkit-scrollbar-thumb { background: #c9cdd8; border: 2px solid transparent; border-radius: 999px; background-clip: padding-box; }
+:host([data-zwa-theme="light"]) *::-webkit-scrollbar-thumb:hover { background-color: #b0b6c4; }
+:host([data-zwa-theme="light"]) .panel-list,
+:host([data-zwa-theme="light"]) .editor-details,
+:host([data-zwa-theme="light"]) .editor-images,
+:host([data-zwa-theme="light"]) .editor-pill textarea,
+:host([data-zwa-theme="light"]) .panel .item textarea { scrollbar-color: #c9cdd8 transparent; }
+:host([data-zwa-theme="light"]) .panel .empty { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel .item { border-color: var(--zwa-border); background: #f9fafc; }
+:host([data-zwa-theme="light"]) .panel .item.editing { border-color: #7c6cff; }
+:host([data-zwa-theme="light"]) .panel .item-thumbs img { border-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .panel .thumb-file { border-color: var(--zwa-border); background: var(--zwa-surface-soft); color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel .item textarea { border-color: var(--zwa-border); background: #fff; color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .panel .item textarea:focus { border-color: #7c6cff; }
+:host([data-zwa-theme="light"]) .panel .item-foot code { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel .tag { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .panel .tag.status-todo { color: #3b6ef0; }
+:host([data-zwa-theme="light"]) .panel .tag.status-doing { color: #d97a2e; }
+:host([data-zwa-theme="light"]) .panel .tag.status-review { color: #b07d1c; }
+:host([data-zwa-theme="light"]) .panel .tag.status-done { color: #2e9e57; }
+:host([data-zwa-theme="light"]) .panel .tag.status-blocked { color: #d04b4b; }
+:host([data-zwa-theme="light"]) .panel .tag.status-cancelled { color: #7a8291; }
+:host([data-zwa-theme="light"]) .panel .tag.queued { color: #a07827; border-color: #d8c391; }
+:host([data-zwa-theme="light"]) .panel .tag.pending { color: #7a5fc0; border-color: #c4b4ee; }
+:host([data-zwa-theme="light"]) .panel .tag.warn { color: #b07d1c; }
+:host([data-zwa-theme="light"]) .panel button.link { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .panel button.link.danger { color: #d04b4b; }
+:host([data-zwa-theme="light"]) .panel .item.locked { border-color: var(--zwa-border); background: #f1f2f6; }
+:host([data-zwa-theme="light"]) .panel .item.locked .item-title { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel .item.locked textarea { background: #f6f7fa; color: var(--zwa-text-muted); cursor: not-allowed; }
+:host([data-zwa-theme="light"]) .panel .lock-note { color: #b07d1c; border-color: #e2d3ac; }
+:host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: #c9c4f0; }
+:host([data-zwa-theme="light"]) .group-head { border-color: var(--zwa-border); background: var(--zwa-surface-soft); }
+:host([data-zwa-theme="light"]) .group-head:hover { background: var(--zwa-surface-hover); }
+:host([data-zwa-theme="light"]) .group-chevron { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .group-name { color: #333a46; }
+:host([data-zwa-theme="light"]) .group-badge { background: #dedaff; color: #29215e; }
+:host([data-zwa-theme="light"]) .group-badge.review { background: #f5ecd7; color: #8a6a1e; }
+:host([data-zwa-theme="light"]) .group-sub { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .group-count { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel footer { border-top-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .panel-msg { color: #2e9e57; }
+:host([data-zwa-theme="light"]) .editor-details { background: #fff; color: var(--zwa-text); border-color: var(--zwa-border-strong); box-shadow: 0 12px 30px var(--zwa-shadow); }
+:host([data-zwa-theme="light"]) .detail-row + .detail-row { border-top-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .detail-label,
+:host([data-zwa-theme="light"]) .detail-empty { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .detail-value .dim { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .confirm-card { background: #fff; color: var(--zwa-text); border-color: var(--zwa-border-strong); box-shadow: 0 20px 50px var(--zwa-shadow); }
+:host([data-zwa-theme="light"]) .confirm-card p { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .confirm-actions button { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .confirm-actions button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .thumb { border-color: var(--zwa-border-strong); background: #fff; }
+:host([data-zwa-theme="light"]) .size-badge { box-shadow: 0 2px 8px var(--zwa-shadow); }
 `;
 
 /* 自动挂载在样式常量声明之后执行，避免初始化顺序导致的暂时性死区。 */
