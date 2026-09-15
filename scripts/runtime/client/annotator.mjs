@@ -1467,7 +1467,18 @@ export function mountAnnotator(options = {}) {
     // 点图钉/详情打开编辑器：新指令存为 pendingInstruction，批次交付时
     // 统一重开为下一轮的 todo（服务端语义，见 store.mjs appendTasks）。
     const locked = task.status === 'doing';
-    const readonly = task.status !== 'todo';
+    // 轮次冻结后，同批 todo 已随首个 doing 整批读取进当前处理批次：
+    // 与未入批的普通待处理不同——不可删、不可就地改（新要求走编辑器 → 下一轮），
+    // 避免面板把它们显示成随时可动的普通待处理。
+    const activeRound = (state.serverRound && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound'))
+      ? state.serverRound.activeRound
+      : null;
+    const batchQueued = !locked
+      && activeRound != null
+      && task.round != null
+      && task.round === activeRound
+      && task.status === 'todo';
+    const readonly = task.status !== 'todo' || batchQueued;
     // 处理开始后新增的批注没有轮次号 → 排队下一轮（有轮次在身时才显示徽标）
     const queued = state.roundQueued && task.round == null;
     const pending = typeof task.pendingInstruction === 'string' && task.pendingInstruction.trim();
@@ -1478,16 +1489,19 @@ export function mountAnnotator(options = {}) {
       : '';
     const readonlyAttr = readonly ? ' readonly' : '';
     const readonlyHint = readonly
-      ? ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"'
+      ? (batchQueued
+        ? ' title="本批已整批锁定读取，暂不可就地修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"'
+        : ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"')
       : '';
     return `
-    <article class="item${task.id === state.editingId ? ' editing' : ''}${locked ? ' locked' : ''}" data-item="${task.id}">
+    <article class="item${task.id === state.editingId ? ' editing' : ''}${locked || batchQueued ? ' locked' : ''}" data-item="${task.id}">
       <div class="item-head">
         <span class="item-seq${manual ? ' manual' : ''}">${seq}</span>
         <span class="item-title">${escapeHtml(title)}</span>
         ${locked ? '<span class="lock-note" title="正在处理中，暂不可修改或删除">🔒 处理中</span>' : ''}
+        ${batchQueued ? '<span class="lock-note" title="已锁定进当前处理批次：整批读取后按顺序完成，暂不可修改或删除；新要求可通过详情提交，下一轮处理">🔒 本批待处理</span>' : ''}
         ${current ? `<button type="button" class="link" data-details="${escapeHtml(task.id)}" title="查看元素详情">详情</button>` : ''}
-        ${locked
+        ${locked || batchQueued
           ? ''
           : `<button type="button" class="link danger" data-del="${escapeHtml(task.id)}" title="删除">✕</button>`}
       </div>
