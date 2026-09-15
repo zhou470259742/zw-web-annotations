@@ -2733,6 +2733,25 @@ export function mountAnnotator(options = {}) {
     if (isEditing()) event.stopPropagation();
   }
 
+  /**
+   * 编辑器打开期间锁住焦点：应用里的弹窗（如 Naive UI 的 n-modal）自带
+   * 焦点陷阱，会把刚聚焦到注释输入框的焦点立刻拉回弹窗——胶囊输入框
+   * 看得见却打不了字。这里在 focusout 捕获阶段同步把焦点拉回输入框：
+   * 同步 focus 会取消这次焦点转移，陷阱的 focusin 根本不会发生，也就
+   * 不存在来回抢的抖动。编辑器自己的关闭路径（Esc/确认）会先改状态，
+   * 此时 isEditing() 已为 false，不会拦截。
+   */
+  function onEditorFocusLeak(event) {
+    if (!isEditing()) return;
+    const input = $('[data-el="editorInput"]');
+    if (!input) return;
+    const fromOwnUi = event.target === host || host.contains(event.target);
+    if (!fromOwnUi) return;
+    const next = event.relatedTarget;
+    if (next && (next === host || host.contains(next))) return;
+    input.focus({ preventScroll: true });
+  }
+
   function onClick(event) {
     const target = event.target;
     if (!target || target.nodeType !== 1) return;
@@ -3005,6 +3024,7 @@ export function mountAnnotator(options = {}) {
     // mousedown 必须早于 click 拦下：页面控件的聚焦发生在 mousedown 阶段，
     // 只拦 click 的话输入框已经拿到焦点了。
     document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('focusout', onEditorFocusLeak, true);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
     window.addEventListener('scroll', onScroll, true);
