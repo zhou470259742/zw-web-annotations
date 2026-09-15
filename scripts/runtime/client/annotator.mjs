@@ -83,6 +83,103 @@ export function computeProgress(tasks = []) {
   return { percent, total, counts, started, devDone, verified };
 }
 
+/**
+ * 本地降级推断：当前轮（活动任务中最大的轮次号）与排队数。
+ *
+ * 只在服务端没有返回轮次摘要（旧版运行时）时使用。已交付但还没归档的
+ * 旧轮次任务（round 更小）不算——它们不属于任何在途工作，混进分母会让
+ * 进度倒退；尚未定稿的排队任务以 queued 单独返回，显示「下一轮 N 条」。
+ * 服务端摘要可用时一律以 `resolveRoundScope` 的权威口径为准。
+ */
+export function selectProgressTasks(tasks = []) {
+  const all = (Array.isArray(tasks) ? tasks : []).filter(t => t && t.id);
+  const withRound = all.filter(t => t.round != null);
+  const currentRound = withRound.reduce((m, t) => Math.max(m, t.round), 0) || null;
+  return {
+    dispatched: withRound.filter(t => t.round === currentRound),
+    queued: all.filter(t => t.round == null && (t.status === 'todo' || t.status === 'doing')).length,
+    currentRound,
+  };
+}
+
+/**
+ * 解析进度统计范围：分母统一为「本轮定稿集合」，服务端摘要优先。
+ *
+ * 两种执行模式（round/queue）共用同一个分母口径——本轮定稿时冻结的任务
+ * 集合，含定稿后并入的标注；归档轮次的存量不进任何进度条。模式的区别
+ * 只在边界行为：round 停下等显式归档，queue 自动归档并续轮。
+ *
+ * 服务端 `roundSummary` 以 `execution.activeRound` 为唯一权威：本轮成员在
+ * 第一个任务进入 doing 时就被原子冻结，之后新增的标注要么并入本轮、要么
+ * 排队，分母随之如实增减。客户端若自行用「活动任务最大轮次号」推断，会在
+ * 旧轮任务尚未归档时把它误当成当前轮——因此只要服务端给了摘要就一律采用；
+ * 只有旧版运行时没有 `round` 字段（serverRound 为 null）才回落到本地推断。
+ *
+ * `serverRound` 存在时必定带 `activeRound` 键（可能为 null）。null 表示本轮
+ * 已交付、当前没有在途轮次，此时不能再从任务里把旧轮翻出来。
+ */
+export function resolveRoundScope(tasks = [], execution = {}, serverRound = null) {
+  const all = (Array.isArray(tasks) ? tasks : []).filter(t => t && t.id);
+  const mode = execution?.mode || 'round';
+  const fallback = selectProgressTasks(all);
+  const runner = serverRound?.runner || execution?.runner || { status: 'idle' };
+  const authority = serverRound && Object.prototype.hasOwnProperty.call(serverRound, 'activeRound')
+    ? serverRound
+    : null;
+  const activeRound = authority ? authority.activeRound : fallback.currentRound;
+  const dispatched = activeRound == null ? [] : all.filter(t => t.round === activeRound);
+  return {
+    all,
+    mode,
+    dispatched,
+    // 排队数用服务端口径（round 为空的 todo/doing）；摘要缺失时才本地数
+    queued: Number.isFinite(authority?.queued) ? authority.queued : fallback.queued,
+    currentRound: activeRound,
+    complete: authority ? !!authority.complete : null,
+    // blocked 要显式可见：它会让本轮无法交付、队列无法续轮，静默停住会
+    // 被误读成卡死。
+    blocked: runner.status === 'blocked'
+      || dispatched.some(t => t && t.status === 'blocked')
+      || (authority?.counts?.blocked || 0) > 0,
+    runner,
+  };
+}
+
+export function pathIsAbsolute(value) {
+  const text = String(value || '');
+  return text.startsWith('/') || /^[A-Za-z]:[\\/]/.test(text);
+}
+
+export function buildAddressPrompt(tasksPath, protocolPath) {
+  if (!pathIsAbsolute(tasksPath) || !pathIsAbsolute(protocolPath)) return null;
+  return [
+    '请按执行要求处理以下网页标注任务：',
+    `任务目录：${tasksPath}`,
+    `执行要求：${protocolPath}`,
+    '以上地址必须都能读取；任一无法读取时停下来告知用户，不要凭猜测执行。',
+  ].join('\n');
+}
+
+export function mergeRemoteTasks(remoteTasks = [], localTasks = [], outbox = []) {
+  if (!outbox.length) return (remoteTasks || []).filter(t => t?.id);
+  const localById = new Map((localTasks || []).filter(t => t?.id).map(t => [t.id, t]));
+  const deleted = new Set(outbox.flatMap(op => op?.ids || []));
+  const merged = [];
+  const seen = new Set();
+  for (const remote of remoteTasks || []) {
+    if (!remote?.id || deleted.has(remote.id)) continue;
+    const local = localById.get(remote.id);
+    merged.push(local
+      ? { ...remote, instruction: local.instruction, element: local.element, images: local.images, confirmedAt: local.confirmedAt }
+      : remote);
+    seen.add(remote.id);
+  }
+  for (const local of localTasks || []) {
+    if (local?.id && !seen.has(local.id) && !deleted.has(local.id)) merged.push(local);
+  }
+  return merged;
+}
+
 const HOST_ID = 'zw-annotation-host';
 const SOURCE = 'zw-web-annotations';
 const DRAFT_DELAY_MS = 900;
@@ -416,7 +513,16 @@ export function mountAnnotator(options = {}) {
     syncMessage: '',
     /** 连续录入时的合并同步定时器 */
     syncTimer: null,
-    /** 已确认但未成功同步的标记 */
+    /** 当前 flush 请求；saving 期间的新变更会进入 outbox，随后继续 flush */
+    syncPromise: null,
+    /** 同步请求 AbortController，销毁时取消 */
+    syncAbort: null,
+    /** 已确认但尚未得到服务端确认的操作队列（localStorage 持久化） */
+    outbox: [],
+    nextOutboxSeq: 1,
+    /** 本页面是否至少成功读取过一次服务端；未读取前空任务不能触发 all 删除 */
+    hasLoadedRemote: false,
+    /** 已确认但未成功同步的标记（由 outbox 派生） */
     dirty: false,
     /** 最近一次从工作区 JSON 读取到的任务版本，用来检测服务端状态变化。 */
     remoteRevision: '',
@@ -435,14 +541,42 @@ export function mountAnnotator(options = {}) {
      */
     receipt: null,
     receiptTimer: null,
+    /**
+     * 项目执行模式（round/queue）与落盘位置，来自 /tasks 响应。
+     * null 表示服务端尚未告知：按默认 round 处理，等首次刷新覆盖。
+     */
+    execution: null,
+    /**
+     * 服务端权威轮次摘要（/tasks 的 round 字段）：activeRound、complete、queued、
+     * counts、runner 都来自这里。客户端不再自行推断当前轮——本地推断在旧轮
+     * 未归档时会把旧轮当成当前轮，导致分母漂移。null = 旧版运行时，回落本地推断。
+     */
+    serverRound: null,
+    executionPath: '',
+    /** 执行要求文件（execution-protocol.md）的绝对路径；null = 服务端未告知或文件缺失 */
+    protocolPath: null,
+    /** 任务目录绝对路径，提示词只引用目录而不是文件快照 */
+    tasksPath: null,
+    /** endpoint.json 的真实绝对路径；缺失时复制提示词必须 fail-closed */
+    endpointManifestPath: null,
   };
 
   try {
     const cached = JSON.parse(localStorage.getItem(storageKey) || '[]');
-    // manual 任务没有 element，不能再用 element 作为过滤条件
-    if (Array.isArray(cached)) state.tasks = cached.filter(t => t && t.id);
+    // 兼容旧版「纯任务数组」缓存，同时升级为持久 outbox；旧缓存视为一条
+    // append 待同步操作，不能因为服务端首次返回空组而被覆盖。
+    if (Array.isArray(cached)) {
+      state.tasks = cached.filter(t => t && t.id);
+      if (state.tasks.length) state.outbox = [{ seq: 1, op: 'append', queuedAt: new Date().toISOString() }];
+    } else if (cached && typeof cached === 'object') {
+      state.tasks = Array.isArray(cached.tasks) ? cached.tasks.filter(t => t && t.id) : [];
+      state.outbox = Array.isArray(cached.outbox) ? cached.outbox : [];
+      state.nextOutboxSeq = Math.max(0, ...state.outbox.map(op => Number(op.seq) || 0)) + 1;
+    }
+    state.dirty = state.outbox.length > 0;
   } catch {
     state.tasks = [];
+    state.outbox = [];
   }
   try {
     const cachedCollapsed = localStorage.getItem(collapseKey);
@@ -574,6 +708,7 @@ export function mountAnnotator(options = {}) {
           <strong>标注列表</strong>
           <span class="panel-meta" data-el="panelMeta"></span>
         </div>
+        <button type="button" class="panel-board" data-act="board" title="在新标签打开任务看板（按状态总览全部任务）">看板</button>
         <span class="panel-version" data-el="panelVersion" title="标注组件运行时版本"></span>
         <button type="button" class="panel-collapse" data-act="collapse" title="收起">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
@@ -588,9 +723,14 @@ export function mountAnnotator(options = {}) {
         <button type="button" class="ghost-danger push-right" data-act="clear" title="清空全部标注">清空</button>
       </div>
       <!-- 总体进度：分派 10% + 开发 70% + 验收 20%，跨越所有页面统计。
-           放在操作区下方、列表上方——用户点开面板第一眼就想知道"改到哪了"。 -->
+           放在操作区下方、列表上方——用户点开面板第一眼就想知道"改到哪了"。
+           左侧是执行模式切换：决定进度分母（本轮/全部）与轮次边界行为。 -->
       <div class="panel-progress" data-el="progress">
         <div class="progress-head">
+          <div class="mode-switch" data-el="modeSwitch" role="group" aria-label="执行模式">
+            <button type="button" data-act="mode" data-mode="round" title="按轮次：本轮复核完毕即收尾，等显式归档（本轮处理期间不可切换）">轮次</button>
+            <button type="button" data-act="mode" data-mode="queue" title="按队列：本轮复核归档后自动继续下一轮（本轮处理期间不可切换）">队列</button>
+          </div>
           <span class="progress-label" data-el="progressLabel"></span>
           <button type="button" class="archive-btn hidden" data-act="archive-round" data-el="archiveBtn" title="把本轮已完成的任务移入归档（交付）">归档本轮</button>
           <span class="progress-pct" data-el="progressPct"></span>
@@ -646,11 +786,45 @@ export function mountAnnotator(options = {}) {
   /* ---------------- 持久化 ---------------- */
 
   function persistLocal() {
+    const payload = { tasks: state.tasks, outbox: state.outbox };
     try {
-      localStorage.setItem(storageKey, JSON.stringify(state.tasks));
+      localStorage.setItem(storageKey, JSON.stringify(payload));
     } catch {
-      /* 存储被禁用时忽略，内存仍在 */
+      // dataUrl 图片只是可重建缓存，配额不足时先剥离它们，保住文字任务。
+      const reduced = state.tasks.map(task => ({
+        ...task,
+        images: Array.isArray(task.images) ? task.images.map(({ dataUrl, ...image }) => image) : task.images,
+      }));
+      try {
+        localStorage.setItem(storageKey, JSON.stringify({ tasks: reduced, outbox: state.outbox }));
+        state.tasks = reduced;
+        state.syncMessage = '本地空间不足，已保留文字标注；图片将在同步后恢复。';
+      } catch {
+        // 内存仍保留任务；outbox 不清空，后续服务恢复/用户重试时仍可同步。
+        state.syncMessage = '本地空间不足，标注保留在当前页面，请尽快同步。';
+      }
     }
+    state.dirty = state.outbox.length > 0;
+  }
+
+  function queueOutbox(op = 'append', details = {}) {
+    state.outbox.push({
+      seq: state.nextOutboxSeq++,
+      op,
+      ...details,
+      queuedAt: new Date().toISOString(),
+      attempts: 0,
+    });
+    // 防止极端连续输入把 localStorage 无界撑大：操作是可合并的，保留最近 64 个
+    // marker 足以区分当前请求与在途期间的新编辑；任务快照仍在 state.tasks。
+    if (state.outbox.length > 64) state.outbox.splice(0, state.outbox.length - 64);
+    persistLocal();
+  }
+
+  function ackOutbox(maxSeq) {
+    state.outbox = state.outbox.filter(op => Number(op.seq) > maxSeq);
+    state.dirty = state.outbox.length > 0;
+    persistLocal();
   }
 
   function persistCollapsed() {
@@ -672,10 +846,28 @@ export function mountAnnotator(options = {}) {
 
   /** 拉取工作区全部页面任务组（服务端是唯一权威来源）。 */
   async function fetchRemoteGroups() {
+    return (await fetchTasksData()).groups;
+  }
+
+  /** 任务组 + 执行模式一次取回：模式与分母必须同源，避免两处请求读到不同时刻的状态。 */
+  async function fetchTasksData() {
     const response = await fetch(`${config.endpoint}/tasks`, { cache: 'no-store' });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-    return Array.isArray(data.groups) ? data.groups : [];
+    return {
+      groups: Array.isArray(data.groups) ? data.groups : [],
+      // 旧版运行时的 /tasks 没有 execution 字段：保持 null，按默认 round 走
+      execution: data.execution && typeof data.execution === 'object' ? data.execution : null,
+      // 服务端轮次摘要（activeRound/complete/queued/runner）；旧版运行时没有则为 null，
+      // 此时客户端回落到本地推断，行为与升级前一致。
+      round: data.round && typeof data.round === 'object' ? data.round : null,
+      executionPath: typeof data.executionPath === 'string' ? data.executionPath : '',
+      tasksPath: typeof data.tasksPath === 'string' && data.tasksPath ? data.tasksPath : null,
+      protocolPath: typeof data.protocolPath === 'string' && data.protocolPath ? data.protocolPath : null,
+      endpointManifestPath: typeof data.endpointManifestPath === 'string' && data.endpointManifestPath
+        ? data.endpointManifestPath
+        : null,
+    };
   }
 
   /**
@@ -684,10 +876,17 @@ export function mountAnnotator(options = {}) {
    */
   function applyRemoteGroups(groups) {
     const group = groups.find(g => g?.page?.url === pageUrl) || null;
-    // 服务端任务是权威数据：它可能已经被模型回写、归档或从工作区删除。
-    state.tasks = (Array.isArray(group?.tasks) ? group.tasks : []).filter(t => t && t.id);
+    const remoteTasks = (Array.isArray(group?.tasks) ? group.tasks : []).filter(t => t && t.id);
+    // 未确认的本地 outbox 是用户输入的优先事实：服务端只覆盖模型字段，
+    // 不得用旧快照抹掉本地 instruction/element/images。
+    if (state.outbox.length) {
+      state.tasks = mergeRemoteTasks(remoteTasks, state.tasks, state.outbox);
+    } else {
+      state.tasks = remoteTasks;
+    }
     state.remoteRevision = group?.updatedAt || '';
     state.groups = groups.filter(g => g && g.page?.url !== pageUrl);
+    state.hasLoadedRemote = true;
     persistLocal();
     renderPins();
     renderList();
@@ -705,7 +904,15 @@ export function mountAnnotator(options = {}) {
     if (!config.autoSync || state.refreshPending) return null;
     state.refreshPending = true;
     try {
-      const group = applyRemoteGroups(await fetchRemoteGroups());
+      const data = await fetchTasksData();
+      // 模式与轮次摘要要在任务渲染前就位：进度分母由它们决定，反过来会闪一下旧分母
+      if (data.execution) {
+        state.execution = data.execution;
+        state.executionPath = data.executionPath;
+      }
+      state.serverRound = data.round;
+      state.endpointManifestPath = data.endpointManifestPath;
+      const group = applyRemoteGroups(data.groups);
       if (!quiet) {
         const otherCount = state.groups.reduce((sum, g) => sum + ((g.tasks || []).length), 0);
         state.syncState = 'saved';
@@ -769,6 +976,7 @@ export function mountAnnotator(options = {}) {
   /** 合并连续确认，避免每条标注都打一次接口。 */
   function scheduleSync() {
     if (!config.autoSync) return;
+    queueOutbox('append');
     state.dirty = true;
     if (state.syncTimer) clearTimeout(state.syncTimer);
     state.syncTimer = setTimeout(() => {
@@ -778,37 +986,73 @@ export function mountAnnotator(options = {}) {
   }
 
   async function syncNow() {
-    if (state.syncState === 'saving') return null;
+    if (!config.autoSync) return null;
+    if (state.syncPromise) return state.syncPromise;
+    if (!state.hasLoadedRemote && !state.tasks.length) {
+      state.syncMessage = '尚未确认工作区状态，暂不执行空任务清理。';
+      renderMessage();
+      return null;
+    }
+    // 没有任务时仍保留原有「清空即删除」语义，但必须先成功拉取过远端。
     if (!state.tasks.length) {
-      // 全部删完：通知服务端移除 JSON 文件与附件
-      return deleteRemote({ all: true });
+      if (!state.hasLoadedRemote) {
+        state.syncMessage = '尚未确认工作区状态，暂不执行空任务清理。';
+        renderMessage();
+        return null;
+      }
+      queueOutbox('delete', { ids: [...new Set(state.outbox.flatMap(op => op.ids || []))] });
+      const op = state.outbox[state.outbox.length - 1];
+      const request = deleteRemote({ all: true });
+      state.syncPromise = request.then(result => {
+        if (result) ackOutbox(op.seq);
+        return result;
+      }).finally(() => { state.syncPromise = null; });
+      return state.syncPromise;
     }
     state.syncState = 'saving';
     renderPanelMeta();
-    try {
-      const response = await fetch(`${config.endpoint}/append`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(pagePayload()),
-      });
-      const data = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
-      state.syncState = 'saved';
-      state.dirty = false;
-      // skipped：本地这些任务都已归档、服务端没有写出任何文件。
-      // 此时不能报「已同步到 xxx」，那会让人以为工作区里有这份数据。
-      state.syncMessage = data.skipped
-        ? '这些标注已归档，工作区无需再写入。'
-        : `已同步到 ${data.absolutePath || data.relativePath || data.file || '工作区'}`;
-      return data;
-    } catch (error) {
-      state.syncState = 'error';
-      state.syncMessage = `本地已保存，工作区同步失败：${error.message}`;
-      return null;
-    } finally {
+    const capturedSeq = Math.max(0, ...state.outbox.map(op => Number(op.seq) || 0));
+    const payload = pagePayload();
+    const controller = new AbortController();
+    state.syncAbort = controller;
+    const timeout = setTimeout(() => controller.abort(), 10000);
+    const request = (async () => {
+      try {
+        const response = await fetch(`${config.endpoint}/append`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
+          body: JSON.stringify(payload),
+          signal: controller.signal,
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+        state.syncState = 'saved';
+        // 只确认请求开始时已存在的 outbox；saving 期间的新编辑仍待发送。
+        ackOutbox(capturedSeq);
+        state.syncMessage = data.skipped
+          ? '这些标注已归档，工作区无需再写入。'
+          : `已同步到 ${data.absolutePath || data.relativePath || data.file || '工作区'}`;
+        return data;
+      } catch (error) {
+        state.syncState = 'error';
+        state.syncMessage = `本地已保存，工作区同步失败：${error.name === 'AbortError' ? '请求超时' : error.message}`;
+        // 失败不清理 outbox；下一次编辑、可见性变化或重试会继续投递。
+        return null;
+      } finally {
+        clearTimeout(timeout);
+        if (state.syncAbort === controller) state.syncAbort = null;
+      }
+    })();
+    state.syncPromise = request.finally(() => {
+      state.syncPromise = null;
       renderPanelMeta();
       renderMessage();
-    }
+      // 请求期间如果有新 outbox，安排下一次 flush，不让 saving 碰撞吞掉编辑。
+      if (state.outbox.length && !state.syncTimer && !state.editingId && !state.editingIsNew) {
+        state.syncTimer = setTimeout(() => { state.syncTimer = null; syncNow(); }, DRAFT_DELAY_MS);
+      }
+    });
+    return state.syncPromise;
   }
 
   /** 记录当前页面已同步的任务 ID，供删除时精确同步。 */
@@ -831,7 +1075,7 @@ export function mountAnnotator(options = {}) {
         : { groupId: null, page: pagePayload().page, ids, selectors };
       const response = await fetch(`${config.endpoint}/delete`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
         body: JSON.stringify({ ...body, pageUrl }),
       });
       const data = await response.json().catch(() => ({}));
@@ -846,6 +1090,9 @@ export function mountAnnotator(options = {}) {
         state.syncMessage = all
           ? '已清空工作区中该页面的任务数据。'
           : `已同步删除 ${data.removed ?? ids.length} 项。`;
+      }
+      if (!kept && state.outbox.length) {
+        ackOutbox(Math.max(0, ...state.outbox.map(op => Number(op.seq) || 0)));
       }
       return data;
     } catch (error) {
@@ -894,7 +1141,7 @@ export function mountAnnotator(options = {}) {
     try {
       const response = await fetch(`${config.endpoint}/append`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
         body: JSON.stringify({
           page: { url: group.page.url, title: group.page.title || group.page.url },
           tasks: [task],
@@ -923,7 +1170,7 @@ export function mountAnnotator(options = {}) {
     try {
       const response = await fetch(`${config.endpoint}/delete`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
         body: JSON.stringify({
           groupId: group.id,
           ids: [task.id],
@@ -978,18 +1225,44 @@ export function mountAnnotator(options = {}) {
   /**
    * 进度统计的范围与排队情况。
    *
-   * 进度条只统计**已定稿**（有轮次号）的任务：轮次在第一个任务被置为 doing
-   * 时定稿，定稿之后新增的批注自动排队下一轮——若把排队中的也计入分母，
-   * 用户一边标注一边处理时进度条会倒退（实测 24%→20%）。
-   * 尚未开轮（无任何轮次号）→ 没有可统计的进度，进度条隐藏，
-   * 面板上以「下一轮 N 条 · 复制提示词开始」提示。
+   * 分母统一为「本轮定稿集合」，权威来源是服务端 `roundSummary`：本轮成员在
+   * 第一个任务被置为 doing 时就原子冻结；执行中新增的标注若被处理者接手会
+   * 并入本轮（分母 +1），未接手的排队下一轮（显示「下一轮 N 条」）。归档
+   * 轮次的存量不进分母——那是对已完成历史的记账，不是当前工作的进度。
+   * 两种执行模式（round/queue）共用这套分母，区别只在边界行为。
+   * 服务端没有返回摘要（旧版运行时）时才回落到本地推断。
    */
   function roundScope() {
-    const all = allProjectTasks();
-    const hasRounds = all.some(t => t.round != null);
-    const dispatched = all.filter(t => t.round != null);
-    const queued = all.filter(t => t.round == null && (t.status === 'todo' || t.status === 'doing')).length;
-    return { all, dispatched, queued, hasRounds };
+    return resolveRoundScope(allProjectTasks(), state.execution || {}, state.serverRound);
+  }
+
+  /**
+   * 执行模式是否处于锁定态：本轮在途（activeRound 非空）期间不允许切换。
+   * 模式决定「本轮怎么收尾」，处理开始后再切换会让收尾预期漂移，所以从
+   * 首个 doing（定稿）到交付之间锁死，交付后自动恢复。以服务端摘要为准；
+   * 摘要缺失（旧版运行时）时不锁——宁可宽松也不误锁。
+   */
+  function executionLocked() {
+    return !!(state.serverRound
+      && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound')
+      && state.serverRound.activeRound != null);
+  }
+
+  /**
+   * 进度标签尾部的状态提示：把「为什么进度停住」说清楚。
+   *
+   * 服务端不会凭空启动模型——queue 模式在轮次边界只负责归档并返回
+   * continue/stop/blocked，真正的下一轮派发由主线程完成。所以这里把
+   * 「等处理者」「有阻塞」「处理者已断开」显式写出来，而不是让进度条
+   * 静默停在某个百分比，让人以为卡死。
+   */
+  function runnerHint(scope) {
+    if (scope.blocked) return ' · 本轮有阻塞，需先解除';
+    const status = scope.runner?.status;
+    if (status === 'blocked') return ' · 本轮有阻塞，需先解除';
+    if (status === 'paused') return ' · 等待处理者接续';
+    if (status === 'disconnected') return ' · 处理者已断开';
+    return '';
   }
 
   /**
@@ -1000,20 +1273,44 @@ export function mountAnnotator(options = {}) {
     const scope = roundScope();
     const p = computeProgress(scope.dispatched);
     renderDockProgress(p, scope);
+    renderModeSwitch();
     const fill = $('[data-el="progressFill"]');
     fill.style.width = `${p.percent}%`;
     $('[data-el="progressPct"]').textContent = p.total ? `${p.percent}%` : '';
+    // 分母两种模式同口径（本轮定稿集合），前缀只标明当前模式便于对账
+    const scopeName = scope.mode === 'queue' ? '队列·本轮' : '本轮';
     $('[data-el="progressLabel"]').textContent = p.total
-      ? `待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
+      ? `${scopeName} 待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
         + (scope.queued ? ` · 下一轮 ${scope.queued}` : '')
+        + runnerHint(scope)
       : (scope.queued ? `下一轮 ${scope.queued} 条 · 复制提示词开始` : '还没有任务');
     fill.parentElement.title = p.total
       ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
-        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 与未定稿的排队任务不计入）`
+        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）\n`
+        + `统计范围：第 ${scope.currentRound} 轮定稿集合（含执行中并入，归档轮次不计）`
       : '';
     // 全部完成时换成绿色并常驻，直到归档（交付）——这是「本轮收工」的信号
     fill.dataset.done = p.total && p.percent >= 100 ? 'on' : 'off';
     $('[data-el="archiveBtn"]').classList.toggle('hidden', !(p.total && p.percent >= 100));
+  }
+
+  /**
+   * 模式切换控件的选中态与锁定态同源刷新：本轮在途期间按钮置灰禁点，
+   * SSE 拉取后（定稿/交付）也会即时锁定或恢复。
+   */
+  function renderModeSwitch() {
+    const mode = state.execution?.mode || 'round';
+    const locked = executionLocked();
+    const group = $('[data-el="modeSwitch"]');
+    for (const btn of $$('[data-act="mode"]')) {
+      btn.dataset.active = btn.dataset.mode === mode ? 'on' : 'off';
+      btn.disabled = locked;
+    }
+    if (group) {
+      group.title = locked
+        ? `第 ${state.serverRound.activeRound} 轮处理中，交付后可切换执行模式`
+        : '';
+    }
   }
 
   /**
@@ -1085,7 +1382,10 @@ export function mountAnnotator(options = {}) {
     const text = activeMessage() || (state.active
       ? '点击页面元素即可就地输入要求。'
       : '点击“标注”后，在页面上点选元素。');
-    $('[data-el="msg"]').textContent = text;
+    const msgEl = $('[data-el="msg"]');
+    msgEl.textContent = text;
+    // 提示行单行省略显示，完整文案靠悬停 title 兜底
+    msgEl.title = text;
     renderToast(activeMessage());
   }
 
@@ -1161,18 +1461,24 @@ export function mountAnnotator(options = {}) {
         ? `${task.images.length} 张图片`
         : '无关联元素'
       : `${truncate(task.element.selector, 40)} · ${task.element.rect.width}×${task.element.rect.height}`;
-    // doing = 已被处理者领取、正在改代码。此时锁住不可改不可删：
-    // 中途换指令或删任务，会让处理者回写的 done/结果与记录对不上。
-    // review（待验收）**不锁**：代码已改完等验收，用户此时看到效果想补一句
-    // 或删掉它都是合理的；锁住会让改动静默失效，比放行更糟。
+    // 面板编辑规则（收敛为一条）：**只有 todo 可直接改当前指令**。
+    // 非 todo（doing/review/done/blocked）的列表输入框一律只读——它们的当前
+    // 指令对应着在途工作或已验收的结论，随手一改会作废它。要提交新要求，
+    // 点图钉/详情打开编辑器：新指令存为 pendingInstruction，批次交付时
+    // 统一重开为下一轮的 todo（服务端语义，见 store.mjs appendTasks）。
     const locked = task.status === 'doing';
-    const review = task.status === 'review';
+    const readonly = task.status !== 'todo';
     // 处理开始后新增的批注没有轮次号 → 排队下一轮（有轮次在身时才显示徽标）
     const queued = state.roundQueued && task.round == null;
+    const pending = typeof task.pendingInstruction === 'string' && task.pendingInstruction.trim();
     const thumbs = (task.images || []).length
       ? `<div class="item-thumbs">${task.images
-          .map(img => (img.dataUrl ? `<img src="${img.dataUrl}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`))
+          .map(img => (img.dataUrl ? `<img src="${escapeHtml(img.dataUrl)}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`))
           .join('')}</div>`
+      : '';
+    const readonlyAttr = readonly ? ' readonly' : '';
+    const readonlyHint = readonly
+      ? ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"'
       : '';
     return `
     <article class="item${task.id === state.editingId ? ' editing' : ''}${locked ? ' locked' : ''}" data-item="${task.id}">
@@ -1180,18 +1486,18 @@ export function mountAnnotator(options = {}) {
         <span class="item-seq${manual ? ' manual' : ''}">${seq}</span>
         <span class="item-title">${escapeHtml(title)}</span>
         ${locked ? '<span class="lock-note" title="正在处理中，暂不可修改或删除">🔒 处理中</span>' : ''}
-        ${current ? `<button type="button" class="link" data-details="${task.id}" title="查看元素详情">详情</button>` : ''}
+        ${current ? `<button type="button" class="link" data-details="${escapeHtml(task.id)}" title="查看元素详情">详情</button>` : ''}
         ${locked
           ? ''
-          : `<button type="button" class="link danger" data-del="${task.id}" title="删除">✕</button>`}
+          : `<button type="button" class="link danger" data-del="${escapeHtml(task.id)}" title="删除">✕</button>`}
       </div>
       ${thumbs}
       <label class="item-instruction">
-        <textarea data-edit="${task.id}" rows="2" placeholder="输入调整要求"${locked ? ' readonly' : ''}>${escapeHtml(task.instruction)}</textarea>
+        <textarea data-edit="${escapeHtml(task.id)}" rows="2" placeholder="输入调整要求"${readonlyAttr}${readonlyHint}>${escapeHtml(task.instruction)}</textarea>
       </label>
       <div class="item-foot">
         <code>${escapeHtml(sub)}</code>
-        <span class="tag${empty ? ' warn' : review ? ' review' : ''}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
+        <span class="tag${empty ? ' warn' : ` status-${task.status}`}" title="状态：${STATUS_LABELS[task.status] || task.status}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${pending ? `<span class="tag pending" title="已提交新要求（下一轮处理）：${escapeHtml(task.pendingInstruction)}">新要求</span>` : ''}${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
       </div>
     </article>`;
   }
@@ -1276,10 +1582,12 @@ export function mountAnnotator(options = {}) {
         const localTask = findTask(el.dataset.edit);
         if (localTask) {
           // 只读输入框理论上不会再触发 input，这里仍兜一层，
-          // 防止通过脚本或浏览器自动填充绕过 readonly 改掉处理中的指令
-          if (localTask.status === 'doing') {
+          // 防止通过脚本或浏览器自动填充绕过 readonly 改掉非 todo 的指令：
+          // 当前指令对应在途工作或已验收结论，改它必须走编辑器的
+          // 「提交新要求」路径（下一轮生效）。
+          if (localTask.status !== 'todo') {
             el.value = localTask.instruction || '';
-            state.syncMessage = '该标注正在处理中，指令暂不可修改；如需调整请先等处理完成或让处理者标记为阻塞。';
+            state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理。';
             renderMessage();
             return;
           }
@@ -1294,9 +1602,9 @@ export function mountAnnotator(options = {}) {
         // 其它页面的任务：以所属页面归组直连同步，绝不混入当前页的 payload
         const remote = findRemoteTask(el.dataset.edit);
         if (!remote) return;
-        if (remote.task.status === 'doing') {
+        if (remote.task.status !== 'todo') {
           el.value = remote.task.instruction || '';
-          state.syncMessage = '该标注正在处理中，指令暂不可修改；如需调整请先等处理完成或让处理者标记为阻塞。';
+          state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理。';
           renderMessage();
           return;
         }
@@ -1663,7 +1971,7 @@ export function mountAnnotator(options = {}) {
       .map(
         image => `
       <div class="thumb" data-thumb="${image.id}">
-        <img src="${image.dataUrl}" alt="${escapeHtml(image.name)}">
+        <img src="${escapeHtml(image.dataUrl)}" alt="${escapeHtml(image.name)}">
         <span class="thumb-size">${image.width ? `${image.width}×${image.height}` : ''}</span>
         <button type="button" class="link danger" data-drop-image="${image.id}" title="移除">✕</button>
       </div>`,
@@ -1714,7 +2022,15 @@ export function mountAnnotator(options = {}) {
     $('[data-el="editorTarget"]').textContent = task.element
       ? task.element.accessibleName || task.element.text || task.element.tagName
       : '手动任务';
-    $('[data-el="editorHint"]').textContent = 'Enter 确认 · Esc 取消';
+    // 非 todo（doing/review/done/blocked）：编辑器是「提交新要求」模式——
+    // 当前指令对应在途工作或已验收结论，这里写下的文字不会改动它，
+    // 而是存为 pendingInstruction，批次交付后作为下一轮的 todo 重新处理。
+    // todo：普通编辑，Enter 即改当前指令。
+    const nonTodo = task.status !== 'todo';
+    input.readOnly = false;
+    $('[data-el="editorHint"]').textContent = nonTodo
+      ? '提交新要求 · 下一轮处理（不改当前指令）· Esc 取消'
+      : 'Enter 确认 · Esc 取消';
     input.value = task.instruction || '';
     renderEditorImages();
     syncEditorInput();
@@ -1734,6 +2050,7 @@ export function mountAnnotator(options = {}) {
     $('[data-el="editorSeq"]').textContent = `#${nextSeq()}`;
     $('[data-el="editorTarget"]').textContent = element.accessibleName || element.text || element.tagName;
     $('[data-el="editorHint"]').textContent = 'Enter 确认 · Esc 取消 · 可粘贴图片';
+    input.readOnly = false;
     input.value = '';
     renderEditorImages();
     syncEditorInput();
@@ -1753,6 +2070,7 @@ export function mountAnnotator(options = {}) {
     $('[data-el="editorSeq"]').textContent = `#${nextSeq()}`;
     $('[data-el="editorTarget"]').textContent = '手动添加的任务';
     $('[data-el="editorHint"]').textContent = 'Enter 确认 · Esc 取消 · 可粘贴图片';
+    input.readOnly = false;
     input.value = '';
     renderEditorImages();
     syncEditorInput();
@@ -1976,13 +2294,21 @@ export function mountAnnotator(options = {}) {
     if (state.editingId) {
       const task = findTask(state.editingId);
       if (task) {
-        // 处理中的任务不接受就地编辑的指令修改（点元素、点「详情」都会走到这里）。
-        // 面板那边锁了输入框，但这条路径绕开了面板，必须单独拦。
-        if (task.status === 'doing') {
-          closeEditor();
-          state.syncMessage = `「${truncate(task.instruction || '未填写', 20)}」正在处理中，指令暂不可修改。`;
-          renderMessage();
-          return null;
+        // 非 todo：编辑器是「提交新要求」模式——写入 pendingInstruction，
+        // 当前指令/状态/结果一律不动（处理者按原指令收尾不受干扰），
+        // 批次交付后新要求自动重开为下一轮的 todo。todo：普通编辑当前指令。
+        if (task.status !== 'todo') {
+          if (!text || text === task.instruction || text === task.pendingInstruction) {
+            // 没有提出新要求（含仅粘贴图片）：视为取消
+            closeEditor();
+            return null;
+          }
+          task.pendingInstruction = text;
+          task.history = [...(task.history || []), { at: new Date().toISOString(), event: 'pending_instruction_updated', detail: text }];
+          task.updatedAt = new Date().toISOString();
+          finishConfirm(task);
+          setReceipt('新要求已提交，将在下一轮处理。', 6000);
+          return task;
         }
         const hasImages = state.pendingImages.length > 0;
         if (!text && !hasImages && !String(task.instruction || '').trim()) {
@@ -2099,6 +2425,7 @@ export function mountAnnotator(options = {}) {
       return;
     }
     state.tasks = state.tasks.filter(t => t.id !== id);
+    queueOutbox('delete', { ids: [id] });
     if (state.editingId === id) closeEditor();
     persistLocal();
     renderPins();
@@ -2124,7 +2451,9 @@ export function mountAnnotator(options = {}) {
    */
   function clearAll() {
     const locked = state.tasks.filter(t => t.status === 'doing');
+    const ids = state.tasks.map(task => task.id);
     state.tasks = locked;
+    queueOutbox('delete', { ids });
     persistLocal();
     closeEditor();
     renderPins();
@@ -2140,139 +2469,169 @@ export function mountAnnotator(options = {}) {
   }
 
   /**
+   * 当前轮是否在途——直接读服务端轮次摘要，不再本地推断。
+   *
+   * 本地推断（取活动任务最大轮次号）在旧轮尚未归档时会把它当成当前轮，
+   * 于是「按轮次」会被描述成本轮在途，实际服务端早已交付。服务端摘要里的
+   * activeRound 才是权威：第一个任务进入 doing 时冻结，completeRound 后置空。
+   * 摘要缺失（旧版运行时）才回落到本地推断，保证降级不崩。
+   */
+  function currentRoundInFlight() {
+    if (state.serverRound && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound')) {
+      const currentRound = state.serverRound.activeRound;
+      return { currentRound, inFlight: currentRound != null && !state.serverRound.complete };
+    }
+    const all = allProjectTasks();
+    const withRound = all.filter(t => t.round != null);
+    const currentRound = withRound.reduce((m, t) => Math.max(m, t.round), 0) || null;
+    const scoped = currentRound ? withRound.filter(t => t.round === currentRound) : [];
+    const complete = scoped.length > 0 && scoped.every(t => t.status === 'done' || t.status === 'cancelled');
+    return { currentRound, inFlight: currentRound != null && !complete };
+  }
+
+  /**
+   * 切换执行模式（round/queue）。模式决定本轮怎么收尾：立即写盘、SSE 广播
+   * 到所有页面。本轮在途期间（首个 doing 到交付）锁定——收尾预期不能在
+   * 处理中途漂移；按钮此时已置灰，这里再守一道防绕过。
+   */
+  async function setExecutionMode(mode) {
+    if (!mode || mode === (state.execution?.mode || 'round')) return;
+    if (executionLocked()) {
+      setReceipt(`第 ${state.serverRound.activeRound} 轮处理中，交付后可切换执行模式。`, 6000);
+      return;
+    }
+    try {
+      const res = await fetch(`${config.endpoint}/execution`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
+        body: JSON.stringify({ mode }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      state.execution = data.execution;
+      // 切换响应带回权威轮次摘要；没有（旧版运行时）就保持原摘要不动，
+      // 由 currentRoundInFlight 的降级分支兜底。
+      if (data.round && typeof data.round === 'object') state.serverRound = data.round;
+      renderModeSwitch();
+      renderProgress();
+      // 回执必须说清生效时机；分母两模式同口径，无需解释跳变
+      const { inFlight } = currentRoundInFlight();
+      setReceipt(mode === 'queue'
+        ? (inFlight
+          ? '已切换为按队列：本轮复核完毕后将自动归档并继续下一轮。'
+          : '已切换为按队列：下一轮完成后将自动继续。')
+        : (inFlight
+          ? '已切换为按轮次：本轮复核完毕后停下，等你显式归档。'
+          : '已切换为按轮次：下一轮完成后停在本轮。'));
+    } catch (error) {
+      setReceipt(`模式切换失败：${error.message}`, 6000);
+    }
+  }
+
+  /**
    * 归档本轮：把全部任务组里已完成（done/cancelled）的任务移入归档。
    * 这是轮次的「交付」动作——验收通过后 100% 绿条常驻，由用户点此按钮
    * （或下一轮复制提示词时自动）完成交付。只动已完成任务，
    * 排队中的下一轮任务不受影响。
    */
   async function archiveRound() {
-    const groups = await fetchRemoteGroups();
-    let tasksArchived = 0;
-    for (const g of groups) {
-      const done = (g.tasks || []).filter(t => t.status === 'done' || t.status === 'cancelled');
-      if (!done.length) continue;
-      try {
-        const res = await fetch(`${config.endpoint}/archive`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ groupId: g.id }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (data.ok) tasksArchived += data.archived || 0;
-      } catch (error) {
-        setReceipt(`归档失败：${error.message}`, 6000);
-        return;
-      }
+    // 归档目标轮次以服务端摘要为准：本地推断可能把未归档的旧轮当成当前轮，
+    // 发出去的 round 会与服务端 activeRound 不匹配而被拒（active round mismatch）。
+    const round = state.serverRound && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound')
+      ? state.serverRound.activeRound
+      : (Number.isInteger(state.execution?.activeRound) ? state.execution.activeRound : roundScope().currentRound);
+    if (!round) {
+      setReceipt('当前没有可归档的活动轮次。');
+      return;
     }
-    setReceipt(tasksArchived ? `本轮已交付：${tasksArchived} 项已归档。` : '没有可归档的任务。');
-    await loadRemoteTasks({ quiet: true });
+    try {
+      const res = await fetch(`${config.endpoint}/complete-round`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
+        body: JSON.stringify({ round }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      if (data.action === 'blocked') {
+        const obstacles = Array.isArray(data.obstacles) ? data.obstacles : (data.summary?.obstacles || []);
+        const detail = obstacles.length
+          ? obstacles.map(item => `${item.id}（${STATUS_LABELS[item.status] || item.status}）`).join('、')
+          : '仍有未收尾任务';
+        setReceipt(`第 ${round} 轮尚未收尾：${detail}`, 7000);
+        await loadRemoteTasks({ quiet: true });
+        return data;
+      }
+      const total = (data.archived || []).reduce((sum, item) => sum + (item.archived || 0), 0);
+      setReceipt(data.action === 'continue'
+        ? `第 ${round} 轮已交付：${total} 项已归档，队列将继续下一轮。`
+        : `第 ${round} 轮已交付：${total} 项已归档。`);
+      await loadRemoteTasks({ quiet: true });
+    } catch (error) {
+      setReceipt(`归档失败：${error.message}`, 6000);
+    }
   }
 
   /**
-   * 复制处理提示词。
-   *
-   * 提示词不嵌入任务明细，只给出任务清单 JSON 的文件地址，
-   * 让 AI agent 自己去读取，避免提示词随任务增多而膨胀。
-   * 地址必须来自同步成功后的真实文件路径，否则模型会去读一个不存在的文件。
-   *
-   * 存储按页面分成多个组文件，而标注是跨页面的：项目里有多个页面待处理时，
-   * 提示词按页面列出每个文件地址。优先用绝对路径：relativePath 是相对
-   * 「项目目录」算的，而模型的工作目录是「工作区根」，项目常在工作区的
-   * 子目录里，照抄 relativePath 会读不到文件。
+   * 复制处理提示词：只给任务目录与执行要求两个绝对路径。
+   * 复制本身除同步本地 outbox 外没有归档/定稿等副作用。
    */
   async function copyPrompt() {
     // 当前页有草稿要先同步；没有任务时绝不能调 syncNow——它把「空」当
     // 删除信号，会发出整组删除请求。其它页面是否有待处理由后面的组列表判断。
-    const saved = state.tasks.length ? await syncNow() : null;
-    if (state.tasks.length && !saved) {
+    // 没有本地未同步变更时，复制必须是纯只读动作；无条件 syncNow 会改写
+    // 任务 updatedAt，导致用户只是复制提示词却改变任务数据。
+    const saved = state.tasks.length && (state.outbox.length || state.dirty) ? await syncNow() : null;
+    if (state.tasks.length && !saved && state.outbox.length) {
       setReceipt('任务尚未成功同步到工作区，无法确定文件地址。', 6000);
       return null;
     }
     const fallbackPath = saved?.absolutePath || saved?.relativePath || saved?.file || '';
 
-    // 轮次交付：上一轮已全部完成（done/cancelled）→ 自动归档。
-    // 注意：复制提示词**不定稿轮次**——复制之后、模型开始处理之前，用户仍可
-    // 继续新增需求；轮次在首个任务被置为 doing 时才定稿（见 store 的
-    // enlistIntoRound），定稿时文件里当时的待处理任务就是确定派发的集合。
+    /**
+     * 复制是只读的地址索引，不负责归档、不冻结轮次，也不输出页面文件快照。
+     * 归档只能由显式「归档本轮」或 queue 边界动作完成；复制后新增页面任务
+     * 仍能被模型从任务目录扫描到。
+     */
+    let taskDirectory = null;
     let groups = null;
     try {
-      groups = await fetchRemoteGroups();
-      const dispatched = groups.flatMap(g => g.tasks || []).filter(t => t.round != null);
-      if (dispatched.length && dispatched.every(t => t.status === 'done' || t.status === 'cancelled')) {
-        for (const g of groups) {
-          if (!(g.tasks || []).some(t => t.status === 'done' || t.status === 'cancelled')) continue;
-          await fetch(`${config.endpoint}/archive`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ groupId: g.id }),
-          });
-        }
-        groups = await fetchRemoteGroups();
+      const data = await fetchTasksData();
+      groups = data.groups;
+      if (data.execution) {
+        state.execution = data.execution;
+        state.executionPath = data.executionPath;
+        state.tasksPath = data.tasksPath;
       }
+      state.serverRound = data.round;
+      state.endpointManifestPath = data.endpointManifestPath;
+      state.protocolPath = data.protocolPath;
+      taskDirectory = data.tasksPath;
     } catch {
-      // 轮次操作失败不阻塞复制
+      // 任务地址读取失败时走下面的 fail-closed
     }
 
-    let pendingGroups = null;
-    try {
-      pendingGroups = (groups || [])
-        // review 也算「还没收尾」：它等着主线程验收，不能从清单里漏掉，
-        // 否则一旦有任务进入待验收，复制出的提示词就会把它们当作已完成而略过。
-        .map(group => ({ ...group, pending: (group.tasks || []).filter(t => t.status === 'todo' || t.status === 'doing' || t.status === 'review') }))
-        .filter(group => group.pending.length);
-    } catch {
-      // 组列表读不到时退回单文件提示词：当前页任务刚刚同步成功，地址可靠
-      pendingGroups = null;
-    }
-    if (!pendingGroups && !fallbackPath) {
-      setReceipt('无法读取工作区任务列表。', 6000);
+    const pendingGroups = (groups || [])
+      .map(group => ({ ...group, pending: (group.tasks || []).filter(t => t.status === 'todo' || t.status === 'doing' || t.status === 'review' || t.status === 'blocked') }))
+      .filter(group => group.pending.length);
+    if (!taskDirectory || !state.protocolPath || !state.endpointManifestPath
+      || !pathIsAbsolute(taskDirectory) || !pathIsAbsolute(state.protocolPath)
+      || !pathIsAbsolute(state.endpointManifestPath)) {
+      setReceipt('任务目录、执行要求文件或接口清单缺失，请升级标注运行时后重试。', 6000);
       return null;
     }
-    if (pendingGroups && !pendingGroups.length) {
+    if (!pendingGroups.length) {
       setReceipt(saved?.skipped
         ? '当前标注均已归档，工作区中没有待处理文件。重新标注后即可复制。'
         : '工作区里没有待处理的标注任务（可能均已完成或归档）。', 6000);
       return null;
     }
 
-    const singleFilePrompt = jsonPath =>
-      [
-        `请参考 ${jsonPath} 中的待处理工作，进行处理。`,
-        '改完把任务状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程复核后才回写。',
-        '已验收通过的任务请进行归档。',
-        '同一任务文件的状态回写已由服务端串行化，多个 agent 并行安全；但同一批源码仍只交给一个 agent 改，不要让两个 agent 同时改同一份源码。',
-      ].join('\n');
-
-    let prompt;
-    let summary;
-    if (!pendingGroups) {
-      prompt = singleFilePrompt(fallbackPath);
-      summary = `指向 ${fallbackPath}`;
-    } else if (pendingGroups.length === 1) {
-      const [group] = pendingGroups;
-      const jsonPath = group.absolutePath || (group.page?.url === pageUrl ? fallbackPath : '');
-      if (!jsonPath) {
-        setReceipt('无法确定任务文件地址。', 6000);
-        return null;
-      }
-      prompt = singleFilePrompt(jsonPath);
-      summary = `指向 ${jsonPath}`;
-    } else {
-      const lines = ['请处理以下网页标注任务（项目跨多个页面，任务已按页面分成多个任务文件）：'];
-      pendingGroups.forEach((group, index) => {
-        const isCurrent = group.page?.url === pageUrl;
-        // 不写「待处理 N 项」：复制之后、开始处理之前用户仍可继续加需求，
-        // 实际数量以子 agent 读取任务文件时为准。
-        lines.push(`${index + 1}. 页面：${group.page?.title || group.page?.url || '未命名页面'}${isCurrent ? '（当前页面）' : ''}`);
-        lines.push(`   任务文件：${group.absolutePath || '（地址未知）'}`);
-      });
-      lines.push('');
-      lines.push('待处理项以任务文件内容为准（开始处理后新增的标注会自动排队下一轮，本轮无需处理）。');
-      lines.push('每个任务文件（对应一个页面）交给一个子 agent，同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆；浏览器验收统一在主线程完成，避免多个 agent 抢占同一个标签页。');
-      lines.push('子 agent 开始时把任务置为 doing，改完源码自测通过后自行把状态回写为 review（待验收），并注明改动的文件与验证证据；不要写 done——done 表示已验收，由主线程浏览器复核后统一回写并归档。状态回写走标注接口（页面同源 /__zw-web-annotations），服务端已串行化，并发安全。');
-      prompt = lines.join('\n');
-      summary = `覆盖 ${pendingGroups.length} 个页面的待处理任务`;
+    const prompt = buildAddressPrompt(taskDirectory, state.protocolPath);
+    if (!prompt) {
+      setReceipt('任务目录或执行要求地址无效，请升级标注运行时后重试。', 6000);
+      return null;
     }
+    const summary = '任务目录与执行要求 2 个地址';
     try {
       await navigator.clipboard.writeText(prompt);
       setReceipt(`提示词已复制，${summary}。`);
@@ -2531,6 +2890,7 @@ export function mountAnnotator(options = {}) {
       event.preventDefault();
       if (act === 'expand') expandBar();
       else if (act === 'collapse') setCollapsed(true);
+      else if (act === 'board') window.open(`${config.endpoint}/board`, '_blank');
       else if (act === 'toggle') setActive(!state.active);
       else if (act === 'clear') {
         if (!state.tasks.length) {
@@ -2556,6 +2916,7 @@ export function mountAnnotator(options = {}) {
         }
       } else if (act === 'copy') copyPrompt();
       else if (act === 'archive-round') archiveRound();
+      else if (act === 'mode') setExecutionMode(event.target?.dataset?.mode);
       else if (act === 'manual') {
         openEditorForManual();
         state.syncMessage = '手动任务：可直接写要求，也可粘贴图片。';
@@ -2572,26 +2933,41 @@ export function mountAnnotator(options = {}) {
   // 输入或粘贴后同步提交按钮状态与输入框高度
   $('[data-el="editorInput"]').addEventListener('input', syncEditorInput);
 
-  document.addEventListener('paste', onPaste, true);
-  document.addEventListener('mousemove', onMove, true);
-  // mousedown 必须早于 click 拦下：页面控件的聚焦发生在 mousedown 阶段，
-  // 只拦 click 的话输入框已经拿到焦点了。
-  document.addEventListener('mousedown', onMouseDown, true);
-  document.addEventListener('click', onClick, true);
-  document.addEventListener('keydown', onKeydown, true);
-  window.addEventListener('scroll', () => {
+  function onScroll() {
     repositionPins();
     // 编辑期间页面仍可滚动（滚轮不被拦截），聚光孔必须跟着元素走
     updateFocusFx();
-  }, true);
-  window.addEventListener('resize', () => {
+  }
+
+  function onResize() {
     repositionPins();
     hideSizeBadge();
     if (state.editingId || state.editingIsNew) {
       const sel = state.editingId ? findTask(state.editingId)?.element?.selector : state.pendingElement?.selector;
       placeEditor(sel || null, $('[data-el="editorInput"]'));
     }
-  });
+  }
+
+  function onVisibilityChange() {
+    if (document.visibilityState === 'visible' && state.outbox.length) syncNow();
+  }
+
+  function onPageHide() {
+    // 不能在卸载阶段假装同步成功；只触发一次 best-effort flush，outbox 仍留在本地。
+    if (state.outbox.length) syncNow();
+  }
+
+  document.addEventListener('paste', onPaste, true);
+    document.addEventListener('mousemove', onMove, true);
+    // mousedown 必须早于 click 拦下：页面控件的聚焦发生在 mousedown 阶段，
+    // 只拦 click 的话输入框已经拿到焦点了。
+    document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('keydown', onKeydown, true);
+    window.addEventListener('scroll', onScroll, true);
+    window.addEventListener('resize', onResize, true);
+    document.addEventListener('visibilitychange', onVisibilityChange, true);
+    window.addEventListener('pagehide', onPageHide, true);
 
   document.documentElement.append(host);
   // 版本由宿主（Vite 插件 / http 适配器）随 bootstrap 注入，与技能版本同源
@@ -2751,12 +3127,25 @@ export function mountAnnotator(options = {}) {
     destroy() {
       stopRemoteRefresh();
       stopEventStream();
+      if (state.syncTimer) clearTimeout(state.syncTimer);
+      if (state.toastTimer) clearTimeout(state.toastTimer);
+      if (state.receiptTimer) clearTimeout(state.receiptTimer);
+      state.syncTimer = null;
+      state.toastTimer = null;
+      state.receiptTimer = null;
+      state.syncAbort?.abort();
+      state.syncAbort = null;
       for (const timer of remoteSyncTimers.values()) clearTimeout(timer);
       remoteSyncTimers.clear();
+      document.removeEventListener('paste', onPaste, true);
       document.removeEventListener('mousemove', onMove, true);
+      document.removeEventListener('mousedown', onMouseDown, true);
       document.removeEventListener('click', onClick, true);
       document.removeEventListener('keydown', onKeydown, true);
-      window.removeEventListener('scroll', repositionPins, true);
+      window.removeEventListener('scroll', onScroll, true);
+      window.removeEventListener('resize', onResize, true);
+      document.removeEventListener('visibilitychange', onVisibilityChange, true);
+      window.removeEventListener('pagehide', onPageHide, true);
       document.documentElement.style.cursor = '';
       host.remove();
       delete window.__zwAnnotator;
@@ -3158,6 +3547,9 @@ const CSS_TEXT = `
   font: 600 12px/1.5 var(--zc-font);
   box-shadow: 0 10px 26px rgba(0,0,0,.45);
   pointer-events: none;
+  /* 单行回执：长文案省略号截断，不因折行增高盖到悬浮按钮（pointer-events:none
+     虽不吞点击，但视觉上压住按钮同样干扰）。 */
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   opacity: 1; transition: opacity .16s ease;
 }
 .toast.hidden { display: none; }
@@ -3193,6 +3585,12 @@ const CSS_TEXT = `
 }
 .panel-collapse svg { width: 15px; height: 15px; }
 .panel-collapse:hover { background: #383838; color: #fff; }
+/* 看板入口：与版本徽标并排的小链接，新标签打开只读看板 */
+.panel-board {
+  flex: none; border: 0; cursor: pointer; padding: 0;
+  background: none; color: #9a9aa6; font-family: inherit; font-size: 11px;
+}
+.panel-board:hover { color: #dedaff; }
 /* 操作区在标题下方，靠左排列 */
 .panel-tools {
   display: flex; flex-wrap: wrap; gap: 5px;
@@ -3224,7 +3622,11 @@ const CSS_TEXT = `
   display: flex; align-items: baseline; justify-content: space-between; gap: 8px;
   margin-bottom: 6px;
 }
-.progress-label { color: #9a9a9a; font-size: 11px; }
+.progress-label {
+  flex: 1; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: #9a9a9a; font-size: 11px;
+}
 .progress-pct { color: #dedaff; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .progress-track {
   position: relative; height: 6px; border-radius: 999px;
@@ -3237,6 +3639,22 @@ const CSS_TEXT = `
 }
 /* 全部验收通过：整条转绿，作为收尾信号 */
 .progress-fill[data-done="on"] { background: linear-gradient(90deg, #4fbf7a, #6fd39a); }
+/* ---- 执行模式切换：轮次 / 队列 ---- */
+/* 分段控件紧贴进度条左侧，与 11px 的进度文字同一行高，不挤压标签 */
+.mode-switch { flex: none; display: inline-flex; border: 1px solid #3d3d46; border-radius: 6px; overflow: hidden; }
+.mode-switch button {
+  border: 0; background: transparent; color: #8f8f9b; cursor: pointer;
+  font-family: inherit; font-size: 10px; font-weight: 600; line-height: 1;
+  padding: 4px 7px;
+}
+.mode-switch button + button { border-left: 1px solid #3d3d46; }
+.mode-switch button:hover { color: #d6d6e0; }
+/* 选中态用面板主色描底：与图钉/进度条的紫保持同一视觉语言 */
+.mode-switch button[data-active="on"] { background: #34315c; color: #dedaff; }
+/* 本轮在途期间按钮禁用（deliver 后恢复）：置灰并压掉 hover 反馈，
+   让「不能切」从视觉上就是确定的，而不是点了没反应 */
+.mode-switch button:disabled { cursor: not-allowed; opacity: .45; }
+.mode-switch button:disabled:hover { color: #8f8f9b; }
 /* ---- 内部滚动条统一美化：默认浅色滚动条在深色面板上不搭。
    规则只作用于组件 Shadow DOM 内部，页面自身的滚动条不受影响。 ---- */
 *::-webkit-scrollbar { width: 8px; height: 8px; }
@@ -3285,9 +3703,20 @@ const CSS_TEXT = `
 .panel .item textarea:focus { outline: none; border-color: #7c6cff; }
 .panel .item-foot { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .panel .item-foot code { color: #8f8f8f; font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.panel .tag { flex: none; font-size: 10px; color: #8fd6a0; }
+.panel .tag { flex: none; font-size: 10px; color: #7fa7e8; }
+/* 状态分色：六种状态一眼可辨，不再共用一个绿色。
+   蓝=待处理 / 橙=进行中 / 琥珀=待验收 / 绿=已完成 / 红=已阻塞 / 灰=已取消。
+   都是深底上的高亮色，亮度对齐避免某个状态显得「更重要」。 */
+.panel .tag.status-todo { color: #7fa7e8; }
+.panel .tag.status-doing { color: #e8935a; }
+.panel .tag.status-review { color: #e0b464; }
+.panel .tag.status-done { color: #7fce8f; }
+.panel .tag.status-blocked { color: #e07a7a; }
+.panel .tag.status-cancelled { color: #85858f; }
 /* 处理开始后新增的批注：琥珀描边（与待验收的状态标签区分开） */
 .panel .tag.queued { color: #c9a35a; border: 1px dashed #8a6d35; padding: 0 5px; border-radius: 4px; }
+/* 暂存新要求：紫描边（与面板主色同语言），悬停可看新指令全文 */
+.panel .tag.pending { color: #b48ce8; border: 1px solid #6f5aa8; padding: 0 5px; border-radius: 4px; }
 /* 归档本轮按钮：仅在本轮 100% 完成时出现 */
 .progress-head .archive-btn {
   border: 1px solid #4fbf7a; border-radius: 5px; padding: 2px 8px; cursor: pointer;
@@ -3295,8 +3724,6 @@ const CSS_TEXT = `
 }
 .progress-head .archive-btn:hover { background: #1f3d2b; }
 .panel .tag.warn { color: #d8a45a; }
-/* 待验收：代码已改、主线程还没验，用琥珀色与「已完成」的绿色区分开 */
-.panel .tag.review { color: #e0b464; }
 .panel button.link { border: 0; background: none; cursor: pointer; padding: 0; color: #c9c9c9; font: inherit; }
 .panel button.link.danger { color: #e07a7a; font-size: 12px; }
 /* 处理中的任务：整条降饱和 + 输入框禁改，明确传达「已锁定，别动」 */
@@ -3338,7 +3765,13 @@ const CSS_TEXT = `
 }
 .group-count { flex: none; color: #8f8f8f; font-size: 10px; }
 .panel footer { padding: 8px 11px 10px; border-top: 1px solid #333; }
-.panel-msg { color: #8fd6a0; font-size: 11px; }
+/* 提示行单行显示：长回执（如模式切换）超出即省略号截断，不再折行把面板撑高。
+   min-width:0 允许 flex/grid 环境下收缩；完整文案通过 title 悬停可见。 */
+.panel-msg {
+  display: block; min-width: 0;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: #8fd6a0; font-size: 11px;
+}
 `;
 
 /* 自动挂载在样式常量声明之后执行，避免初始化顺序导致的暂时性死区。 */

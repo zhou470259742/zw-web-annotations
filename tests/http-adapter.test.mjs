@@ -7,15 +7,17 @@ import path from 'node:path';
 import { createAnnotationsMiddleware, injectAnnotatorScript } from '../scripts/runtime/adapters/http.mjs';
 import { DEFAULT_DIR } from '../scripts/runtime/core/store.mjs';
 
-function request(port, { method = 'GET', path: urlPath, body } = {}) {
+function request(port, { method = 'GET', path: urlPath, body, headers = {}, rawBody } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method, headers: body ? { 'content-type': 'application/json' } : {} }, res => {
+    const requestHeaders = { ...(body ? { 'content-type': 'application/json' } : {}), ...headers };
+    const req = http.request({ host: '127.0.0.1', port, path: urlPath, method, headers: requestHeaders }, res => {
       let data = '';
       res.on('data', c => (data += c));
-      res.on('end', () => resolve({ status: res.statusCode, text: data, json: () => JSON.parse(data) }));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, text: data, json: () => JSON.parse(data) }));
     });
     req.on('error', reject);
-    if (body) req.write(JSON.stringify(body));
+    if (rawBody != null) req.write(rawBody);
+    else if (body) req.write(JSON.stringify(body));
     req.end();
   });
 }
@@ -60,6 +62,9 @@ test('middleware writes annotations to the local workspace', async () => {
     const health = await request(port, { path: '/__zw-web-annotations/health' });
     assert.equal(health.status, 200);
     assert.equal(health.json().workspace, dir);
+    assert.equal(health.json().endpoint, '/__zw-web-annotations');
+    assert.equal(health.json().endpointManifestPath, path.join(dir, '.zwa', 'runtime', 'endpoint.json'));
+    assert.deepEqual(JSON.parse(await fs.readFile(health.json().endpointManifestPath, 'utf8')).endpoint, '/__zw-web-annotations');
 
     const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
     assert.equal(saved.status, 200);
@@ -68,6 +73,8 @@ test('middleware writes annotations to the local workspace', async () => {
 
     const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
     assert.equal(listed.json().groups.length, 1);
+    // 协议文件随运行时分发、与适配器同目录解析；提示词的执行要求地址来自这里
+    assert.match(listed.json().protocolPath, /execution-protocol\.md$/);
   });
 
   // 落盘位置必须与 store 的规范目录一致
@@ -203,6 +210,24 @@ test('/tasks lists every page group with its absolute file path', async () => {
   });
 });
 
+test('/tasks carries the authoritative round summary so the client never infers it', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
+  await withServer(dir, async port => {
+    await seedTwoPages(port);
+
+    const data = (await request(port, { path: '/__zw-web-annotations/tasks' })).json();
+    // 客户端用它定进度分母：缺了它只能自己从任务里推断当前轮，旧轮未归档就会算错
+    assert.ok(data.round && typeof data.round === 'object', '/tasks 必须返回 round 摘要');
+    assert.ok('activeRound' in data.round, 'round.activeRound 键必须存在（可为 null）');
+    assert.ok('complete' in data.round, 'round.complete 用于判断本轮是否可交付');
+    assert.equal(typeof data.round.queued, 'number', 'round.queued 供面板显示下一轮条数');
+    assert.ok(data.round.runner, 'round.runner 供面板显示处理者状态');
+    // 未开轮（全部任务 round=null）时服务端必须明确说 activeRound 为 null，
+    // 而不是把某个旧轮翻出来当成当前轮
+    assert.equal(data.round.activeRound, null);
+  });
+});
+
 test('cross-page delete by groupId only removes tasks from that page group', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-'));
   await withServer(dir, async port => {
@@ -290,4 +315,205 @@ test('events endpoint pushes tasks-changed to SSE clients on task writes', async
     assert.match(stream, /retry: 3000/);
     assert.match(stream, /tasks-changed/);
   });
+});
+
+test('middleware rejects cross-origin and non-JSON mutations', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-security-'));
+  await withServer(dir, async port => {
+    const evilOrigin = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/execution',
+      headers: { origin: 'https://evil.example', 'content-type': 'application/json' },
+      rawBody: JSON.stringify({ mode: 'queue' }),
+    });
+    assert.equal(evilOrigin.status, 403);
+    const wrongType = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/execution',
+      headers: { 'content-type': 'text/plain' }, rawBody: '{"mode":"queue"}',
+    });
+    assert.equal(wrongType.status, 415);
+  });
+});
+
+test('task-agent header cannot write done, while main-thread path remains compatible', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-actor-'));
+  await withServer(dir, async port => {
+    const saved = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] },
+    });
+    const groupId = saved.json().groupId;
+    const base = `/__zw-web-annotations/${encodeURIComponent(groupId)}/tasks/task_1`;
+    const headers = { 'x-zwa-client': 'task-agent' };
+    assert.equal((await request(port, { method: 'PATCH', path: base, body: { status: 'doing' }, headers })).status, 200);
+    assert.equal((await request(port, { method: 'PATCH', path: base, body: { status: 'review' }, headers })).status, 200);
+    const rejected = await request(port, { method: 'PATCH', path: base, body: { status: 'done' }, headers });
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.json().error, /task-agent cannot mark done/);
+    const accepted = await request(port, { method: 'PATCH', path: base, body: { status: 'done' } });
+    assert.equal(accepted.status, 200);
+  });
+});
+
+test('complete-round exposes obstacles when the current round is incomplete', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-obstacles-'));
+  await withServer(dir, async port => {
+    const saved = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] },
+    });
+    const groupId = saved.json().groupId;
+    const base = `/__zw-web-annotations/${encodeURIComponent(groupId)}/tasks/task_1`;
+    await request(port, { method: 'PATCH', path: base, body: { status: 'doing' }, headers: { 'x-zwa-client': 'task-agent' } });
+    const summary = (await request(port, { path: '/__zw-web-annotations/execution' })).json().round;
+    const result = await request(port, { method: 'POST', path: '/__zw-web-annotations/complete-round', body: { round: summary.activeRound } });
+    assert.equal(result.status, 200);
+    assert.equal(result.json().action, 'blocked');
+    assert.deepEqual(result.json().obstacles, [{ id: 'task_1', status: 'doing' }]);
+  });
+});
+test('http custom route derives the client path and writes the manifest', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-endpoint-'));
+  const server = http.createServer(createAnnotationsMiddleware({ workspace: dir, route: '/custom-zwa' }));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = server.address().port;
+    const health = await request(port, { path: '/custom-zwa/health' });
+    assert.equal(health.status, 200);
+    assert.equal(health.json().endpoint, '/custom-zwa');
+    assert.equal(health.json().clientPath, '/custom-zwa/client.js');
+    assert.equal(health.json().endpointManifestPath, path.join(dir, '.zwa', 'runtime', 'endpoint.json'));
+    const client = await request(port, { path: '/custom-zwa/client.js' });
+    assert.equal(client.status, 200);
+    const manifest = JSON.parse(await fs.readFile(health.json().endpointManifestPath, 'utf8'));
+    assert.equal(manifest.endpoint, '/custom-zwa');
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+test('board page is served on the configured route with relative data addresses', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-board-'));
+  const server = http.createServer(createAnnotationsMiddleware({ workspace: dir, route: '/custom-zwa' }));
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const port = server.address().port;
+    const board = await request(port, { path: '/custom-zwa/board' });
+    assert.equal(board.status, 200);
+    assert.match(board.headers['content-type'] || '', /text\/html/);
+    assert.match(board.text, /标注任务看板/);
+    assert.match(board.text, /fetch\('\.\/tasks'/, '看板用相对地址取数，天然跟随自定义 endpoint');
+    assert.match(board.text, /EventSource\('\.\/events'\)/, 'SSE 实时刷新');
+    // 六个状态列齐全
+    for (const label of ['待处理', '进行中', '待验收', '已完成', '已阻塞', '已取消']) {
+      assert.match(board.text, new RegExp(label));
+    }
+    // 布局切换菜单：看板/表格两个视图入口随页面分发
+    for (const viewLabel of ['看板', '表格']) {
+      assert.match(board.text, new RegExp(viewLabel));
+    }
+    assert.match(board.text, /view-menu/);
+    // 常用过滤工具行：搜索、页面下拉、归档开关、状态 chips
+    assert.match(board.text, /filter-q/);
+    assert.match(board.text, /filter-page/);
+    assert.match(board.text, /filter-arch/);
+    assert.match(board.text, /status-chips/);
+    // XSS 契约：任务数据必须经 esc() 转义后才能进 innerHTML
+    assert.match(board.text, /function esc\(/);
+    assert.match(board.text, /esc\(t\.instruction/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    await fs.rm(dir, { recursive: true, force: true });
+  }
+});
+test('GET /archive serves the read-only archive overview for the board', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-archview-'));
+  await withServer(dir, async port => {
+    const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
+    assert.equal(saved.status, 200);
+    const groupId = saved.json().groupId;
+    const patch = status =>
+      request(port, { method: 'PATCH', path: `/__zw-web-annotations/${groupId}/tasks/task_1`, body: { status } });
+    assert.equal((await patch('doing')).status, 200);
+    assert.equal((await patch('review')).status, 200);
+    assert.equal((await patch('done')).status, 200);
+
+    const empty = await request(port, { path: '/__zw-web-annotations/archive' });
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.json().archives, [], '归档前总览为空');
+
+    const archived = await request(port, { method: 'POST', path: '/__zw-web-annotations/archive', body: { groupId } });
+    assert.equal(archived.status, 200);
+
+    const view = await request(port, { path: '/__zw-web-annotations/archive' });
+    assert.equal(view.status, 200);
+    assert.equal(view.json().archives.length, 1);
+    assert.equal(view.json().archives[0].taskCount, 1);
+    assert.equal(view.json().archives[0].tasks[0].id, 'task_1');
+    assert.equal(view.json().archives[0].tasks[0].status, 'done');
+    assert.ok(!('history' in view.json().archives[0].tasks[0]), '总览不携带历史记录大字段');
+
+    // 任务粒度删除：按 id 只删归档里的这一条
+    const granular = await request(port, {
+      method: 'POST',
+      path: '/__zw-web-annotations/purge-archive',
+      body: { groupId, ids: ['task_1'] },
+    });
+    assert.equal(granular.status, 200);
+    assert.equal(granular.json().removed, 1);
+    assert.equal(granular.json().remaining, 0);
+    const after = await request(port, { path: '/__zw-web-annotations/archive' });
+    assert.deepEqual(after.json().archives, [], '删到 0 条后归档文件随之移除');
+  });
+});
+test('blocked task reopens to todo through the PATCH endpoint', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-reopen-'));
+  await withServer(dir, async port => {
+    const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
+    const groupId = saved.json().groupId;
+    const patch = status =>
+      request(port, { method: 'PATCH', path: `/__zw-web-annotations/${groupId}/tasks/task_1`, body: { status } });
+    await patch('doing');
+    assert.equal((await patch('blocked')).status, 200);
+    const reopened = await patch('todo');
+    assert.equal(reopened.status, 200, 'blocked→todo 是留给人工的重新入列转移');
+    assert.equal(reopened.json().task.status, 'todo');
+  });
+});
+test('GET/POST /board-prefs persists the board theme inside the project', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-prefs-'));
+  await withServer(dir, async port => {
+    const empty = await request(port, { path: '/__zw-web-annotations/board-prefs' });
+    assert.equal(empty.status, 200);
+    assert.deepEqual(empty.json().prefs, {});
+
+    const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/board-prefs', body: { theme: 'light' } });
+    assert.equal(saved.status, 200);
+    assert.equal(saved.json().prefs.theme, 'light');
+
+    const bad = await request(port, { method: 'POST', path: '/__zw-web-annotations/board-prefs', body: { theme: 'solarized' } });
+    assert.equal(bad.status, 400, '白名单之外的主题值拒绝');
+
+    const again = await request(port, { path: '/__zw-web-annotations/board-prefs' });
+    assert.equal(again.json().prefs.theme, 'light');
+  });
+  const raw = JSON.parse(await fs.readFile(path.join(dir, '.zwa', 'runtime', 'board-prefs.json'), 'utf8'));
+  assert.equal(raw.theme, 'light', '偏好确实落盘在项目里');
+});
+test('Vite custom endpoint uses the configured route prefix', async () => {
+  const { zwAnnotations } = await import('../scripts/runtime/vite/index.mjs');
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-vite-endpoint-'));
+  try {
+    const plugin = zwAnnotations({ workspace: dir, endpoint: '/custom-zwa' });
+    let middleware;
+    const server = { watcher: { add() {}, on() {} }, ws: { send() {} }, middlewares: { use(fn) { middleware = fn; } } };
+    plugin.configureServer(server);
+    const req = { url: '/custom-zwa/health', method: 'GET', headers: { host: 'localhost:5173' } };
+    let body = '';
+    const res = { statusCode: 0, setHeader() {}, end(value) { body = value || ''; } };
+    await middleware(req, res, () => { throw new Error('unexpected next'); });
+    assert.equal(res.statusCode, 200);
+    assert.equal(JSON.parse(body).endpoint, '/custom-zwa');
+    assert.equal(JSON.parse(body).endpointManifestPath, path.join(dir, '.zwa', 'runtime', 'endpoint.json'));
+    assert.equal(JSON.parse(await fs.readFile(path.join(dir, '.zwa', 'runtime', 'endpoint.json'), 'utf8')).endpoint, '/custom-zwa');
+  } finally {
+    await fs.rm(dir, { recursive: true, force: true });
+  }
 });

@@ -129,3 +129,62 @@ test('upgrade refuses when the project has no installation', async () => {
   const dir = await tempProject({ 'package.json': VITE_PKG });
   await assert.rejects(() => upgradeProject(dir), /尚未安装/);
 });
+
+test('runtime integrity detects a modified installed file and upgrade repairs it', async () => {
+  const dir = await tempProject({ 'package.json': VITE_PKG });
+  await installProject(dir);
+  const target = path.join(dir, WORK_ROOT, 'runtime', 'client', 'annotator.mjs');
+  await fs.appendFile(target, '\n// tampered\n');
+  const before = await checkStatus(dir);
+  assert.equal(before.action, 'upgrade');
+  const result = await upgradeProject(dir);
+  assert.equal(result.action, 'upgraded');
+  assert.equal(result.tasks.preserved, true);
+  const repaired = await checkStatus(dir);
+  assert.equal(repaired.action, 'current');
+});
+
+test('upgrade preserves the dynamic endpoint manifest while replacing static runtime files', async () => {
+  const dir = await tempProject({ 'package.json': VITE_PKG });
+  await installProject(dir);
+  const manifestPath = path.join(dir, WORK_ROOT, 'runtime', 'endpoint.json');
+  await fs.writeFile(manifestPath, JSON.stringify({
+    version: '1.0', runtimeVersion: 'custom', endpoint: '/custom-zwa',
+    routes: { updateTask: 'PATCH /<groupId>/tasks/<taskId>', completeRound: 'POST /complete-round' },
+  }, null, 2));
+  const metaPath = path.join(dir, META_FILE);
+  const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+  meta.skillVersion = '0.1.0';
+  await fs.writeFile(metaPath, JSON.stringify(meta));
+  const result = await upgradeProject(dir);
+  assert.equal(result.tasks.preserved, true);
+  assert.deepEqual(JSON.parse(await fs.readFile(manifestPath, 'utf8')), {
+    version: '1.0', runtimeVersion: 'custom', endpoint: '/custom-zwa',
+    routes: { updateTask: 'PATCH /<groupId>/tasks/<taskId>', completeRound: 'POST /complete-round' },
+  });
+});
+test('upgrade preserves active tasks, archives, attachments and execution state by hash', async () => {
+  const dir = await tempProject({ 'package.json': VITE_PKG });
+  await installProject(dir);
+  await seedTask(dir, 'active');
+  const archiveDir = path.join(dir, WORK_ROOT, 'tasks', 'archive');
+  const attachmentsDir = path.join(dir, WORK_ROOT, 'tasks', 'attachments');
+  await fs.mkdir(archiveDir, { recursive: true });
+  await fs.mkdir(attachmentsDir, { recursive: true });
+  await fs.writeFile(path.join(archiveDir, 'keep.json'), '{"archive":"keep"}');
+  await fs.writeFile(path.join(attachmentsDir, 'keep.png'), Buffer.from([1,2,3,4]));
+  await fs.writeFile(path.join(dir, WORK_ROOT, 'execution.json'), JSON.stringify({ version:'1.0', mode:'queue', rounds:[] }));
+  const prefsPath = path.join(dir, WORK_ROOT, 'runtime', 'board-prefs.json');
+  await fs.mkdir(path.dirname(prefsPath), { recursive: true });
+  await fs.writeFile(prefsPath, JSON.stringify({ theme: 'light' }));
+  const metaPath = path.join(dir, META_FILE);
+  const meta = JSON.parse(await fs.readFile(metaPath, 'utf8'));
+  meta.skillVersion = '0.1.0';
+  await fs.writeFile(metaPath, JSON.stringify(meta));
+  const result = await upgradeProject(dir);
+  assert.equal(result.tasks.preserved, true);
+  assert.deepEqual(await fs.readFile(path.join(attachmentsDir, 'keep.png')), Buffer.from([1,2,3,4]));
+  assert.match(await fs.readFile(path.join(archiveDir, 'keep.json'), 'utf8'), /keep/);
+  assert.equal(JSON.parse(await fs.readFile(path.join(dir, WORK_ROOT, 'execution.json'), 'utf8')).mode, 'queue');
+  assert.equal(JSON.parse(await fs.readFile(prefsPath, 'utf8')).theme, 'light', '看板偏好（主题）升级后保留');
+});

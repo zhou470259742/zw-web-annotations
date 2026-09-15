@@ -55,6 +55,11 @@
       "items": {
         "$ref": "#/$defs/task"
       }
+    },
+    "meta": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "运行时保留的页面组元数据，例如所属轮次"
     }
   },
   "$defs": {
@@ -127,10 +132,12 @@
           "enum": [
             "todo",
             "doing",
+            "review",
             "done",
             "blocked",
             "cancelled"
-          ]
+          ],
+          "description": "review=开发完成待验收（子 agent 回写）；done=主线程浏览器验收通过。"
         },
         "createdAt": {
           "type": "string",
@@ -162,7 +169,10 @@
           "format": "date-time"
         },
         "element": {
-          "$ref": "#/$defs/element"
+          "anyOf": [
+            { "$ref": "#/$defs/element" },
+            { "type": "null" }
+          ]
         },
         "history": {
           "type": "array",
@@ -189,6 +199,10 @@
             "null"
           ],
           "description": "所属轮次号（复制/派发后定稿；处理开始后新增的批注为 null，排队下一轮）"
+        },
+        "pendingInstruction": {
+          "type": "string",
+          "description": "暂存的新要求：批次冻结后对非 todo 任务追加的指令，交付（complete-round）时应用为无轮次 todo 并移除本字段"
         }
       }
     },
@@ -339,6 +353,9 @@
           "type": "string"
         },
         "detail": {
+          "type": "string"
+        },
+        "reason": {
           "type": "string"
         }
       }

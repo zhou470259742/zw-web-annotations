@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "AI agent Web Annotation Execution State",
+  "description": "项目级执行状态（.zwa/execution.json）。mode 是执行模式的唯一事实源，只在轮次边界被消费：本轮复核完毕/归档完成时读取，决定停还是自动续轮。rounds 是轮次归档日志，纯记录性质。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "mode"
+  ],
+  "properties": {
+    "version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["round", "queue"],
+      "description": "round=按轮次：本轮复核完毕即收尾，等显式归档（默认）；queue=按队列：本轮复核归档后由主线程调度下一轮。"
+    },
+    "activeRound": {
+      "type": ["integer", "null"],
+      "minimum": 1,
+      "description": "当前在途轮次；没有已定稿轮次时为 null"
+    },
+    "runner": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "status": { "type": "string", "enum": ["idle", "running", "paused", "blocked", "disconnected"] },
+        "updatedAt": { "type": ["string", "null"], "format": "date-time" }
+      }
+    },
+    "totals": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "queued": { "type": "integer", "minimum": 0 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "total": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "updatedAt": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time",
+      "description": "mode/rounds 最近一次写入时刻"
+    },
+    "rounds": {
+      "type": "array",
+      "description": "轮次归档日志，按轮次号升序。仅用于历史展示，不参与决策。",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "round"
+        ],
+        "properties": {
+          "round": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "archived": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "该轮累计归档任务数（跨页面组幂等合并）"
+          },
+          "completed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "该轮累计验收完成任务数，供队列累计进度使用"
+          },
+          "taskIds": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "该轮已归档任务 ID，用于幂等累计进度"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "reviewing", "completed", "archived", "blocked"]
+          },
+          "archivedAt": {
+            "type": "string",
+            "format": "date-time",
+            "description": "该轮最近一次归档时刻"
+          }
+        }
+      }
+    }
+  }
+}

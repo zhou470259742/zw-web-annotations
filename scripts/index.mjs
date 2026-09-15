@@ -31,10 +31,15 @@ export const RUNTIME_FILES = [
   'client/annotator.mjs',
   'vite/index.mjs',
   'adapters/http.mjs',
+  'board.mjs',
   'adapters/bridge.mjs',
   'adapters/vue3.mjs',
   'adapters/vue2.mjs',
   'schema/annotations.schema.json',
+  'schema/execution.schema.json',
+  // 执行要求（提示词只给这份文件的地址，协议细节都在里面）。
+  // 必须与适配器同在 runtime/ 根下：适配器按「自身位置上一级」解析它。
+  'execution-protocol.md',
 ];
 
 export const WORK_ROOT = '.zwa';
@@ -53,7 +58,7 @@ export const META_FILE = `${WORK_ROOT}/install.json`;
  * 项目就静默停留在旧代码上。
  */
 export const SKILL_NAME = 'zw-web-annotations';
-export const SKILL_VERSION = '0.22.0';
+export const SKILL_VERSION = '0.27.12';
 
 /**
  * 任务目录。
@@ -198,18 +203,58 @@ function runtimeSourceRoot(options = {}) {
 }
 
 /** 递归拷贝运行时文件，保持目录结构。 */
-async function copyRuntime(root, options = {}) {
+async function prepareRuntime(root, options = {}) {
   const sourceRoot = runtimeSourceRoot(options);
-  const target = path.join(root, WORK_ROOT, 'runtime');
+  const finalTarget = path.join(root, WORK_ROOT, 'runtime');
+  const staging = path.join(root, WORK_ROOT, `.runtime-staging-${process.pid}-${Date.now()}`);
+  const previous = path.join(root, WORK_ROOT, `.runtime-previous-${process.pid}-${Date.now()}`);
   const written = [];
-  for (const rel of RUNTIME_FILES) {
-    const src = path.join(sourceRoot, rel);
-    const dest = path.join(target, rel);
-    await fs.mkdir(path.dirname(dest), { recursive: true });
-    await fs.copyFile(src, dest);
-    written.push(path.relative(root, dest));
+  await fs.mkdir(staging, { recursive: true });
+  try {
+    for (const rel of RUNTIME_FILES) {
+      const src = path.join(sourceRoot, rel);
+      const dest = path.join(staging, rel);
+      await fs.mkdir(path.dirname(dest), { recursive: true });
+      await fs.copyFile(src, dest);
+      written.push(path.relative(root, path.join(finalTarget, rel)));
+    }
+    // endpoint.json 与 board-prefs.json 是运行时按项目生成的动态元数据/用户
+    // 偏好，不属于技能静态 fingerprint；升级替换整个 runtime/ 时要先带过去，
+    // 避免协议文件在请求前暂时失去自定义 endpoint 信息、用户主题偏好被清掉。
+    for (const name of ['endpoint.json', 'board-prefs.json']) {
+      try {
+        await fs.copyFile(path.join(finalTarget, name), path.join(staging, name));
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error;
+      }
+    }
+    const stagedFingerprint = await runtimeFingerprint({ runtimeSource: staging });
+    const sourceFingerprint = await runtimeFingerprint({ runtimeSource: sourceRoot });
+    if (stagedFingerprint !== sourceFingerprint) throw new Error('runtime staging fingerprint mismatch');
+    return { staging, finalTarget, previous, written };
+  } catch (error) {
+    await fs.rm(staging, { recursive: true, force: true });
+    throw error;
   }
+}
+
+async function commitRuntime(prepared) {
+  const { staging, finalTarget, previous, written } = prepared;
+  const hadPrevious = await exists(finalTarget);
+  if (hadPrevious) await fs.rename(finalTarget, previous);
+  try {
+    await fs.rename(staging, finalTarget);
+  } catch (error) {
+    if (hadPrevious && await exists(previous)) await fs.rename(previous, finalTarget);
+    throw error;
+  }
+  if (await exists(previous)) await fs.rm(previous, { recursive: true, force: true });
   return written;
+}
+
+async function discardRuntime(prepared) {
+  if (!prepared) return;
+  await fs.rm(prepared.staging, { recursive: true, force: true });
 }
 
 async function initWorkspace(root, options) {
@@ -219,14 +264,23 @@ async function initWorkspace(root, options) {
   if (!(await exists(keep))) await fs.writeFile(keep, '', 'utf8');
 
   const gitignore = path.join(root, '.gitignore');
-  const entry = `${WORK_ROOT}/tasks/`;
+  const entry = `${WORK_ROOT}/`;
   let gitignoreUpdated = false;
-  const current = (await exists(gitignore)) ? await fs.readFile(gitignore, 'utf8') : '';
-  if (!current.split('\n').some(line => line.trim() === entry)) {
-    const prefix = current && !current.endsWith('\n') ? '\n' : '';
-    await fs.writeFile(gitignore, `${current}${prefix}\n# 网页标注产生的本地任务\n${entry}\n`, 'utf8');
+  let current = (await exists(gitignore)) ? await fs.readFile(gitignore, 'utf8') : '';
+  // 0.24 及更早只忽略 tasks/；升级到完整工作区忽略时删除旧行，保留其余内容。
+  const legacyEntry = `${WORK_ROOT}/tasks/`;
+  const normalizedLines = current.split('\n').filter(line => line.trim() !== legacyEntry);
+  const normalized = normalizedLines.join('\n');
+  if (normalized !== current) {
+    current = normalized;
     gitignoreUpdated = true;
   }
+  if (!current.split('\n').some(line => line.trim() === entry)) {
+    const prefix = current && !current.endsWith('\n') ? '\n' : '';
+    current = `${current}${prefix}\n# 网页标注产生的本地工作空间\n${entry}\n`;
+    gitignoreUpdated = true;
+  }
+  if (gitignoreUpdated) await fs.writeFile(gitignore, current, 'utf8');
   return { tasksDir: path.relative(root, tasksDir), gitignoreUpdated };
 }
 
@@ -289,6 +343,10 @@ export function patchViteConfigContent(content) {
 
 /** 极简语法校验：用 node 解析模块语法，不执行配置。 */
 async function validateSyntax(filePath) {
+  // Node 20/22 的 --check 不能解析 TypeScript 类型语法；把合法 vite.config.ts
+  // 当成 JS 判错会阻断安装。TS 配置只做确定性的文本改写+备份，交给 Vite 自己
+  // 的 TS loader 在启动时校验；JS/MJS/CJS 仍用 Node 语法检查。
+  if (/\.(?:ts|mts|cts)$/i.test(filePath)) return { ok: true, skipped: true, reason: 'typescript config validated by Vite' };
   const { spawn } = await import('node:child_process');
   return new Promise(resolve => {
     const child = spawn(process.execPath, ['--check', filePath], { stdio: 'pipe' });
@@ -622,6 +680,34 @@ async function countTaskGroupFiles(root) {
   }
 }
 
+async function workspaceDataFingerprint(root) {
+  const workRoot = path.join(path.resolve(root), WORK_ROOT);
+  const tasksRoot = path.join(workRoot, 'tasks');
+  const files = [];
+  async function walk(dir) {
+    let entries = [];
+    try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      if (entry.name === '.gitkeep') continue;
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) await walk(full);
+      else if (entry.isFile()) files.push(full);
+    }
+  }
+  await walk(tasksRoot);
+  // execution.json 与 tasks 同级，是运行状态的一部分；install.json 不是用户任务数据，
+  // 升级会正常更新它，绝不能把它算进 preserved 判断。
+  const executionFile = path.join(workRoot, 'execution.json');
+  if (await exists(executionFile)) files.push(executionFile);
+  files.sort();
+  const hash = crypto.createHash('sha256');
+  for (const file of files) {
+    hash.update(path.relative(workRoot, file));
+    hash.update(await fs.readFile(file));
+  }
+  return { digest: hash.digest('hex'), files: files.map(file => path.relative(workRoot, file)) };
+}
+
 /**
  * 执行安装。幂等：重复执行为跳过而非报错。
  * @returns 安装结果摘要
@@ -645,23 +731,32 @@ export async function installProject(projectRoot, options = {}) {
 
   const strategy = options.framework || detected.recommendation.strategy;
 
-  const written = options.force || !detected.installed ? await copyRuntime(root, options) : [];
-  const workspace = await initWorkspace(root, options);
-
+  const shouldCopyRuntime = options.force || !detected.installed;
+  const preparedRuntime = shouldCopyRuntime ? await prepareRuntime(root, options) : null;
+  const written = preparedRuntime?.written || [];
+  const runtimeManifest = await runtimeFileManifest();
+  const runtimeFingerprintValue = await runtimeFingerprint();
+  let workspace;
   let integration;
-  if (strategy === 'vite') {
-    integration = await integrateVite(root, detected);
-  } else {
-    const adapter = detected.frontend.framework === 'vue'
-      ? (detected.frontend.frameworkMajor === 2 ? 'vue2.mjs' : 'vue3.mjs')
-      : 'http.mjs';
-    integration = {
-      action: 'manual',
-      file: null,
-      adapter,
-      reason: detected.recommendation.reason,
-      snippet: buildManualSnippet(root, detected, adapter),
-    };
+  try {
+    workspace = await initWorkspace(root, options);
+    if (strategy === 'vite') {
+      integration = await integrateVite(root, detected);
+    } else {
+      const adapter = detected.frontend.framework === 'vue'
+        ? (detected.frontend.frameworkMajor === 2 ? 'vue2.mjs' : 'vue3.mjs')
+        : 'http.mjs';
+      integration = {
+        action: 'manual',
+        file: null,
+        adapter,
+        reason: detected.recommendation.reason,
+        snippet: buildManualSnippet(root, detected, adapter),
+      };
+    }
+  } catch (error) {
+    await discardRuntime(preparedRuntime);
+    throw error;
   }
 
   const meta = {
@@ -678,8 +773,11 @@ export async function installProject(projectRoot, options = {}) {
     tasksDir: TASKS_DIR,
     integration,
     files: written,
+    runtimeFingerprint: runtimeFingerprintValue,
+    runtimeManifest,
     source: 'copy',
   };
+  if (preparedRuntime) await commitRuntime(preparedRuntime);
   await fs.writeFile(path.join(root, META_FILE), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
 
   return {
@@ -731,10 +829,11 @@ export async function checkStatus(projectRoot) {
   const detected = await detectProject(root);
   const installedVersion = detected.meta?.skillVersion || null;
   const versionKnown = !!installedVersion && installedVersion !== '0.0.0';
+  const integrity = detected.installed ? await runtimeIntegrity(root) : { matches: false };
   let action;
   if (!detected.frontend.isFrontend) action = 'not-frontend';
   else if (!detected.installed || !versionKnown) action = 'install';
-  else if (installedVersion !== SKILL_VERSION) action = 'upgrade';
+  else if (installedVersion !== SKILL_VERSION || !integrity.matches) action = 'upgrade';
   else action = 'current';
   return {
     root,
@@ -746,6 +845,7 @@ export async function checkStatus(projectRoot) {
     upToDate: action === 'current',
     action,
     runtimeInstalled: detected.installed,
+    runtimeIntegrity: integrity,
     metaFile: META_FILE,
   };
 }
@@ -795,7 +895,8 @@ export async function upgradeProject(projectRoot, options = {}) {
     };
   }
   const from = detected.meta.skillVersion || '0.0.0';
-  if (from === SKILL_VERSION && !options.force) {
+  const integrity = await runtimeIntegrity(root);
+  if (from === SKILL_VERSION && integrity.matches && !options.force) {
     return {
       ok: true,
       root,
@@ -806,19 +907,14 @@ export async function upgradeProject(projectRoot, options = {}) {
     };
   }
 
-  const taskGroupsBefore = await countTaskGroupFiles(root);
-
-  // 删旧运行时 → 整目录重拷 → 幂等重接入配置（已接入时结果为 patched）
-  await fs.rm(path.join(root, WORK_ROOT, 'runtime'), { recursive: true, force: true });
+  const taskSnapshotBefore = await workspaceDataFingerprint(root);
   const result = await installProject(root, { ...options, force: true });
-
-  // installProject 重写了 meta，这里补记升级来源，供排查与回溯
+  const taskSnapshotAfter = await workspaceDataFingerprint(root);
   const meta = JSON.parse(await fs.readFile(path.join(root, META_FILE), 'utf8'));
   meta.previousSkillVersion = from === '0.0.0' ? null : from;
   meta.upgradedAt = new Date().toISOString();
   await fs.writeFile(path.join(root, META_FILE), `${JSON.stringify(meta, null, 2)}\n`, 'utf8');
 
-  const taskGroupsAfter = await countTaskGroupFiles(root);
   return {
     ok: true,
     root,
@@ -828,24 +924,50 @@ export async function upgradeProject(projectRoot, options = {}) {
     runtimeFiles: result.runtimeFiles,
     tasks: {
       dir: TASKS_DIR,
-      before: taskGroupsBefore,
-      after: taskGroupsAfter,
-      preserved: taskGroupsBefore === taskGroupsAfter,
+      before: taskSnapshotBefore,
+      after: taskSnapshotAfter,
+      preserved: taskSnapshotBefore.digest === taskSnapshotAfter.digest && JSON.stringify(taskSnapshotBefore.files) === JSON.stringify(taskSnapshotAfter.files),
     },
     integration: result.integration,
     metaFile: META_FILE,
   };
 }
 
-/** 计算运行时的内容哈希，用于判断是否需要升级。 */
 export async function runtimeFingerprint(options = {}) {
   const sourceRoot = runtimeSourceRoot(options);
-  const hash = crypto.createHash('sha1');
+  const hash = crypto.createHash('sha256');
   for (const rel of [...RUNTIME_FILES].sort()) {
     hash.update(rel);
     hash.update(await fs.readFile(path.join(sourceRoot, rel)));
   }
-  return hash.digest('hex').slice(0, 12);
+  return hash.digest('hex');
+}
+
+async function runtimeFileManifest(options = {}) {
+  const sourceRoot = runtimeSourceRoot(options);
+  const result = {};
+  for (const rel of [...RUNTIME_FILES].sort()) {
+    const data = await fs.readFile(path.join(sourceRoot, rel));
+    result[rel] = { bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') };
+  }
+  return result;
+}
+
+async function runtimeIntegrity(root) {
+  const target = path.join(path.resolve(root), WORK_ROOT, 'runtime');
+  const expected = await runtimeFileManifest();
+  const actual = {};
+  for (const rel of Object.keys(expected)) {
+    const file = path.join(target, rel);
+    try {
+      const data = await fs.readFile(file);
+      actual[rel] = { bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') };
+    } catch {
+      actual[rel] = null;
+    }
+  }
+  const matches = JSON.stringify(expected) === JSON.stringify(actual);
+  return { matches, expected, actual };
 }
 
 /** 只读检测：供 Skill 在安装前汇报现状，以及安装后校验。 */
@@ -876,6 +998,7 @@ export async function inspectProject(projectRoot) {
     patched: detected.patched,
     installed: detected.installed,
     runtimeFiles,
+    runtimeIntegrity: await runtimeIntegrity(detected.root),
     tasksDir: path.join(detected.root, TASKS_DIR),
     metaFile: path.join(detected.root, META_FILE),
     meta: detected.meta,

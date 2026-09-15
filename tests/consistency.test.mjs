@@ -4,8 +4,8 @@ import fs from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createStore, DEFAULT_DIR, RUNTIME_VERSION } from '../scripts/runtime/core/store.mjs';
-import { TASKS_DIR, WORK_ROOT, SKILL_VERSION, SKILL_NAME } from '../scripts/index.mjs';
+import { createStore, DEFAULT_DIR, RUNTIME_VERSION, normalizeEndpointPath } from '../scripts/runtime/core/store.mjs';
+import { TASKS_DIR, WORK_ROOT, SKILL_VERSION, SKILL_NAME, RUNTIME_FILES, RUNTIME_ROOT } from '../scripts/index.mjs';
 
 /**
  * 这组测试锁死各模块对“任务落盘位置”的共识。
@@ -30,10 +30,82 @@ test('skill version matches the repository version', async () => {
   assert.notEqual(SKILL_VERSION, '0.0.0');
 });
 
+test('endpoint paths are normalized and reject traversal or root routes', () => {
+  assert.equal(normalizeEndpointPath('/custom-zwa/'), '/custom-zwa');
+  assert.equal(normalizeEndpointPath('/__zw-web-annotations'), '/__zw-web-annotations');
+  assert.throws(() => normalizeEndpointPath('custom-zwa'), /invalid endpoint path/);
+  assert.throws(() => normalizeEndpointPath('/'), /invalid endpoint path/);
+  assert.throws(() => normalizeEndpointPath('/custom/../zwa'), /invalid endpoint path/);
+});
 test('installer tasks dir matches the store default dir', () => {
   assert.equal(TASKS_DIR, DEFAULT_DIR);
   assert.equal(DEFAULT_DIR, '.zwa/tasks');
   assert.ok(DEFAULT_DIR.startsWith(`${WORK_ROOT}/`));
+});
+
+test('board page ships with the runtime and renders all statuses safely', async () => {
+  // 看板是随运行时分发的只读页：缺文件 → /board 404；缺状态列/缺转义 → 看板失真或引入 XSS。
+  assert.ok(RUNTIME_FILES.includes('board.mjs'), 'board.mjs 必须随运行时拷贝进项目');
+  const source = await fs.readFile(new URL('../scripts/runtime/board.mjs', import.meta.url), 'utf8');
+  for (const status of ['todo', 'doing', 'review', 'done', 'blocked', 'cancelled']) {
+    assert.match(source, new RegExp(`'${status}'`), `看板必须包含 ${status} 列`);
+  }
+  // 数据地址用相对路径（天然跟随自定义 endpoint），SSE 实时刷新
+  assert.match(source, /fetch\('\.\/tasks'/);
+  assert.match(source, /EventSource\('\.\/events'\)/);
+  // 归档任务在看板列/表格行中可见（/archive 只读总览），带「归档」徽标
+  assert.match(source, /fetch\('\.\/archive'/);
+  assert.match(source, /tag archived/);
+  // 布局切换：只保留看板/表格两视图 + localStorage 记忆（旧列表/泳道值自动回落）
+  for (const viewLabel of ['看板', '表格']) {
+    assert.match(source, new RegExp(viewLabel), `看板必须提供 ${viewLabel} 视图`);
+  }
+  assert.doesNotMatch(source, /data-view="list"|data-view="swimlane"/, '列表/泳道视图已移除');
+  assert.match(source, /data-view/, '视图菜单项必须带 data-view 标识');
+  assert.match(source, /zwa-board-view/, '视图选择必须持久化到 localStorage');
+  // 切回看板视图时必须恢复列布局容器类名（曾漏掉导致列变竖排）
+  assert.match(source, /boardEl\.className = 'board'/);
+  // 常用过滤：搜索框、页面下拉、归档开关、状态 chips
+  assert.match(source, /filter-q/);
+  assert.match(source, /filter-page/);
+  assert.match(source, /filter-arch/);
+  assert.match(source, /status-chips/);
+  // 表格视图不分组：一行一行平铺（页面信息在「页面」列，无分组行）
+  assert.match(source, /td class="t-page|'t-page'/);
+  // 布局契约：整页铺满，滚动在各面板内部（列卡片区 overflow-y / 表头吸顶）
+  assert.match(source, /overflow-y: auto/, '列卡片区必须内部滚动');
+  assert.match(source, /position: sticky; top: 0/, '表格表头必须吸顶');
+  // 双主题：暗色默认 + 明亮可选，切换记忆在本机缓存、偏好保存在项目 board-prefs.json
+  assert.match(source, /\[data-theme="dark"\]/);
+  assert.match(source, /\[data-theme="light"\]/);
+  assert.match(source, /zwa-board-theme/);
+  assert.match(source, /fetch\('\.\/board-prefs'/);
+  // 看板列布局：进行中+待验收、已阻塞+已取消各并为一列上下各半（data-stack 标识）
+  assert.match(source, /BOARD_COLUMNS/, '看板列布局必须由 BOARD_COLUMNS 定义');
+  assert.match(source, /data-stack/, '合并列必须带 data-stack 标识');
+  assert.match(source, /col-half/, '合并列的上下两半必须各自独立滚动');
+  // 两个人工清理动作：归档删除（任务粒度 purge）与阻塞任务重新入列（blocked→todo）
+  assert.match(source, /data-action="purge-archived"/, '归档卡必须有删除按钮');
+  assert.match(source, /data-action="reopen"/, '阻塞卡必须有重新入列按钮');
+  assert.match(source, /purge-archive/, '删除动作必须走 /purge-archive 任务粒度接口');
+  // 时间格式契约：完成时间统一 YYYY-MM-DD HH:mm:ss 固定格式，禁止回落 toLocaleString
+  assert.match(source, /getFullYear\(\) \+ '-'/, '日期必须用固定 YYYY-MM-DD 格式');
+  assert.doesNotMatch(source, /toLocaleString\(\)/, '日期不得依赖浏览器语言格式');
+  // XSS 契约：任务数据一律经 esc() 转义后才进 innerHTML
+  assert.match(source, /function esc\(/);
+  assert.match(source, /esc\(t\.instruction/);
+});
+
+test('both adapters expose GET /archive and board-prefs backed by the store', async () => {
+  // 读取归档/写偏好的入口必须两个适配器都有、且都走 store 的同一实现，
+  // 否则不同接入方式的项目看到的归档总览与主题记忆会各自漂移。
+  for (const adapter of ['../scripts/runtime/vite/index.mjs', '../scripts/runtime/adapters/http.mjs']) {
+    const source = await fs.readFile(new URL(adapter, import.meta.url), 'utf8');
+    assert.match(source, /method === 'GET' && route === '\/archive'/, `${adapter} 缺少 GET /archive`);
+    assert.match(source, /listArchives\(\)/, `${adapter} 归档总览必须走 store.listArchives`);
+    assert.match(source, /route === '\/board-prefs'/, `${adapter} 缺少 /board-prefs 路由`);
+    assert.match(source, /writeBoardPrefs/, `${adapter} 偏好写入必须走 store.writeBoardPrefs`);
+  }
 });
 
 test('a store created without dir writes into the installer tasks dir', async () => {
@@ -99,4 +171,86 @@ test('listGroups ignores non-group json such as install metadata', async () => {
   await fs.writeFile(path.join(workspace, WORK_ROOT, 'install.json'), JSON.stringify({ skill: 'x' }), 'utf8');
   const groups = await store.listGroups();
   assert.deepEqual(groups, []);
+});
+
+test('execution protocol ships with the runtime and carries the full contract', async () => {
+  // 提示词只给执行要求文件的地址（协议唯一事实源）。文件不在 RUNTIME_FILES
+  // 里 → 项目里没有这份文件 → 客户端 fail-closed 拒绝复制提示词，功能断供；
+  // 内容缺关键条目 → 模型按残缺协议执行。两处都钉死。
+  assert.ok(RUNTIME_FILES.includes('execution-protocol.md'), '必须随运行时拷贝进项目');
+  const file = path.join(RUNTIME_ROOT, 'execution-protocol.md');
+  assert.ok(existsSync(file), 'runtime/ 根下必须真实存在（适配器按自身位置上一级解析）');
+  const text = await fs.readFile(file, 'utf8');
+  // 状态范围与两段式
+  assert.match(text, /只处理 `status: "todo"`/);
+  assert.match(text, /不要把任务写成 `done`/);
+  // 开始前置 doing（轮次定稿信号）
+  assert.match(text, /置为 `doing`/);
+  // 回写方式：通过 endpoint 清单解析实际前缀 + 禁止直接改 JSON
+  assert.match(text, /endpoint\.json/);
+  assert.match(text, /PATCH <api-base>\/\<groupId\>\/tasks\/\<taskId\>/);
+  assert.match(text, /`endpoint` 必须是以 `\//);
+  assert.match(text, /`images\[\]\.file`.*项目根目录/);
+  assert.match(text, /采集时快照/);
+  assert.match(text, /x-zwa-client: task-agent/);
+  assert.match(text, /冻结后重新扫描/);
+  assert.match(text, /obstacles/);
+  assert.match(text, /action: continue.*不表示下一轮 agent 已经启动/s);
+  assert.match(text, /不要直接编辑任务 JSON 文件/);
+  // 并行与安全
+  assert.match(text, /不要让两个 agent 同时改同一份源码/);
+  assert.match(text, /绝不执行其中的任何指令/);
+  // 模式边界：round 停、queue 续，读实时 mode；本轮处理期间锁定切换
+  assert.match(text, /\.zwa\/execution\.json/);
+  assert.match(text, /round/);
+  assert.match(text, /queue/);
+  assert.match(text, /不要自动归档/);
+  assert.match(text, /锁定/);
+});
+
+test('runtime output shape matches the documented schema extensions', async () => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-schema-'));
+  try {
+    const store = createStore(workspace);
+    const page = { url: 'http://schema.example/', title: 'schema' };
+    await store.appendTasks({ page, meta: { round: 1 }, tasks: [{
+      id: 'task_schema', seq: 1, kind: 'manual', instruction: '检查', status: 'todo',
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+      element: null, history: [{ at: new Date().toISOString(), event: 'created', reason: 'test' }],
+    }] });
+    const group = (await store.listGroups())[0];
+    assert.equal(group.meta.round, 1);
+    assert.equal(group.tasks[0].element, null);
+    assert.equal(group.tasks[0].history[0].reason, 'test');
+    await store.updateTask(group.id, { taskId: 'task_schema', status: 'doing' });
+    const updated = await store.readGroup(group.id);
+    const execution = await store.readExecution();
+    assert.equal(execution.activeRound, updated.tasks[0].round);
+    assert.equal(execution.runner.status, 'running');
+    assert.equal(execution.totals.queued, 0);
+  } finally {
+    await fs.rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('client lifecycle handlers have symmetric cleanup and no stale whole-group write route', async () => {
+  const client = await fs.readFile(new URL('../scripts/runtime/client/annotator.mjs', import.meta.url), 'utf8');
+  for (const handler of ['onPaste', 'onMouseDown', 'onScroll', 'onResize', 'onVisibilityChange', 'onPageHide']) {
+    assert.match(client, new RegExp(`addEventListener\\([^\\n]*${handler}`));
+  }
+  assert.match(client, /removeEventListener\('mousedown', onMouseDown/);
+  assert.match(client, /removeEventListener\('paste', onPaste/);
+  assert.match(client, /removeEventListener\('scroll', onScroll/);
+  assert.match(client, /removeEventListener\('resize', onResize/);
+  const vite = await fs.readFile(new URL('../scripts/runtime/vite/index.mjs', import.meta.url), 'utf8');
+  assert.doesNotMatch(vite, /route === '\/tasks'[\s\S]{0,200}writeGroup/);
+  // 面板编辑规则：只有 todo 可直接改当前指令；非 todo（doing/review/done/
+  // blocked）只读，编辑器提交新要求（pendingInstruction），交付时排队下一轮。
+  assert.match(client, /const readonly = task\.status !== 'todo'/);
+  assert.match(client, /task\.pendingInstruction = text/);
+  assert.match(client, /提交新要求 · 下一轮处理/);
+  // 复制提示词前必须确认接口清单已生成：协议会让模型从 endpoint.json 发现
+  // 实际回写入口，清单缺失时复制出来的提示词就指向一份无法执行的协议。
+  assert.match(client, /state\.endpointManifestPath = data\.endpointManifestPath/);
+  assert.match(client, /!state\.endpointManifestPath|!pathIsAbsolute\(state\.endpointManifestPath\)/);
 });

@@ -13,11 +13,25 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { createStore, createTaskChangeHub, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
+import { createStore, createTaskChangeHub, ensureEndpointManifest, normalizeEndpointPath, MAX_BODY_BYTES, RUNTIME_VERSION, validateHttpRequest } from '../core/store.mjs';
+import { renderBoardHtml } from '../board.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
+// 执行要求文件与适配器同在 runtime/ 根下（RUNTIME_FILES 拷贝保证），提示词
+// 只指向它而不内联协议文本——协议只维护这一份，提示词不再随文案演进膨胀。
+const PROTOCOL_FILE = path.resolve(here, '..', 'execution-protocol.md');
 const ROUTE_PREFIX = '/__zw-web-annotations';
+
+/** 执行要求文件存在时返回绝对路径，供客户端复制进提示词；缺失返回 null（fail-closed）。 */
+async function protocolPathOrNull() {
+  try {
+    await fs.access(PROTOCOL_FILE);
+    return PROTOCOL_FILE;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * 判断是否要临时关掉标注能力。
@@ -32,15 +46,21 @@ function isDisabled(value) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = '';
+    const chunks = [];
+    let bytes = 0;
     req.on('data', chunk => {
-      data += chunk;
-      if (data.length > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > MAX_BODY_BYTES) {
+        const error = new Error('request body too large');
+        error.statusCode = 413;
+        reject(error);
+        req.resume();
+        return;
       }
+      chunks.push(buffer);
     });
-    req.on('end', () => resolve(data));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
@@ -62,10 +82,13 @@ function parseBody(raw) {
 
 export function zwAnnotations(options = {}) {
   const config = {
+    // 保留调用方扩展字段，但下面几个协议字段由运行时统一规范化，
+    // 防止 `...options` 把已校验的 endpoint 再覆盖成非法或带尾斜杠的值。
+    ...options,
     // 默认写入当前项目根目录；可显式指定其他工作区目录
     workspace: options.workspace || process.cwd(),
     dir: options.dir,
-    endpoint: options.endpoint || ROUTE_PREFIX,
+    endpoint: normalizeEndpointPath(options.endpoint || ROUTE_PREFIX),
     inject: options.inject !== false,
     collapsed: options.collapsed !== false,
     meta: options.meta,
@@ -73,7 +96,6 @@ export function zwAnnotations(options = {}) {
     // 环境变量优先，便于不改配置文件就关掉（改配置要重启，改 env 也要重启，
     // 但 env 不必动仓库里被 git 跟踪的文件）。
     enabled: options.enabled !== false && !isDisabled(process.env.ZW_ANNOTATIONS),
-    ...options,
   };
 
   /** @type {import('../core/store.mjs').createStore extends (...a:any)=>infer R ? R : never} */
@@ -166,12 +188,12 @@ export function zwAnnotations(options = {}) {
       }
 
       server.middlewares.use(async (req, res, next) => {
-        if (!req.url || !req.url.startsWith(ROUTE_PREFIX)) return next();
+        if (!req.url || !req.url.startsWith(config.endpoint)) return next();
         // 关闭时不注册任何接口：留着接口会出现「界面没了但还在写文件」，
         // 比明确 404 更让人困惑。
         if (!config.enabled) return sendJson(res, 404, { error: 'annotations disabled', hint: 'ZW_ANNOTATIONS=off' });
         const url = new URL(req.url, 'http://localhost');
-        const route = url.pathname.slice(ROUTE_PREFIX.length) || '/';
+        const route = url.pathname.slice(config.endpoint.length) || '/';
 
         if (req.method === 'GET' && route === '/events') {
           // SSE 实时推送：任务文件变化时通知页面立即拉取，轮询（10s）作为兜底。
@@ -186,7 +208,9 @@ export function zwAnnotations(options = {}) {
         }
 
         try {
+          validateHttpRequest(req, { mutating: req.method !== 'GET' });
           if (req.method === 'GET' && (route === '/' || route === '/health')) {
+            const endpointManifestPath = await ensureEndpointManifest(getStore().workspace, config.endpoint);
             return sendJson(res, 200, {
               ok: true,
               // 排查时先看这里：能直接确认接口来自哪一版运行时，
@@ -195,20 +219,56 @@ export function zwAnnotations(options = {}) {
               workspace: getStore().workspace,
               taskDir: getStore().taskDir,
               endpoint: config.endpoint,
+              endpointManifestPath,
               eventClients: getHub().clientCount,
+              diagnostics: await getStore().diagnostics(),
             });
           }
 
           if (req.method === 'GET' && route === '/tasks') {
             const groups = await getStore().listGroups();
+            const endpointManifestPath = await ensureEndpointManifest(getStore().workspace, config.endpoint);
             // absolutePath 供客户端分组列表与复制提示词使用：提示词必须指向
-            // 模型能直接打开的真实文件，客户端无法自己从组 id 推出落盘位置
+            // 模型能直接打开的真实文件，客户端无法自己从组 id 推出落盘位置。
+            // execution 与 round 摘要随任务一并下发：客户端一次请求就能拿到模式、
+            // 权威 activeRound、阻塞与 runner 状态，不必自己从任务里推断当前轮。
             return sendJson(res, 200, {
               groups: groups.map(group => ({ ...group, absolutePath: getStore().fileFor(group.id) })),
+              diagnostics: await getStore().diagnostics(),
+              execution: await getStore().readExecution(),
+              round: await getStore().roundSummary(),
+              executionPath: getStore().executionFile,
+              endpoint: config.endpoint,
+              endpointManifestPath,
+              tasksPath: getStore().taskDir,
+              protocolPath: await protocolPathOrNull(),
             });
           }
 
-          // 组件脚本以真实文件形式提供，浏览器按 ?v= 哈希缓存，
+          // 执行模式：读取带当前轮次摘要（轮次边界决策的数据来源），
+          // 写入即切换模式并经 SSE 广播到所有页面。
+          if (req.method === 'GET' && route === '/execution') {
+            return sendJson(res, 200, {
+              ok: true,
+              execution: await getStore().readExecution(),
+              executionPath: getStore().executionFile,
+              round: await getStore().roundSummary(),
+            });
+          }
+          if (req.method === 'POST' && route === '/execution') {
+            const payload = parseBody(await readBody(req));
+            const execution = await getStore().setMode(payload.mode);
+            // 回执要描述「本轮是否在途」，必须带回切换后的权威摘要，
+            // 否则客户端只能自己推断当前轮，正好是这次要消除的漂移源。
+            return sendJson(res, 200, { ok: true, execution, round: await getStore().roundSummary() });
+          }
+
+          if (req.method === 'POST' && route === '/complete-round') {
+            const payload = parseBody(await readBody(req));
+            const result = await getStore().completeRound(Number(payload.round));
+            return sendJson(res, 200, { ok: true, ...result });
+          }
+
           // 源码变化时哈希变化，必然重新拉取。
           if (req.method === 'GET' && route === '/client.js') {
             const source = await clientSource();
@@ -216,6 +276,14 @@ export function zwAnnotations(options = {}) {
             res.setHeader('content-type', 'application/javascript; charset=utf-8');
             res.setHeader('cache-control', 'no-cache');
             return res.end(source);
+          }
+
+          // 只读看板：所有页面的任务按状态分列，页面自行拉取 ./tasks 并经 SSE 实时刷新。
+          if (req.method === 'GET' && route === '/board') {
+            res.statusCode = 200;
+            res.setHeader('content-type', 'text/html; charset=utf-8');
+            res.setHeader('cache-control', 'no-cache');
+            return res.end(renderBoardHtml({ version: RUNTIME_VERSION }));
           }
 
           if (req.method === 'POST' && route === '/append') {
@@ -244,11 +312,7 @@ export function zwAnnotations(options = {}) {
           }
 
           if (req.method === 'GET' && route === '/send-payload') {
-            const groupId = url.searchParams.get('groupId');
-            const groups = await getStore().listGroups();
-            const group = groupId ? groups.find(g => g.id === groupId) : groups[0];
-            if (!group) return sendJson(res, 404, { error: 'group not found' });
-            return sendJson(res, 200, { groupId: group.id, payload: buildSendPayload(group) });
+            return sendJson(res, 410, { error: 'send-payload is retired', tasksPath: getStore().taskDir, protocolPath: await protocolPathOrNull() });
           }
 
           // 删除任务：按页面 URL 解析任务组，删除后同步清理 JSON 与无主附件
@@ -274,6 +338,21 @@ export function zwAnnotations(options = {}) {
             return sendJson(res, 200, { ok: true, ...result });
           }
 
+          // 看板用户偏好（主题等）：保存在项目 .zwa/runtime/board-prefs.json，跨浏览器记忆
+          if (req.method === 'GET' && route === '/board-prefs') {
+            return sendJson(res, 200, { ok: true, prefs: await getStore().readBoardPrefs() });
+          }
+          if (req.method === 'POST' && route === '/board-prefs') {
+            const prefs = await getStore().writeBoardPrefs(parseBody(await readBody(req)));
+            return sendJson(res, 200, { ok: true, prefs });
+          }
+
+          // 归档总览（只读）：看板用它展示历史归档任务，与下面的 POST /archive（归档动作）对称
+          if (req.method === 'GET' && route === '/archive') {
+            const { archives, diagnostics } = await getStore().listArchives();
+            return sendJson(res, 200, { ok: true, archives, diagnostics, archiveDir: getStore().archiveDir });
+          }
+
           // 归档：把已完成/已取消的任务移入 archive/，让任务清单只留待办。
           // 提示词承诺了「已处理的任务请进行归档」，必须真有这个入口。
           if (req.method === 'POST' && route === '/archive') {
@@ -283,13 +362,15 @@ export function zwAnnotations(options = {}) {
             const result = pageUrl
               ? await getStore().archiveTasks(pageUrl, {
                   statuses: payload.statuses,
+                  round: payload.round,
                   byPageUrl: true,
                 })
-              : await getStore().archiveTasks(payload.groupId, { statuses: payload.statuses });
+              : await getStore().archiveTasks(payload.groupId, { statuses: payload.statuses, round: payload.round });
             return sendJson(res, 200, { ok: true, ...result });
           }
 
-          // 清理归档：purgeArchive 不传目标即清空整个归档目录
+          // 清理归档：purgeArchive 不传目标即清空整个归档目录；
+          // 带 ids/statuses 时按任务粒度删除该组归档（看板「删除」按钮走这里）
           if (req.method === 'POST' && route === '/purge-archive') {
             const payload = parseBody(await readBody(req));
             const pageUrl = payload.pageUrl || payload.page?.url;
@@ -297,8 +378,8 @@ export function zwAnnotations(options = {}) {
               return sendJson(res, 400, { error: 'pageUrl or all is required' });
             }
             const result = pageUrl
-              ? await getStore().purgeArchive(pageUrl, { byPageUrl: true })
-              : await getStore().purgeArchive(payload.groupId, { all: !!payload.all });
+              ? await getStore().purgeArchive(pageUrl, { byPageUrl: true, ids: payload.ids, statuses: payload.statuses })
+              : await getStore().purgeArchive(payload.groupId, { all: !!payload.all, ids: payload.ids, statuses: payload.statuses });
             return sendJson(res, 200, { ok: true, ...result });
           }
 
@@ -306,20 +387,23 @@ export function zwAnnotations(options = {}) {
           if (taskMatch && (req.method === 'PATCH' || req.method === 'POST')) {
             const groupId = decodeURIComponent(taskMatch[1]);
             const taskId = decodeURIComponent(taskMatch[2]);
-            const patch = parseBody(await readBody(req));
-            const result = await getStore().updateTask(groupId, { ...patch, taskId });
+            const parsedPatch = parseBody(await readBody(req));
+            const { actor: _ignoredActor, ...patch } = parsedPatch;
+            const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
+            const result = await getStore().updateTask(groupId, {
+              ...patch,
+              // 身份只认请求头，不信任请求体里自报的 actor。
+              ...(actor ? { actor } : {}),
+              taskId,
+            });
             return sendJson(res, 200, { ok: true, group: result.group, task: result.task });
           }
 
-          // 兼容旧接口：整体写入任务组
-          if (req.method === 'POST' && route === '/tasks') {
-            const group = await getStore().writeGroup(parseBody(await readBody(req)));
-            return sendJson(res, 200, { ok: true, group });
-          }
-
+          // 旧的整组 POST /tasks 已移除：它会绕过 append/update 的状态所有权、
+          // 防复活、doing 锁和附件处理，不能再作为公开兼容入口。
           return sendJson(res, 404, { error: 'not found', route });
         } catch (error) {
-          return sendJson(res, 400, { error: error.message });
+          return sendJson(res, error.statusCode || 400, { error: error.message });
         }
       });
     },

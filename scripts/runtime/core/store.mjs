@@ -5,7 +5,61 @@ import crypto from 'node:crypto';
 
 export const STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'cancelled'];
 export const STATUS_SET = new Set(STATUSES);
+export const TERMINAL_STATUSES = ['done', 'cancelled'];
+export const TERMINAL_STATUS_SET = new Set(TERMINAL_STATUSES);
+export const MAX_TASK_ID_LENGTH = 64;
+export const MAX_INSTRUCTION_LENGTH = 4096;
+export const MAX_IMAGES_PER_TASK = 8;
+export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/** 正常处理流；同状态写入是幂等的，reopen 由 updateTask 的显式选项控制。 */
+export const STATUS_TRANSITIONS = {
+  todo: new Set(['todo', 'doing', 'cancelled']),
+  doing: new Set(['doing', 'review', 'blocked', 'cancelled']),
+  review: new Set(['review', 'done', 'blocked', 'cancelled', 'todo']),
+  done: new Set(['done']),
+  // blocked → todo：人工「重新入列」。队列停下等的就是这个人工决定。
+  blocked: new Set(['blocked', 'cancelled', 'todo']),
+  cancelled: new Set(['cancelled']),
+};
+/**
+ * 项目执行模式。区别只在「当前轮复核归档后的走向」：
+ * - round：本轮收尾即停，等用户显式归档/下一步指令（默认）；
+ * - queue：本轮复核归档后自动继续派发下一轮，直到没有待处理任务。
+ * 模式是**实时状态**，只在轮次边界被消费（见 task-protocol.md 的决策点），
+ * 不随轮次定稿——用户中途切换，下一次边界决策就用新值。
+ */
+export const EXECUTION_MODES = ['round', 'queue'];
+export const EXECUTION_MODE_SET = new Set(EXECUTION_MODES);
 export const MAX_BODY_BYTES = 24 * 1024 * 1024;
+
+export function validateHttpRequest(req, { mutating = false } = {}) {
+  const host = String(req?.headers?.host || '');
+  const hostname = host.startsWith('[') ? host.slice(1, host.indexOf(']')) : host.split(':')[0];
+  if (!['localhost', '127.0.0.1', '::1'].includes(hostname)) {
+    const error = new Error('forbidden host');
+    error.statusCode = 403;
+    throw error;
+  }
+  const origin = String(req?.headers?.origin || '');
+  if (origin) {
+    let originHost = '';
+    try { originHost = new URL(origin).host; } catch { /* invalid origin remains empty */ }
+    if (originHost !== host) {
+      const error = new Error('forbidden origin');
+      error.statusCode = 403;
+      throw error;
+    }
+  }
+  if (mutating) {
+    const type = String(req?.headers?.['content-type'] || '').toLowerCase();
+    if (!type.startsWith('application/json')) {
+      const error = new Error('content-type must be application/json');
+      error.statusCode = 415;
+      throw error;
+    }
+  }
+  return true;
+}
 /**
  * 任务落盘的规范目录。
  * 安装器、Vite 插件、http 适配器、bridge 与 MCP 必须共用这一个常量：
@@ -25,7 +79,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.22.0';
+export const RUNTIME_VERSION = '0.27.12';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -44,8 +98,66 @@ export const IMAGE_TYPES = {
 
 export const nowIso = () => new Date().toISOString();
 
+export function normalizeEndpointPath(value) {
+  const text = String(value || '').trim();
+  const normalized = text.replace(/\/+$/, '');
+  if (!normalized || normalized === '/' || !/^\/[A-Za-z0-9._~-]+(?:\/[A-Za-z0-9._~-]+)*$/.test(normalized) || normalized.includes('..')) {
+    throw new Error('invalid endpoint path');
+  }
+  return normalized;
+}
+
+/**
+ * 写入项目级运行时 endpoint 清单。执行要求文件本身是静态 runtime，不能把
+ * 用户自定义的 endpoint 写死进去；适配器在运行时把真实 endpoint 写到
+ * `.zwa/runtime/endpoint.json`，模型读取协议后再读这份清单。清单不在 tasks/
+ * 中，不属于用户任务数据；写入采用临时文件 + rename，读取到半文件不会发生。
+ */
+export async function ensureEndpointManifest(workspace, endpoint) {
+  const root = path.resolve(workspace);
+  const file = path.join(root, '.zwa', 'runtime', 'endpoint.json');
+  const manifest = `${JSON.stringify({
+    version: '1.0',
+    runtimeVersion: RUNTIME_VERSION,
+    endpoint: normalizeEndpointPath(endpoint),
+    routes: {
+      tasks: 'GET /tasks',
+      updateTask: 'PATCH /<groupId>/tasks/<taskId>',
+      execution: 'GET|POST /execution',
+      completeRound: 'POST /complete-round',
+      board: 'GET /board',
+    },
+  }, null, 2)}\n`;
+  try {
+    if (await fs.readFile(file, 'utf8') === manifest) return file;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') {
+      // 运行时元数据损坏时按期望内容原子修复，不影响 tasks/ 原件。
+    }
+  }
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${Date.now()}.${crypto.randomUUID()}.tmp`;
+  try {
+    await fs.writeFile(tmp, manifest, { mode: 0o600 });
+    await fs.rename(tmp, file);
+  } catch (error) {
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+  return file;
+}
+
 export function safeId(value) {
-  return String(value || '').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+  const text = String(value || '');
+  return text.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120);
+}
+
+export function validateTaskId(value) {
+  const text = String(value || '');
+  if (!text || text.length > MAX_TASK_ID_LENGTH || !/^[A-Za-z0-9._-]+$/.test(text)) {
+    throw new Error(`invalid task id: ${text.slice(0, 40)}`);
+  }
+  return text;
 }
 
 /**
@@ -78,8 +190,13 @@ export function validateGroup(group) {
     throw new Error('invalid annotation group');
   }
   for (const task of group.tasks) {
-    if (!task.id || typeof task.instruction !== 'string' || !STATUS_SET.has(task.status) || !Array.isArray(task.history)) {
+    if (!task.id || typeof task.id !== 'string' || task.id.length > MAX_TASK_ID_LENGTH || !/^[A-Za-z0-9._-]+$/.test(task.id) || typeof task.instruction !== 'string' || task.instruction.length > MAX_INSTRUCTION_LENGTH || !STATUS_SET.has(task.status) || !Array.isArray(task.history)) {
       throw new Error(`invalid task: ${task.id || 'unknown'}`);
+    }
+    for (const item of task.history) {
+      if (!item || typeof item.at !== 'string' || typeof item.event !== 'string') {
+        throw new Error(`invalid task history: ${task.id}`);
+      }
     }
     // manual 任务没有关联元素；element 任务必须有 element
     if (task.kind !== 'manual' && !task.element) {
@@ -227,8 +344,14 @@ export function createStore(workspace, options = {}) {
     return path.join(taskDir, `${clean}.json`);
   };
 
+  const lockFile = path.join(path.dirname(taskDir), '.write.lock');
+
   const attachmentsDir = path.join(taskDir, ATTACHMENTS_DIRNAME);
   const archiveDir = path.join(taskDir, ARCHIVE_DIRNAME);
+  // 执行状态文件与 tasks/ 同级（默认 <workspace>/.zwa/execution.json）：
+  // 存放项目级执行模式与轮次归档日志，是模式的唯一事实源。
+  const executionFile = path.join(path.dirname(taskDir), 'execution.json');
+  const tasksDirectory = taskDir;
 
   // 任务数据变更回调：宿主用它驱动 SSE 实时推送（见 createTaskChangeHub）。
   // 回调抛错绝不影响写盘本身的数据一致性。
@@ -241,27 +364,65 @@ export function createStore(workspace, options = {}) {
   };
 
   /**
+   * 跨 store / 跨进程锁：每个 workspace 共用一个 O_EXCL 锁文件。
+   * 同进程的 queueWrite 负责顺序，锁负责两个 createStore/进程之间互斥。
+   * 锁只包住读—改—写临界区；异常/进程崩溃留下的锁在超时后才回收，
+   * 避免一个短暂的残留文件永久阻塞任务系统。
+   */
+  const acquireFileLock = async () => {
+    await fs.mkdir(path.dirname(lockFile), { recursive: true });
+    const started = Date.now();
+    const staleMs = 30_000;
+    while (true) {
+      try {
+        const handle = await fs.open(lockFile, 'wx', 0o600);
+        await handle.writeFile(JSON.stringify({ pid: process.pid, at: nowIso() }));
+        return async () => {
+          await handle.close().catch(() => {});
+          await fs.rm(lockFile, { force: true }).catch(() => {});
+        };
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+        let stale = false;
+        try {
+          const stat = await fs.stat(lockFile);
+          stale = Date.now() - stat.mtimeMs > staleMs;
+        } catch (statError) {
+          if (statError?.code !== 'ENOENT') throw statError;
+        }
+        if (stale) {
+          await fs.rm(lockFile, { force: true });
+          continue;
+        }
+        if (Date.now() - started > 15_000) throw new Error('timed out waiting for workspace write lock');
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+    }
+  };
+
+  /**
    * 写操作串行队列。
    *
-   * 每个变更都是「读文件 → 改内存 → 写回整份文件」，中间没有任何版本校验。
-   * 两个变更并发时会各自基于同一份旧快照写回，后写的把先写的成果整个覆盖——
-   * 典型场景是用户正标注时子 agent 回写状态：一次并发就可能让 agent 的 review
-   * 被回退成 doing（实测 30/30），或让用户刚加的标注整条消失（实测低频但存在）。
-   * 这两种后果分别是「处理者工作标记丢失」和「用户输入丢失」，都不可接受。
-   *
-   * 因此把所有变更串到一条 promise 链上，使「读—改—写」成为临界区。
-   * 用**全局**单条队列而不是按 groupId 分锁：pruneAttachments 会扫描全部任务组
-   * 与归档来决定附件保活，跨组操作与单组写入并发时仍会误删附件。
-   * 本机小文件写入是毫秒级，全局串行的代价可忽略。
-   *
-   * 边界：这只覆盖**同一进程内**的并发。若另有进程（如另一个 agent 直接改 JSON）
-   * 同时写同一文件，需要跨进程文件锁，不在本队列职责内。
+   * 先前的 promise 队列只覆盖单个 createStore 实例；这里再加 workspace 级
+   * O_EXCL 锁，避免两个 dev server/进程各自读旧快照后互相覆盖。
    */
   let writeChain = Promise.resolve();
   const queueWrite = fn => {
-    // 前一个写失败也不能堵塞队列，因此两个分支都继续执行下一个
-    const result = writeChain.then(() => fn(), () => fn());
-    // 链上只保留「是否结束」，避免异常沿链冒泡成未处理的 rejection
+    const result = writeChain.then(async () => {
+      const release = await acquireFileLock();
+      try {
+        return await fn();
+      } finally {
+        await release();
+      }
+    }, async () => {
+      const release = await acquireFileLock();
+      try {
+        return await fn();
+      } finally {
+        await release();
+      }
+    });
     writeChain = result.then(() => undefined, () => undefined);
     return result;
   };
@@ -279,6 +440,9 @@ export function createStore(workspace, options = {}) {
         if (!parsed) {
           delete image.dataUrl;
           continue;
+        }
+        if (parsed.buffer.length > MAX_IMAGE_BYTES) {
+          throw new Error(`image too large: ${task.id}`);
         }
         await fs.mkdir(attachmentsDir, { recursive: true });
         const name = `${safeId(task.id)}-${safeId(image.id || crypto.randomUUID().slice(0, 8))}.${parsed.ext}`;
@@ -299,6 +463,15 @@ export function createStore(workspace, options = {}) {
 
   const readGroup = async id => validateGroup(JSON.parse(await fs.readFile(fileFor(id), 'utf8')));
 
+  const readGroupOrMissing = async id => {
+    try {
+      return await readGroup(id);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return null;
+      throw new Error(`corrupt annotation group: ${id}`);
+    }
+  };
+
   /** 按页面 URL 解析任务组 id，删除接口用它从不信任的页面侧值安全定位。 */
   const groupIdForPage = url => pageKey(url);
 
@@ -316,21 +489,261 @@ export function createStore(workspace, options = {}) {
     return group;
   };
 
-  const listGroups = async () => {
+  const listGroupsWithDiagnostics = async () => {
     await fs.mkdir(taskDir, { recursive: true });
     const names = (await fs.readdir(taskDir)).filter(n => n.endsWith('.json'));
     const groups = [];
+    const diagnostics = [];
     for (const name of names) {
       try {
         groups.push(validateGroup(JSON.parse(await fs.readFile(path.join(taskDir, name), 'utf8'))));
-      } catch {
-        // 跳过损坏或不符合 schema 的文件，避免一个坏文件让整个列表不可用
+      } catch (error) {
+        diagnostics.push({
+          kind: 'corrupt-group',
+          file: path.join(taskDir, name),
+          message: error?.message || 'invalid JSON',
+        });
       }
     }
-    return groups.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    groups.sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+    return { groups, diagnostics };
+  };
+
+  const listGroups = async () => (await listGroupsWithDiagnostics()).groups;
+
+  const diagnostics = async () => {
+    const result = await listGroupsWithDiagnostics();
+    try {
+      const names = (await fs.readdir(archiveDir)).filter(n => n.endsWith('.json'));
+      for (const name of names) {
+        try {
+          validateGroup(JSON.parse(await fs.readFile(path.join(archiveDir, name), 'utf8')));
+        } catch (error) {
+          result.diagnostics.push({ kind: 'corrupt-archive', file: path.join(archiveDir, name), message: error?.message || 'invalid JSON' });
+        }
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') result.diagnostics.push({ kind: 'archive-read-error', file: archiveDir, message: error.message });
+    }
+    try {
+      JSON.parse(await fs.readFile(executionFile, 'utf8'));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') result.diagnostics.push({ kind: 'corrupt-execution', file: executionFile, message: error?.message || 'invalid JSON' });
+    }
+    return result.diagnostics;
   };
 
   const archiveFileFor = id => path.join(archiveDir, `${safeId(id)}.json`);
+
+  /* ---------------- 执行模式（execution.json） ---------------- */
+
+  const normalizeExecution = raw => {
+    const execution = {
+      version: '1.0',
+      // 非法值一律回落 round 而不是报错：模式文件损坏不应让任务系统瘫痪
+      mode: EXECUTION_MODE_SET.has(raw?.mode) ? raw.mode : 'round',
+      activeRound: Number.isInteger(raw?.activeRound) && raw.activeRound > 0 ? raw.activeRound : null,
+      runner: raw?.runner && typeof raw.runner === 'object' ? { ...raw.runner } : { status: 'idle' },
+      totals: raw?.totals && typeof raw.totals === 'object' ? { ...raw.totals } : { queued: 0, completed: 0 },
+      updatedAt: raw?.updatedAt || null,
+      rounds: Array.isArray(raw?.rounds)
+        ? raw.rounds.filter(r => r && Number.isFinite(r.round))
+        : [],
+    };
+    // 非枚举元数据用于区分旧 execution 文件（没有 activeRound）与明确写入的
+    // activeRound:null。否则 completeRound 后重新从旧任务 round 推导，会让已交付轮次
+    // 重新出现在当前进度里。
+    Object.defineProperty(execution, '_activeRoundExplicit', {
+      value: !!raw && Object.prototype.hasOwnProperty.call(raw, 'activeRound'),
+      enumerable: false,
+    });
+    return execution;
+  };
+
+  const readExecution = async () => {
+    try {
+      return normalizeExecution(JSON.parse(await fs.readFile(executionFile, 'utf8')));
+    } catch (error) {
+      if (error?.code === 'ENOENT') return normalizeExecution(null);
+      throw new Error('corrupt execution state');
+    }
+  };
+
+  const refreshExecutionTotals = async execution => {
+    const groups = await listGroups();
+    const all = groups.flatMap(g => g.tasks || []);
+    const active = all.filter(t => t.status !== 'cancelled');
+    execution.totals = {
+      queued: all.filter(t => t.round == null && (t.status === 'todo' || t.status === 'doing')).length,
+      completed: all.filter(t => t.status === 'done').length,
+      total: active.length,
+    };
+    return execution;
+  };
+
+  const saveExecution = async execution => {
+    execution.updatedAt = nowIso();
+    await writeJsonAtomic(executionFile, JSON.stringify(execution, null, 2));
+    notifyChange();
+    return execution;
+  };
+
+  const completeRound = async round => {
+    const summary = await roundSummary();
+    if (!round || summary.activeRound !== round) throw new Error('active round mismatch');
+    if (!summary.complete) {
+      return { action: 'blocked', round, summary, obstacles: summary.obstacles };
+    }
+    const mode = (await readExecution()).mode;
+    // 交付前先应用暂存新要求（pendingInstruction）：带它的任务重开为无轮次
+    // todo（指令换成新值、清验收痕迹），不进入本轮归档，自然排队下一批——
+    // 「冻结集合在处理期间不可变，追加一律进下一批」由此严格成立。
+    // 必须在归档前做：重开成 todo 后任务不再是终态，不会被按轮归档误收。
+    const groups = await listGroups();
+    let appliedPendings = 0;
+    for (const group of groups) {
+      let changed = false;
+      for (const task of group.tasks) {
+        if (!task.pendingInstruction) continue;
+        task.instruction = task.pendingInstruction;
+        delete task.pendingInstruction;
+        task.status = 'todo';
+        task.result = null;
+        task.reviewAt = null;
+        task.completedAt = null;
+        task.round = null;
+        task.history.push({ at: nowIso(), event: 'pending_applied', detail: task.instruction, reason: 'applied at round delivery' });
+        changed = true;
+        appliedPendings++;
+      }
+      if (changed) await writeGroup(group);
+    }
+    const archived = [];
+    for (const group of groups) {
+      const hits = group.tasks.filter(t => t.round === round && TERMINAL_STATUS_SET.has(t.status));
+      if (!hits.length) continue;
+      const result = await archiveTasks(group.id, { statuses: [...TERMINAL_STATUSES], round });
+      archived.push({ groupId: group.id, archived: result.archived });
+    }
+    const after = await roundSummary();
+    const execution = await readExecution();
+    execution.activeRound = null;
+    execution.runner = { status: mode === 'queue' && after.queued ? 'ready' : 'idle', updatedAt: nowIso() };
+    await saveExecution(execution);
+    return { action: mode === 'queue' && after.queued ? 'continue' : 'stop', round, archived, appliedPendings, summary: after };
+  };
+  const setMode = async mode => {
+    if (!EXECUTION_MODE_SET.has(mode)) throw new Error(`invalid mode: ${mode}`);
+    const execution = await readExecution();
+    // 本轮在途期间模式锁定：模式决定「本轮怎么收尾」，处理开始后再切换会让
+    // 收尾预期漂移。面板按钮已禁用，这里是接口层兜底；交付（completeRound
+    // 置空 activeRound）后自动恢复可切换。
+    if (execution.activeRound != null) {
+      throw new Error(`round ${execution.activeRound} in progress; mode is locked until delivery`);
+    }
+    if (execution.mode !== mode) {
+      execution.mode = mode;
+      await saveExecution(execution);
+    }
+    return execution;
+  };
+
+  /**
+   * 轮次归档日志：把本次归档命中的轮次记录进 execution.json 的 rounds。
+   * 纯记录性质（供面板显示历史轮次），不影响任何决策——决策读取的是任务
+   * 文件里的实时状态。同一轮多次归档（跨页面组）按轮次幂等合并。
+   */
+  const recordArchivedRounds = async (execution, hits) => {
+    const byRoundTasks = new Map();
+    for (const task of hits) {
+      if (Number.isFinite(task.round)) {
+        const list = byRoundTasks.get(task.round) || [];
+        list.push(task);
+        byRoundTasks.set(task.round, list);
+      }
+    }
+    if (!byRoundTasks.size) return false;
+    const byRound = new Map(execution.rounds.map(r => [r.round, { ...r }]));
+    const at = nowIso();
+    for (const [round, tasks] of byRoundTasks) {
+      const entry = byRound.get(round) || { round, archived: 0, completed: 0 };
+      const known = new Set(entry.taskIds || []);
+      const newlyArchived = tasks.filter(task => !known.has(task.id));
+      entry.archived = (entry.archived || 0) + newlyArchived.length;
+      entry.completed = (entry.completed || 0) + newlyArchived.length;
+      entry.taskIds = [...new Set([...(entry.taskIds || []), ...tasks.map(task => task.id)])];
+      entry.archivedAt = at;
+      byRound.set(round, entry);
+    }
+    execution.rounds = [...byRound.values()].sort((a, b) => a.round - b.round);
+    execution.updatedAt = at;
+    await writeJsonAtomic(executionFile, JSON.stringify(execution, null, 2));
+    return true;
+  };
+
+  /**
+   * 当前轮次摘要——轮次边界决策（停/续）的数据来源。
+   *
+   * 当前轮 = 活动任务中最大的轮次号。已交付却未归档的旧轮次任务（round 更小）
+   * 不计入：它们不属于任何在途工作，混进分母会让进度倒退。
+   * complete = 当前轮全部任务 done/cancelled：按队列模式此时应归档并续轮；
+   * 只要还有 blocked/todo/doing/review，队列就不能越过它自动继续。
+   */
+  const roundSummary = async () => {
+    const groups = await listGroups();
+    const all = groups.flatMap(g => (Array.isArray(g.tasks) ? g.tasks : []));
+    const inferredRound = all.reduce((m, t) => Math.max(m, Number.isFinite(t.round) ? t.round : 0), 0) || null;
+    const execution = await readExecution();
+    let activeRound = execution._activeRoundExplicit ? execution.activeRound : (execution.activeRound || inferredRound);
+    let scoped = activeRound ? all.filter(t => t.round === activeRound) : [];
+    // 自愈：交付不只发生在 complete-round——任务也可能经直接归档（POST /archive）
+    // 或删除路径全部离开本轮。activeRound 残留而本轮已无任何活跃任务时，模式锁
+    // 会永不释放（实测第 8 轮直接归档后锁死），这里把「轮次已结束」写回 execution。
+    if (activeRound != null && scoped.length === 0) {
+      execution.activeRound = null;
+      execution.updatedAt = nowIso();
+      await saveExecution(execution);
+      activeRound = null;
+    }
+    const counts = {};
+    for (const t of scoped) counts[t.status] = (counts[t.status] || 0) + 1;
+    const outstanding = (counts.todo || 0) + (counts.doing || 0) + (counts.review || 0) + (counts.blocked || 0);
+    const obstacles = scoped
+      .filter(t => !TERMINAL_STATUS_SET.has(t.status))
+      .map(t => ({ id: t.id, status: t.status }));
+    await refreshExecutionTotals(execution);
+    return {
+      mode: execution.mode,
+      activeRound,
+      runner: execution.runner,
+      totals: execution.totals,
+      currentRound: activeRound,
+      total: scoped.length,
+      counts,
+      obstacles,
+      complete: activeRound != null && scoped.length > 0 && outstanding === 0,
+      queued: all.filter(t => t.round == null && (t.status === 'todo' || t.status === 'doing')).length,
+    };
+  };
+
+  /**
+   * 轮次交付释放：activeRound 冻结于首个 doing，但交付不只发生在
+   * complete-round——任务也可能经直接归档（POST /archive）或删除路径
+   * 全部离开本轮。本轮已无任何活跃任务时清掉 activeRound，否则面板的
+   * 模式锁会永久卡住（实测第 8 轮直接归档后锁死）。
+   */
+  const releaseRoundIfDelivered = async () => {
+    const execution = await readExecution();
+    if (execution.activeRound == null) return false;
+    const groups = await listGroups();
+    const inFlight = groups.some(g => (Array.isArray(g.tasks) ? g.tasks : []).some(t => t.round === execution.activeRound));
+    if (inFlight) return false;
+    execution.activeRound = null;
+    execution.updatedAt = nowIso();
+    await saveExecution(execution);
+    return true;
+  };
+
 
   /**
    * 历史最大轮次号：活动组 + 归档一起扫。
@@ -398,6 +811,10 @@ export function createStore(workspace, options = {}) {
     const max = await maxRoundEver();
     // 有在途任务：并入当前轮次（它正在被处理，进度应如实计入）
     if (inFlight) return { round: max, froze: false };
+    // 任一已定稿轮次仍 blocked 时，不能偷偷越过它开启新轮。
+    // 必须由用户/主线程显式取消、解决或延期后，才允许下一轮。
+    const blocked = groups.flatMap(g => g.tasks).find(t => t.status === 'blocked' && Number.isFinite(t.round));
+    if (blocked) throw new Error(`blocked task prevents next round: ${blocked.id}`);
     // 定稿：开启新一轮，把**其它组**里尚未分派的待处理任务一并纳入
     const round = max + 1;
     for (const g of groups) {
@@ -427,10 +844,98 @@ export function createStore(workspace, options = {}) {
       for (const t of Array.isArray(raw.tasks) ? raw.tasks : []) {
         if (t?.id) byId.set(t.id, t);
       }
-    } catch {
-      // 没有归档是常态，不能让归档索引反过来阻塞正常同步
+    } catch (error) {
+      if (error?.code === 'ENOENT') return byId;
+      // 归档损坏不能按「没有归档」处理：否则 append 会复活旧任务，
+      // archive 会覆盖历史，prune 还可能删除归档引用的附件。
+      throw new Error(`corrupt annotation archive: ${groupId}`);
     }
     return byId;
+  };
+
+  /**
+   * 看板用户偏好（主题等）：落在项目 .zwa/runtime/board-prefs.json，
+   * 跨浏览器/设备记忆——「用户改了要保存到项目里」。只接受白名单键，
+   * 单个未知字段不落盘；文件损坏按空偏好处理（下次保存即自愈）。
+   */
+  const BOARD_PREFS_FILE = path.join(root, '.zwa', 'runtime', 'board-prefs.json');
+  const BOARD_THEMES = ['dark', 'light'];
+
+  const readBoardPrefs = async () => {
+    try {
+      const raw = JSON.parse(await fs.readFile(BOARD_PREFS_FILE, 'utf8'));
+      return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        // 损坏的偏好文件不值得让看板挂掉：按空偏好处理，写入时覆盖修复
+      }
+      return {};
+    }
+  };
+
+  const writeBoardPrefs = async patch => {
+    const current = await readBoardPrefs();
+    const accepted = {};
+    if (patch && BOARD_THEMES.includes(patch.theme)) accepted.theme = patch.theme;
+    if (!Object.keys(accepted).length) throw new Error(`no valid preference keys (theme: ${BOARD_THEMES.join('|')})`);
+    const next = { ...current, ...accepted, updatedAt: nowIso() };
+    await writeJsonAtomic(BOARD_PREFS_FILE, JSON.stringify(next, null, 2));
+    return next;
+  };
+
+  /**
+   * 归档总览（只读）：读出 archive/ 下全部页面组的精简视图，供看板展示
+   * 历史归档任务。归档文件与任务组同 schema，但任务里带截图引用、历史
+   * 记录等看板用不到的大字段，这里只挑渲染需要的字段；单个损坏文件进
+   * diagnostics，不拖垮整个总览（与 listGroupsWithDiagnostics 同一策略）。
+   */
+  const listArchives = async () => {
+    const archives = [];
+    const diagnostics = [];
+    let names = [];
+    try {
+      names = (await fs.readdir(archiveDir)).filter(n => n.endsWith('.json'));
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        diagnostics.push({ kind: 'archive-read-error', file: archiveDir, message: error.message });
+      }
+      return { archives, diagnostics };
+    }
+    for (const name of names) {
+      const file = path.join(archiveDir, name);
+      try {
+        const raw = JSON.parse(await fs.readFile(file, 'utf8'));
+        const tasks = (Array.isArray(raw.tasks) ? raw.tasks : []).map(t => ({
+          id: t.id,
+          seq: t.seq,
+          status: t.status,
+          round: t.round == null ? null : t.round,
+          instruction: t.instruction || '',
+          completedAt: t.completedAt || null,
+          updatedAt: t.updatedAt || null,
+          element: t.element ? {
+            selector: t.element.selector || '',
+            tagName: t.element.tagName || '',
+            accessibleName: t.element.accessibleName || '',
+            text: typeof t.element.text === 'string' ? t.element.text.slice(0, 300) : '',
+          } : null,
+        }));
+        archives.push({
+          id: raw.id || name.replace(/\.json$/, ''),
+          file,
+          page: raw.page ? { url: raw.page.url || '', title: raw.page.title || '' } : null,
+          updatedAt: raw.updatedAt || null,
+          taskCount: tasks.length,
+          counts: tasks.reduce((m, t) => { m[t.status] = (m[t.status] || 0) + 1; return m; }, {}),
+          tasks,
+        });
+      } catch (error) {
+        diagnostics.push({ kind: 'corrupt-archive', file, message: error?.message || 'invalid JSON' });
+      }
+    }
+    // 最近有归档动作的页面组排前面，稳定的次序键兜底
+    archives.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '') || a.id.localeCompare(b.id));
+    return { archives, diagnostics };
   };
 
   /**
@@ -442,12 +947,22 @@ export function createStore(workspace, options = {}) {
     if (!url) throw new Error('page.url is required');
     const incomingTasks = Array.isArray(input.tasks) ? input.tasks.filter(t => t?.id) : [];
     if (!incomingTasks.length) throw new Error('no tasks to append');
+    for (const incoming of incomingTasks) {
+      validateTaskId(incoming.id);
+      if (typeof incoming.instruction === 'string' && incoming.instruction.length > MAX_INSTRUCTION_LENGTH) {
+        throw new Error(`instruction too long: ${incoming.id}`);
+      }
+      if (Array.isArray(incoming.images) && incoming.images.length > MAX_IMAGES_PER_TASK) {
+        throw new Error(`too many images: ${incoming.id}`);
+      }
+    }
 
     const id = pageKey(url);
     let group;
     try {
       group = await readGroup(id);
-    } catch {
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw new Error(`corrupt annotation group: ${id}`);
       const at = nowIso();
       group = {
         version: '1.0',
@@ -502,24 +1017,26 @@ export function createStore(workspace, options = {}) {
       const existing = byId.get(incoming.id) || (incoming.element?.selector ? bySelector.get(incoming.element.selector) : null);
       if (existing) {
         if (incoming.element) existing.element = incoming.element;
-        // doing 任务的指令不接受覆盖：处理者正按当前指令改代码，中途换掉指令会让
-        // 它回写的 done 与结果描述的是另一件事，用户看到的记录也会前后矛盾。
-        // 要改需先由处理者回写状态（done/blocked/cancelled），再重新编辑。
-        const locked = existing.status === 'doing';
-        if (!locked && typeof incoming.instruction === 'string' && incoming.instruction.trim()) {
-          if (incoming.instruction !== existing.instruction) {
-            existing.history.push({ at, event: 'instruction_updated', detail: incoming.instruction });
-            existing.instruction = incoming.instruction;
-            // 待验收的任务被改了要求：已改的代码是按旧要求做的，不再作数。
-            // 必须退回 todo 重新走一遍，否则进度条会把这份「开发完成」
-            // 一直算作已完成，而实际上它对应的需求已经变了。
-            // 注意 review 不像 doing 那样锁指令——锁住会让用户新写的要求
-            // 静默失效（元素上还挂着图钉，人却看不到改动），那是更糟的失败。
-            if (existing.status === 'review') {
-              existing.status = 'todo';
-              existing.reviewAt = null;
-              existing.history.push({ at, event: 'status_changed', detail: 'todo', reason: 'instruction changed' });
-            }
+        // 指令变更的两条路径：
+        // - todo（含未领取的本批任务）：处理者还没开始，原位更新、留在本批；
+        // - 非 todo（doing/review/done/blocked）：批次已冻结、当前指令对应着
+        //   在途工作或已验收的结论，直接改会作废它（doing）或把任务拉回
+        //   当前批（review/done）——都违背「冻结集合在处理期间不可变」。
+        //   新指令存为 pendingInstruction 暂存：当前状态/结果/分母一律不动，
+        //   批次交付（completeRound）时统一重开为无轮次 todo，被下一批纳入。
+        //   重复追加取最新值；客户端全量同步经 incoming.pendingInstruction
+        //   或变化后的 instruction 都能触达同一条暂存路径。
+        const incomingText = (typeof incoming.pendingInstruction === 'string' && incoming.pendingInstruction.trim())
+          ? incoming.pendingInstruction
+          : (typeof incoming.instruction === 'string' ? incoming.instruction : '');
+        if (incomingText.trim() && incomingText !== existing.instruction && incomingText !== existing.pendingInstruction) {
+          if (existing.status === 'todo') {
+            existing.history.push({ at, event: 'instruction_updated', detail: incomingText });
+            existing.instruction = incomingText;
+            if (existing.pendingInstruction) delete existing.pendingInstruction;
+          } else {
+            existing.pendingInstruction = incomingText;
+            existing.history.push({ at, event: 'pending_instruction_updated', detail: incomingText });
           }
         }
         // 职责划分：任务「内容」（element/instruction）由浏览器拥有，
@@ -537,7 +1054,9 @@ export function createStore(workspace, options = {}) {
           result: null,
           ...incoming,
           instruction: typeof incoming.instruction === 'string' ? incoming.instruction : '',
-          status: STATUS_SET.has(incoming.status) ? incoming.status : 'todo',
+          // 新任务只能从 todo 进入状态机；浏览器旧缓存或伪造请求携带的
+          // doing/done/cancelled 都不能跳过领取、待验收和验收阶段。
+          status: 'todo',
           createdAt: incoming.createdAt || at,
           updatedAt: at,
           startedAt: incoming.startedAt || null,
@@ -580,10 +1099,25 @@ export function createStore(workspace, options = {}) {
     const task = group.tasks.find(t => t.id === patch.taskId);
     if (!task) throw new Error('task not found');
     if (patch.status && !STATUS_SET.has(patch.status)) throw new Error('invalid status');
+    // task-agent 只能把源码处理结果交给主线程验收。这个 actor 由适配器
+    // 从 x-zwa-client header 注入；不对没有显式声明的兼容调用收紧权限。
+    if (patch.actor === 'task-agent' && patch.status === 'done' && task.status !== 'done') {
+      throw new Error('task-agent cannot mark done; main thread review is required');
+    }
     const at = nowIso();
     if (patch.status && patch.status !== task.status) {
+      const allowed = STATUS_TRANSITIONS[task.status] || new Set();
+      if (!allowed.has(patch.status) && !(patch.reopen === true && patch.status === 'todo' && ['done', 'blocked', 'cancelled'].includes(task.status))) {
+        throw new Error(`invalid status transition: ${task.status} -> ${patch.status}`);
+      }
       task.status = patch.status;
       task.history.push({ at, event: 'status_changed', detail: patch.status });
+      if (patch.status === 'todo' && patch.reopen === true) {
+        task.result = null;
+        task.reviewAt = null;
+        task.completedAt = null;
+        task.history.push({ at, event: 'reopened', detail: 'explicit reopen' });
+      }
       if (patch.status === 'doing') task.startedAt = task.startedAt || at;
       // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
       if (patch.status === 'review') task.reviewAt = at;
@@ -611,11 +1145,19 @@ export function createStore(workspace, options = {}) {
     }
     if (typeof patch.result === 'string' && patch.result !== task.result) {
       task.result = patch.result;
-      task.history.push({ at, event: 'result_updated', detail: patch.result });
+      task.history.push({ at, event: 'result_updated', detail: task.result });
     }
     task.updatedAt = at;
     group.updatedAt = at;
     await writeGroup(group);
+    // 声明 activeRound 必须在任务落盘之后：先声明后写盘的窗口里，并发
+    // roundSummary 会看到「activeRound 有值但本轮无活跃任务」而误自愈清空。
+    const execution = await readExecution();
+    if (execution.activeRound !== task.round && task.round != null) {
+      execution.activeRound = task.round;
+      execution.runner = { status: 'running', updatedAt: at };
+      await saveExecution(execution);
+    }
     notifyChange();
     return { group, task };
   };
@@ -629,6 +1171,7 @@ export function createStore(workspace, options = {}) {
    */
   const pruneAttachments = async () => {
     const keep = new Set();
+    let readable = true;
     const collect = group => {
       for (const task of group.tasks || []) {
         for (const image of task.images || []) {
@@ -636,20 +1179,33 @@ export function createStore(workspace, options = {}) {
         }
       }
     };
-    for (const group of await listGroups()) collect(group);
-    // 归档任务仍保留图片引用，归档文件必须与活动组一起参与保活
+    try {
+      const names = (await fs.readdir(taskDir)).filter(n => n.endsWith('.json'));
+      for (const name of names) {
+        try {
+          collect(validateGroup(JSON.parse(await fs.readFile(path.join(taskDir, name), 'utf8'))));
+        } catch {
+          readable = false;
+        }
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') readable = false;
+    }
+    // 归档任务仍保留图片引用；任何活动组或归档组读不全时都不能根据
+    // 不完整 keep 集合删除附件，宁可暂时留下孤儿文件也不能删用户图片。
     try {
       const names = (await fs.readdir(archiveDir)).filter(n => n.endsWith('.json'));
       for (const name of names) {
         try {
-          collect(JSON.parse(await fs.readFile(path.join(archiveDir, name), 'utf8')));
+          collect(validateGroup(JSON.parse(await fs.readFile(path.join(archiveDir, name), 'utf8'))));
         } catch {
-          // 单个损坏的归档文件不参与保活，但不能中断整体清理
+          readable = false;
         }
       }
-    } catch {
-      // 归档目录不存在时没有可扫描的归档
+    } catch (error) {
+      if (error?.code !== 'ENOENT') readable = false;
     }
+    if (!readable) return 0;
     let removed = 0;
     try {
       const names = await fs.readdir(attachmentsDir);
@@ -686,9 +1242,11 @@ export function createStore(workspace, options = {}) {
     let group;
     try {
       group = await readGroup(groupId);
-    } catch {
-      // 文件已不存在：视为已删除，保持幂等
-      return { groupId, removed: 0, remaining: 0, fileRemoved: false, attachmentsRemoved: 0, skipped: [] };
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return { groupId, removed: 0, remaining: 0, fileRemoved: false, attachmentsRemoved: 0, skipped: [] };
+      }
+      throw new Error(`corrupt annotation group: ${groupId}`);
     }
 
     const before = group.tasks.length;
@@ -717,14 +1275,16 @@ export function createStore(workspace, options = {}) {
       await fs.rm(fileFor(groupId), { force: true });
       const attachmentsRemoved = await pruneAttachments();
       notifyChange();
-      return { groupId, removed, remaining: 0, fileRemoved: true, attachmentsRemoved, skipped };
+      const roundReleased = removed > 0 ? await releaseRoundIfDelivered() : false;
+      return { groupId, removed, remaining: 0, fileRemoved: true, attachmentsRemoved, skipped, roundReleased };
     }
 
     group.updatedAt = nowIso();
     await writeGroup(group);
     const attachmentsRemoved = await pruneAttachments();
     notifyChange();
-    return { groupId, removed, remaining: group.tasks.length, fileRemoved: false, attachmentsRemoved, skipped };
+    const roundReleased = removed > 0 ? await releaseRoundIfDelivered() : false;
+    return { groupId, removed, remaining: group.tasks.length, fileRemoved: false, attachmentsRemoved, skipped, roundReleased };
   };
 
   /**
@@ -736,31 +1296,36 @@ export function createStore(workspace, options = {}) {
   const archiveTasks = async (groupIdOrUrl, options = {}) => {
     const groupId = options.byPageUrl ? groupIdForPage(groupIdOrUrl) : groupIdOrUrl;
     if (!groupId) throw new Error('groupId is required');
-    const statuses = new Set(options.statuses || ['done', 'cancelled']);
+    const statuses = new Set(options.statuses || TERMINAL_STATUSES);
+    for (const status of statuses) {
+      if (!TERMINAL_STATUS_SET.has(status)) throw new Error(`invalid archive status: ${status}`);
+    }
+    const targetRound = options.round == null ? null : Number(options.round);
 
     let group;
     try {
       group = await readGroup(groupId);
-    } catch {
-      // 组不存在：无可归档，与 removeTasks 一致保持幂等
-      return { groupId, archived: 0, remaining: 0, fileRemoved: false, archiveFile: null };
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        return { groupId, archived: 0, remaining: 0, fileRemoved: false, archiveFile: null };
+      }
+      throw new Error(`corrupt annotation group: ${groupId}`);
     }
 
-    const hits = group.tasks.filter(t => statuses.has(t.status));
+    const hits = group.tasks.filter(t => statuses.has(t.status) && (targetRound == null || t.round === targetRound));
     if (!hits.length) {
       // 没有命中就不改写任何文件，避免无意义的 updatedAt 翻动
       return { groupId, archived: 0, remaining: group.tasks.length, fileRemoved: false, archiveFile: null };
     }
 
-    const rest = group.tasks.filter(t => !statuses.has(t.status));
+    const rest = group.tasks.filter(t => !hits.includes(t));
     const file = archiveFileFor(groupId);
     let archiveGroup;
     try {
       archiveGroup = JSON.parse(await fs.readFile(file, 'utf8'));
-    } catch {
-      // 归档文件不存在时新建。无法解析的旧文件在这里重建是安全的：
-      // 内容本已读不回来；能解析但过不了校验的文件走下面的 validateGroup 抛错，
-      // 宁可拒绝归档也不静默覆盖一份看起来是有意编辑过的归档。
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw new Error(`corrupt annotation archive: ${groupId}`);
+      // 归档文件不存在时新建。解析失败绝不能静默重建并覆盖历史。
       archiveGroup = null;
     }
     const at = nowIso();
@@ -790,14 +1355,25 @@ export function createStore(workspace, options = {}) {
       await writeGroup(group);
     }
     await pruneAttachments();
+    // 轮次归档日志在移动完成之后记录：失败不能回滚归档本身，
+    // 因此单独 try——日志缺失只影响历史展示，不影响数据。
+    try {
+      await recordArchivedRounds(await readExecution(), hits);
+    } catch {
+      /* 日志写失败不阻塞归档 */
+    }
     notifyChange();
-    return { groupId, archived: hits.length, remaining: rest.length, fileRemoved, archiveFile: file };
+    // 直接归档路径交付轮次：本轮任务全部离开活动组时释放 activeRound（模式锁）
+    const roundReleased = await releaseRoundIfDelivered();
+    return { groupId, archived: hits.length, remaining: rest.length, fileRemoved, archiveFile: file, roundReleased };
   };
 
   /**
-   * 清空归档。指定 groupId（或页面 URL）时只删该组的归档文件；省略参数
-   * 或 options.all 为 true 时清空整个归档目录。purged 是被清除的归档任务
-   * 数，filesRemoved 是被删除的归档文件数；删完后清理失去引用的附件。
+   * 清理归档。指定 groupId（或页面 URL）时默认删该组的整个归档文件；
+   * 带 options.ids / options.statuses 时按任务粒度删除（保留其余归档）；
+   * 省略参数或 options.all 为 true 时清空整个归档目录。purged/removed 是
+   * 被清除的归档任务数，filesRemoved 是被删除的归档文件数，remaining 是
+   * 粒度删除后该组剩余的归档任务数；删完清理失去引用的附件。
    */
   const purgeArchive = async (groupIdOrUrl, options = {}) => {
     let purged = 0;
@@ -827,19 +1403,55 @@ export function createStore(workspace, options = {}) {
     const groupId = options.byPageUrl ? groupIdForPage(groupIdOrUrl) : groupIdOrUrl;
     if (!groupId) throw new Error('groupId is required');
     const file = archiveFileFor(groupId);
-    let exists = true;
+    // 任务粒度：ids 按任务 id 精确删，statuses 按终态批量删（如只清 cancelled）
+    const ids = Array.isArray(options.ids) ? options.ids.map(String) : null;
+    const statuses = Array.isArray(options.statuses) ? options.statuses.filter(s => STATUS_SET.has(s)) : null;
+    const granular = !!(ids?.length || statuses?.length);
+
+    let raw = null;
+    let missing = false;
+    let corrupt = false;
     try {
-      purged = countTasks(JSON.parse(await fs.readFile(file, 'utf8')));
+      raw = JSON.parse(await fs.readFile(file, 'utf8'));
     } catch (error) {
-      if (error?.code === 'ENOENT') exists = false;
-      // 其余情况（损坏 JSON）同样删掉，只是任务数统计不到
+      if (error?.code === 'ENOENT') missing = true;
+      else corrupt = true;
     }
-    if (exists) {
-      await fs.rm(file, { force: true });
-      filesRemoved = 1;
+    const tasks = Array.isArray(raw?.tasks) ? raw.tasks : [];
+
+    if (granular) {
+      // 粒度删除必须建立在可解析的归档上：损坏文件不能当「空」静默处理
+      if (corrupt) throw new Error(`corrupt annotation archive: ${groupId}`);
+      if (missing) {
+        return { groupId, purged: 0, removed: 0, remaining: 0, fileRemoved: false, filesRemoved: 0, attachmentsRemoved: 0 };
+      }
+      const keep = tasks.filter(t => !(ids?.includes(String(t.id)) || (statuses && statuses.includes(t.status))));
+      const removed = tasks.length - keep.length;
+      if (!removed) {
+        return { groupId, purged: 0, removed: 0, remaining: tasks.length, fileRemoved: false, filesRemoved: 0, attachmentsRemoved: 0 };
+      }
+      let fileRemoved = false;
+      if (keep.length) {
+        raw.tasks = keep;
+        raw.updatedAt = nowIso();
+        await writeJsonAtomic(file, JSON.stringify(raw, null, 2));
+      } else {
+        await fs.rm(file, { force: true });
+        fileRemoved = true;
+      }
+      const attachmentsRemoved = await pruneAttachments();
+      return { groupId, purged: removed, removed, remaining: keep.length, fileRemoved, filesRemoved: fileRemoved ? 1 : 0, attachmentsRemoved };
     }
+
+    if (missing) {
+      const attachmentsRemoved = await pruneAttachments();
+      return { groupId, purged: 0, removed: 0, remaining: 0, fileRemoved: false, filesRemoved: 0, attachmentsRemoved };
+    }
+    // 整文件删除：损坏的归档也一并清掉，只是统计不到其中的任务数
+    const purgedCount = corrupt ? 0 : tasks.length;
+    await fs.rm(file, { force: true });
     const attachmentsRemoved = await pruneAttachments();
-    return { purged, filesRemoved, attachmentsRemoved };
+    return { groupId, purged: purgedCount, removed: purgedCount, remaining: 0, fileRemoved: true, filesRemoved: 1, attachmentsRemoved };
   };
 
   // 写操作在**对外边界**统一排队，内部实现之间仍直连（见上方 queueWrite 注释）。
@@ -850,18 +1462,25 @@ export function createStore(workspace, options = {}) {
     taskDir,
     attachmentsDir,
     archiveDir,
+    executionFile,
     fileFor,
     readGroup,
-    writeGroup: group => queueWrite(() => writeGroup(group)),
     listGroups,
+    listGroupsWithDiagnostics,
+    listArchives,
+    diagnostics,
     appendTasks: input => queueWrite(() => appendTasks(input)),
     updateTask: (groupId, patch) => queueWrite(() => updateTask(groupId, patch)),
     removeTasks: (groupIdOrUrl, options) => queueWrite(() => removeTasks(groupIdOrUrl, options)),
     archiveTasks: (groupIdOrUrl, options) => queueWrite(() => archiveTasks(groupIdOrUrl, options)),
+    completeRound: round => queueWrite(() => completeRound(round)),
     purgeArchive: (groupIdOrUrl, options) => queueWrite(() => purgeArchive(groupIdOrUrl, options)),
+    readExecution,
+    readBoardPrefs,
+    writeBoardPrefs: patch => queueWrite(() => writeBoardPrefs(patch)),
+    setMode: mode => queueWrite(() => setMode(mode)),
+    roundSummary,
     groupIdForPage,
-    pruneAttachments,
-    persistAttachments,
     buildSendPayload,
   };
 }

@@ -79,7 +79,7 @@ test('install initializes workspace, metadata and gitignore', async () => {
   assert.equal(meta.framework, 'vue');
   assert.equal(meta.frameworkMajor, 3);
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
-  assert.match(ignore, /\.zwa\/tasks\//);
+  assert.match(ignore, /\.zwa\//);
 });
 
 test('githubignore is appended without clobbering existing content', async () => {
@@ -91,7 +91,7 @@ test('githubignore is appended without clobbering existing content', async () =>
   const ignore = await fs.readFile(path.join(dir, '.gitignore'), 'utf8');
   assert.match(ignore, /node_modules/);
   assert.match(ignore, /dist/);
-  assert.match(ignore, /\.zwa\/tasks\//);
+  assert.match(ignore, /\.zwa\//);
 });
 
 test('declared tasks dir matches where the runtime actually writes', async () => {
@@ -326,4 +326,16 @@ test('detectProject recognizes an already patched config', async () => {
   const detected = await detectProject(dir);
   assert.equal(detected.patched, true);
   assert.equal(detected.installed, true);
+});
+
+test('install accepts a Vite TypeScript config with real type syntax', async () => {
+  const dir = await tempProject({
+    'package.json': VITE_PKG,
+    'vite.config.ts': "import { defineConfig, type UserConfig } from 'vite';\nconst cfg = { plugins: [] } satisfies UserConfig;\nexport default defineConfig(cfg);\n",
+  });
+  const result = await installProject(dir);
+  assert.equal(result.integration.action, 'patched');
+  const content = await fs.readFile(path.join(dir, 'vite.config.ts'), 'utf8');
+  assert.match(content, /zwAnnotations/);
+  assert.match(content, /satisfies UserConfig/);
 });

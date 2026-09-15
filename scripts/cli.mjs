@@ -70,6 +70,12 @@ async function runDoctor(root) {
     detail: `${info.runtimeFiles.length}/${RUNTIME_FILES.length} 个运行时文件`,
   });
 
+  checks.push({
+    name: 'runtime-integrity',
+    ok: info.runtimeIntegrity?.matches === true,
+    detail: info.runtimeIntegrity?.matches ? '运行时文件内容与技能一致' : '运行时文件内容缺失或已被修改，需兼容升级',
+  });
+
   const tasksDir = path.join(root, TASKS_DIR);
   const tasksExists = await fs.access(tasksDir).then(() => true).catch(() => false);
   checks.push({ name: 'tasks-dir', ok: tasksExists, detail: path.relative(root, tasksDir) });
@@ -127,6 +133,7 @@ async function main() {
     framework: args.framework,
     force: !!args.force,
     allowNonFrontend: !!args['allow-non-frontend'],
+    runtimeSource: args['runtime-source'] || undefined,
   };
 
   try {

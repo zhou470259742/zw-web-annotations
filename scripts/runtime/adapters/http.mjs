@@ -17,10 +17,23 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { watchTaskDir, createTaskChangeHub, createStore, MAX_BODY_BYTES, buildSendPayload, RUNTIME_VERSION } from '../core/store.mjs';
+import { watchTaskDir, createTaskChangeHub, createStore, ensureEndpointManifest, normalizeEndpointPath, MAX_BODY_BYTES, RUNTIME_VERSION, validateHttpRequest } from '../core/store.mjs';
+import { renderBoardHtml } from '../board.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
+// 执行要求文件与适配器同在 runtime/ 根下（与 Vite 插件的解析方式一致），
+// 缺失时 /tasks 返回 null，客户端按 fail-closed 拒绝复制提示词。
+const PROTOCOL_FILE = path.resolve(here, '..', 'execution-protocol.md');
+
+async function protocolPathOrNull() {
+  try {
+    await fs.access(PROTOCOL_FILE);
+    return PROTOCOL_FILE;
+  } catch {
+    return null;
+  }
+}
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -40,15 +53,21 @@ function sendJs(res, source) {
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = '';
+    const chunks = [];
+    let bytes = 0;
     req.on('data', chunk => {
-      data += chunk;
-      if (data.length > MAX_BODY_BYTES) {
-        reject(new Error('request body too large'));
-        req.destroy();
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytes += buffer.length;
+      if (bytes > MAX_BODY_BYTES) {
+        const error = new Error('request body too large');
+        error.statusCode = 413;
+        reject(error);
+        req.resume();
+        return;
       }
+      chunks.push(buffer);
     });
-    req.on('end', () => resolve(data));
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
 }
@@ -58,9 +77,10 @@ function readBody(req) {
  * 只处理 /__zw-web-annotations 前缀，其他请求交给 next()。
  */
 export function createAnnotationsMiddleware(options = {}) {
+  const route = normalizeEndpointPath(options.route || '/__zw-web-annotations');
   const config = {
-    route: options.route || '/__zw-web-annotations',
-    clientPath: options.clientPath || '/__zw-web-annotations/client.js',
+    route,
+    clientPath: options.clientPath || `${route}/client.js`,
     workspace: options.workspace || process.cwd(),
     dir: options.dir,
     collapsed: options.collapsed !== false,
@@ -108,6 +128,14 @@ export function createAnnotationsMiddleware(options = {}) {
       return sendJs(res, await clientSource());
     }
 
+    // 只读看板：所有页面的任务按状态分列，页面自行拉取 ./tasks 并经 SSE 实时刷新
+    if (pathname === `${config.route}/board` && req.method === 'GET') {
+      res.statusCode = 200;
+      res.setHeader('content-type', 'text/html; charset=utf-8');
+      res.setHeader('cache-control', 'no-cache');
+      return res.end(renderBoardHtml({ version: RUNTIME_VERSION }));
+    }
+
     // 标注接口之外的请求交给下游，但顺手把脚本注入它返回的 HTML，
     // 否则没有任何东西会去挂载标注 UI。
     if (!pathname.startsWith(config.route)) {
@@ -130,15 +158,58 @@ export function createAnnotationsMiddleware(options = {}) {
     }
     ensureWatcher();
     try {
+      validateHttpRequest(req, { mutating: req.method !== 'GET' });
       if (req.method === 'GET' && (route === '/' || route === '/health')) {
-        return sendJson(res, 200, { ok: true, version: RUNTIME_VERSION, workspace: store.workspace, taskDir: store.taskDir, clientPath: config.clientPath, eventClients: hub.clientCount });
+        const endpointManifestPath = await ensureEndpointManifest(store.workspace, config.route);
+        return sendJson(res, 200, {
+          ok: true,
+          version: RUNTIME_VERSION,
+          workspace: store.workspace,
+          taskDir: store.taskDir,
+          endpoint: config.route,
+          endpointManifestPath,
+          clientPath: config.clientPath,
+          eventClients: hub.clientCount,
+          diagnostics: await store.diagnostics(),
+        });
       }
       if (req.method === 'GET' && route === '/tasks') {
         const groups = await store.listGroups();
-        // absolutePath 供客户端分组列表与复制提示词使用（与 Vite 插件保持一致）
+        const endpointManifestPath = await ensureEndpointManifest(store.workspace, config.route);
+        // absolutePath 供客户端分组列表与复制提示词使用（与 Vite 插件保持一致）；
+        // round 是服务端权威轮次摘要，客户端据此定分母，不再自行推断当前轮。
         return sendJson(res, 200, {
           groups: groups.map(group => ({ ...group, absolutePath: store.fileFor(group.id) })),
+          diagnostics: await store.diagnostics(),
+          execution: await store.readExecution(),
+          round: await store.roundSummary(),
+          executionPath: store.executionFile,
+          endpoint: config.route,
+          endpointManifestPath,
+          tasksPath: store.taskDir,
+          protocolPath: await protocolPathOrNull(),
         });
+      }
+      // 执行模式：读取带轮次摘要，写入即切换并广播（与 Vite 插件保持一致）
+      if (req.method === 'GET' && route === '/execution') {
+        return sendJson(res, 200, {
+          ok: true,
+          execution: await store.readExecution(),
+          executionPath: store.executionFile,
+          round: await store.roundSummary(),
+        });
+      }
+      if (req.method === 'POST' && route === '/execution') {
+        const raw = await readBody(req);
+        const execution = await store.setMode((raw ? JSON.parse(raw) : {}).mode);
+        // 带回落盘后的权威摘要，客户端回执不必再自行推断当前轮
+        return sendJson(res, 200, { ok: true, execution, round: await store.roundSummary() });
+      }
+      if (req.method === 'POST' && route === '/complete-round') {
+        const raw = await readBody(req);
+        const payload = raw ? JSON.parse(raw) : {};
+        const result = await store.completeRound(Number(payload.round));
+        return sendJson(res, 200, { ok: true, ...result });
       }
       if (req.method === 'POST' && route === '/append') {
         const raw = await readBody(req);
@@ -162,11 +233,7 @@ export function createAnnotationsMiddleware(options = {}) {
         });
       }
       if (req.method === 'GET' && route === '/send-payload') {
-        const groups = await store.listGroups();
-        const groupId = query.get('groupId');
-        const group = groupId ? groups.find(g => g.id === groupId) : groups[0];
-        if (!group) return sendJson(res, 404, { error: 'group not found' });
-        return sendJson(res, 200, { groupId: group.id, payload: buildSendPayload(group) });
+        return sendJson(res, 410, { error: 'send-payload is retired', tasksPath: store.taskDir, protocolPath: await protocolPathOrNull() });
       }
       // 删除任务：按页面 URL 解析任务组，删除后同步清理 JSON 与无主附件
       if (req.method === 'POST' && route === '/delete') {
@@ -191,6 +258,22 @@ export function createAnnotationsMiddleware(options = {}) {
             });
         return sendJson(res, 200, { ok: true, ...result });
       }
+      // 看板用户偏好（主题等）：保存在项目 .zwa/runtime/board-prefs.json，跨浏览器记忆
+      if (req.method === 'GET' && route === '/board-prefs') {
+        return sendJson(res, 200, { ok: true, prefs: await store.readBoardPrefs() });
+      }
+      if (req.method === 'POST' && route === '/board-prefs') {
+        const raw = await readBody(req);
+        const prefs = await store.writeBoardPrefs(raw ? JSON.parse(raw) : {});
+        return sendJson(res, 200, { ok: true, prefs });
+      }
+
+      // 归档总览（只读）：看板用它展示历史归档任务，与下面的 POST /archive（归档动作）对称
+      if (req.method === 'GET' && route === '/archive') {
+        const { archives, diagnostics } = await store.listArchives();
+        return sendJson(res, 200, { ok: true, archives, diagnostics, archiveDir: store.archiveDir });
+      }
+
       // 归档：把已完成/已取消的任务移入 archive/，与 Vite 插件保持同一能力
       if (req.method === 'POST' && route === '/archive') {
         const raw = await readBody(req);
@@ -198,11 +281,12 @@ export function createAnnotationsMiddleware(options = {}) {
         const pageUrl = payload.pageUrl || (payload.page && payload.page.url);
         if (!pageUrl && !payload.groupId) return sendJson(res, 400, { error: 'pageUrl is required' });
         const result = pageUrl
-          ? await store.archiveTasks(pageUrl, { statuses: payload.statuses, byPageUrl: true })
-          : await store.archiveTasks(payload.groupId, { statuses: payload.statuses });
+          ? await store.archiveTasks(pageUrl, { statuses: payload.statuses, round: payload.round, byPageUrl: true })
+          : await store.archiveTasks(payload.groupId, { statuses: payload.statuses, round: payload.round });
         return sendJson(res, 200, { ok: true, ...result });
       }
-      // 清理归档：不传目标且 all=true 时清空整个归档目录
+      // 清理归档：不传目标且 all=true 时清空整个归档目录；
+      // 带 ids/statuses 时按任务粒度删除该组归档（看板「删除」按钮走这里）
       if (req.method === 'POST' && route === '/purge-archive') {
         const raw = await readBody(req);
         const payload = raw ? JSON.parse(raw) : {};
@@ -211,22 +295,27 @@ export function createAnnotationsMiddleware(options = {}) {
           return sendJson(res, 400, { error: 'pageUrl or all is required' });
         }
         const result = pageUrl
-          ? await store.purgeArchive(pageUrl, { byPageUrl: true })
-          : await store.purgeArchive(payload.groupId, { all: !!payload.all });
+          ? await store.purgeArchive(pageUrl, { byPageUrl: true, ids: payload.ids, statuses: payload.statuses })
+          : await store.purgeArchive(payload.groupId, { all: !!payload.all, ids: payload.ids, statuses: payload.statuses });
         return sendJson(res, 200, { ok: true, ...result });
       }
       const taskMatch = route.match(/^\/([^/]+)\/tasks\/([^/]+)$/);
       if (taskMatch && (req.method === 'PATCH' || req.method === 'POST')) {
         const raw = await readBody(req);
+        const parsedPatch = raw ? JSON.parse(raw) : {};
+        const { actor: _ignoredActor, ...patch } = parsedPatch;
+        const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
         const result = await store.updateTask(decodeURIComponent(taskMatch[1]), {
-          ...(raw ? JSON.parse(raw) : {}),
+          ...patch,
+          // 身份只认请求头，不信任请求体里自报的 actor。
+          ...(actor ? { actor } : {}),
           taskId: decodeURIComponent(taskMatch[2]),
         });
         return sendJson(res, 200, { ok: true, group: result.group, task: result.task });
       }
       return sendJson(res, 404, { error: 'not found', route });
     } catch (error) {
-      return sendJson(res, 400, { error: error.message });
+      return sendJson(res, error.statusCode || 400, { error: error.message });
     }
   };
 }
