@@ -6,7 +6,7 @@
  */
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { stableTaskId, canonicalPageUrl, shouldBlockPageEvent } from '../scripts/runtime/client/annotator.mjs';
+import { stableTaskId, canonicalPageUrl, shouldBlockPageEvent, copyTextRobust } from '../scripts/runtime/client/annotator.mjs';
 
 /** 复刻组件的编号分配规则：按已存在的最大编号递增，删除后不重排。 */
 function nextSeq(tasks) {
@@ -194,4 +194,60 @@ test('click shield sits below the annotator UI and above the page', () => {
   assert.ok(PINS > SHIELD, '图钉必须在拦截层之上，否则编辑器开着时点不到图钉');
   assert.ok(PANEL > SHIELD, '面板必须在拦截层之上，否则按钮点不动');
   assert.ok(EDITOR > SHIELD, '编辑器必须在拦截层之上，否则输入框无法聚焦');
+});
+
+/**
+ * 复制降级梯：嵌入式宿主（Devin/Codex 内置浏览器）会以权限策略拒绝
+ * clipboard.writeText（"Write permission denied"），而「复制提示词」是标注
+ * 主流程入口，不能在那类环境里直接不可用。
+ *
+ * 这几条锁死三级降级与「不谎报成功」：只要有一级成功就算成功，全失败必须
+ * 返回 false 让调用方走手动兜底，绝不能吞掉异常假装复制好了。
+ */
+test('copyTextRobust prefers the Clipboard API when it is permitted', async () => {
+  const calls = [];
+  const ok = await copyTextRobust('hello', {
+    navigator: { clipboard: { writeText: async t => { calls.push(t); } } },
+  });
+  assert.equal(ok, true);
+  assert.deepEqual(calls, ['hello']);
+});
+
+test('copyTextRobust falls back to execCommand when the Clipboard API is denied', async () => {
+  // 复现宿主拒绝：writeText 抛 NotAllowedError，老接口仍可用
+  let execValue = null;
+  const fakeTa = {
+    style: {}, value: '',
+    setAttribute() {}, select() {}, setSelectionRange() {}, remove() {},
+  };
+  const ok = await copyTextRobust('prompt-text', {
+    navigator: { clipboard: { writeText: async () => { throw new Error('Write permission denied'); } } },
+    document: {
+      createElement: () => fakeTa,
+      body: { append() {} },
+      execCommand: cmd => { execValue = cmd; return true; },
+    },
+  });
+  assert.equal(ok, true, '老接口成功即算复制成功');
+  assert.equal(execValue, 'copy');
+  assert.equal(fakeTa.value, 'prompt-text', '落到兜底路径时文本必须真的写进 textarea');
+});
+
+test('copyTextRobust reports failure instead of faking success', async () => {
+  // 两级都不可用：必须 false，调用方据此弹手动复制层
+  const ok = await copyTextRobust('x', {
+    navigator: { clipboard: { writeText: async () => { throw new Error('Write permission denied'); } } },
+    document: {
+      createElement: () => ({ style: {}, setAttribute() {}, select() {}, setSelectionRange() {}, remove() {} }),
+      body: { append() {} },
+      execCommand: () => false,
+    },
+  });
+  assert.equal(ok, false, '全失败必须返回 false，不得谎报成功');
+});
+
+test('copyTextRobust survives a host without any clipboard support', async () => {
+  // 极简宿主：navigator.clipboard 不存在，execCommand 也不存在
+  const ok = await copyTextRobust('x', { navigator: {}, document: {} });
+  assert.equal(ok, false);
 });

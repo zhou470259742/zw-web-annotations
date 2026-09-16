@@ -155,6 +155,8 @@ node "<技能目录>/scripts/cli.mjs" upgrade --root "<项目目录>"
 5. 确认后弹窗关闭、元素上出现编号图钉，标注模式保持开启，可连续标注；
 6. 标注会自动存到 `tasks/` 下的 JSON；刷新页面不丢。
 
+**嵌入式浏览器里的复制**：Devin / Codex 等内置浏览器、iframe 预览会以权限策略拒绝 `navigator.clipboard.writeText`（报 `Write permission denied`）。组件因此做了三级降级——Clipboard API → `document.execCommand('copy')` → 弹出可选中的文本框让用户手动 `⌘C/Ctrl+C`（自动全选）。**不会谎报成功**：真的全失败时才弹手动层，且文案说明原因。所以「复制提示词」在这些宿主里依然可用，只是最后一步要用户亲自按键。
+
 之后可以用「复制提示词」按钮生成处理指令，或直接让 AI agent 读 `tasks/*.json` 处理任务。
 
 ## 处理任务（安装后）

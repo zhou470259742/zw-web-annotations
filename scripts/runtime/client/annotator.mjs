@@ -784,7 +784,23 @@ export function mountAnnotator(options = {}) {
     </div>
   `;
 
-  shadow.append(outline, sizeBadge, veil, spotlight, pins, clickShield, editor, confirmBox, bar, toast);
+  // 手动复制兜底层：宿主禁用剪贴板写入时弹出，文本可直接选中。
+  // 挂在 shadow DOM 内既保持样式隔离，也避免污染页面。
+  const manualCopy = document.createElement('div');
+  manualCopy.className = 'manual-copy-layer hidden';
+  manualCopy.setAttribute('data-el', 'manualCopy');
+  manualCopy.innerHTML = `
+    <div class="manual-copy-card">
+      <h3>当前浏览器不允许自动写入剪贴板</h3>
+      <p>请点击下方文本框全选后，用 ${'⌘C / Ctrl+C'} 手动复制。</p>
+      <textarea data-el="manualCopyText" readonly rows="6"></textarea>
+      <div class="manual-copy-actions">
+        <button type="button" data-act="manual-copy-close">关闭</button>
+      </div>
+    </div>
+  `;
+
+  shadow.append(outline, sizeBadge, veil, spotlight, pins, clickShield, editor, confirmBox, manualCopy, bar, toast);
 
   const $ = sel => shadow.querySelector(sel);
   const $$ = sel => Array.from(shadow.querySelectorAll(sel));
@@ -1458,6 +1474,30 @@ export function mountAnnotator(options = {}) {
     }, ms);
   }
 
+  /**
+   * 剪贴板被宿主禁用时的兜底：把文本摊在可选中的文本框里，让用户手动复制。
+   *
+   * 这不是「失败提示」而是完成路径的一部分：嵌入式浏览器（Devin 内置浏览器等）
+   * 常以权限策略拒绝 clipboard.writeText，用户仍然需要拿到那段提示词。所以这里
+   * 自动全选文本并在回执里说清该按什么键，而不是把用户丢在「复制失败」上。
+   */
+  function showManualCopy(text, successHint) {
+    const box = $('[data-el="manualCopy"]');
+    const ta = $('[data-el="manualCopyText"]');
+    if (!box || !ta) return;
+    ta.value = text;
+    box.classList.remove('hidden');
+    // 自动聚焦并全选：用户只需按一次 ⌘C/Ctrl+C
+    setTimeout(() => { ta.focus(); ta.select(); }, 0);
+    state.syncMessage = `${successHint || ''}浏览器不允许自动复制，已展开文本供手动复制。`.trim();
+    renderMessage();
+  }
+
+  function hideManualCopy() {
+    const box = $('[data-el="manualCopy"]');
+    if (box) box.classList.add('hidden');
+  }
+
   /** 当前应当显示的文案：回执在有效期内优先，否则用最近的后台消息。 */
   function activeMessage() {
     if (state.receipt && Date.now() < state.receipt.until) return state.receipt.message;
@@ -2027,11 +2067,12 @@ export function mountAnnotator(options = {}) {
     ]
       .filter(Boolean)
       .join('\n');
-    try {
-      await navigator.clipboard.writeText(text);
+    const ok = await copyTextRobust(text);
+    if (ok) {
       state.syncMessage = '已复制元素信息。';
-    } catch (error) {
-      state.syncMessage = `复制失败：${error.message}`;
+    } else {
+      // 宿主禁用了剪贴板写入：不谎报成功，把文本摊开让用户自己复制
+      showManualCopy(text, '已复制元素信息。');
     }
     renderMessage();
   }
@@ -2779,11 +2820,13 @@ export function mountAnnotator(options = {}) {
       return null;
     }
     const summary = '任务目录与执行要求 2 个地址';
-    try {
-      await navigator.clipboard.writeText(prompt);
+    const copied = await copyTextRobust(prompt);
+    if (copied) {
       setReceipt(`提示词已复制，${summary}。`);
-    } catch (error) {
-      setReceipt(`复制失败：${error.message}`, 6000);
+    } else {
+      // 嵌入式宿主拒绝剪贴板时不把流程断在这里：展开文本让用户手动复制，
+      // 否则「复制提示词」这个主入口在某些浏览器里直接不可用。
+      showManualCopy(prompt, '');
     }
     return prompt;
   }
@@ -2901,6 +2944,12 @@ export function mountAnnotator(options = {}) {
    */
   function onKeydown(event) {
     if (event.key === 'Escape') {
+      if (!$('[data-el="manualCopy"]').classList.contains('hidden')) {
+        event.preventDefault();
+        event.stopPropagation();
+        hideManualCopy();
+        return;
+      }
       if (!$('[data-el="confirm"]').classList.contains('hidden')) {
         event.preventDefault();
         event.stopPropagation();
@@ -3092,6 +3141,7 @@ export function mountAnnotator(options = {}) {
       } else if (act === 'editor-confirm') confirmEditor();
       else if (act === 'editor-close') closeEditor();
       else if (act === 'toggle-details') toggleDetails();
+      else if (act === 'manual-copy-close') hideManualCopy();
       else if (act === 'confirm-ok') resolveConfirm(true);
       else if (act === 'confirm-cancel') resolveConfirm(false);
     },
@@ -3291,6 +3341,10 @@ export function mountAnnotator(options = {}) {
     },
     isEditorOpen: () => !editor.classList.contains('hidden'),
     editorValue: () => $('[data-el="editorInput"]').value,
+    /** 手动复制兜底层状态：宿主禁用剪贴板时用它验证降级路径确实可达。 */
+    isManualCopyOpen: () => !$('[data-el="manualCopy"]').classList.contains('hidden'),
+    manualCopyText: () => $('[data-el="manualCopyText"]').value,
+    hideManualCopy,
     pinCount: () => $$('.pin').length,
     pinTexts: () => $$('.pin').map(p => p.textContent),
     pinTitle: id => shadow.querySelector(`[data-pin="${cssEscape(id)}"]`)?.title || null,
@@ -3385,6 +3439,51 @@ export function canonicalPageUrl(url) {
   } catch {
     return String(url || '');
   }
+}
+
+/**
+ * 复制文本，逐级降级直到成功；全失败返回 false。
+ *
+ * 嵌入式宿主（Devin / Codex 等内置浏览器、iframe 预览、被 Permissions-Policy
+ * 限制的页面）里 `navigator.clipboard.writeText` 会被直接拒绝——它要求安全上下文
+ * + 用户激活 + 未被策略禁用，任一不满足就抛 "Write permission denied"。而这类
+ * 环境恰恰是看标注面板的主场景，所以不能只依赖 Clipboard API：
+ *   1. navigator.clipboard.writeText（标准路径，权限正常时最好用）；
+ *   2. document.execCommand('copy')（老接口，很多嵌入宿主仍放行）；
+ *   3. 都失败返回 false，由调用方弹出可选中的文本框让用户手动复制。
+ * 绝不谎报成功。
+ *
+ * `env` 可注入，便于单测覆盖「宿主拒绝剪贴板」这条否则只能靠人肉复现的分支。
+ */
+export async function copyTextRobust(text, env = {}) {
+  const nav = env.navigator ?? (typeof navigator !== 'undefined' ? navigator : null);
+  const doc = env.document ?? (typeof document !== 'undefined' ? document : null);
+  try {
+    if (nav?.clipboard?.writeText) {
+      await nav.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // 宿主拒绝：落到下一个方案，这不是错误路径
+  }
+  try {
+    if (!doc?.createElement) return false;
+    // execCommand 要求真实选中：临时 textarea 必须在文档里且可聚焦，
+    // 否则部分宿主会静默失败。
+    const ta = doc.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
+    doc.body.append(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = doc.execCommand('copy');
+    ta.remove();
+    if (ok) return true;
+  } catch {
+    // 两条路都不通，交给调用方走手动兜底
+  }
+  return false;
 }
 
 /* ------------------------------------------------------------------ *
@@ -3620,6 +3719,38 @@ const CSS_TEXT = `
 .confirm-actions button[data-act="confirm-ok"][data-danger="off"] {
   background: #dedaff; color: #29215e; font-weight: 700;
 }
+
+/* ---- 手动复制兜底层（宿主禁用剪贴板写入时） ---- */
+.manual-copy-layer {
+  position: fixed; inset: 0; z-index: 2147483647;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(12,12,18,.42);
+  font: 13px/1.5 var(--zc-font);
+}
+.manual-copy-card {
+  width: min(560px, calc(100vw - 32px));
+  padding: 16px 17px 14px;
+  background: #1b1b1b; color: #eee;
+  border: 1px solid #4a4a4a; border-radius: 12px;
+  box-shadow: 0 20px 50px rgba(0,0,0,.55);
+}
+.manual-copy-card h3 { margin: 0 0 8px; font-size: 14px; }
+.manual-copy-card p { margin: 0 0 10px; color: #9a9a9a; font-size: 12px; }
+/* 文本框必须可选中可聚焦：它存在的唯一目的就是让用户按 ⌘C/Ctrl+C */
+.manual-copy-card textarea {
+  width: 100%; box-sizing: border-box; resize: vertical;
+  padding: 9px 10px; border-radius: 8px;
+  background: #111; color: #e6e6e6; border: 1px solid #4a4a4a;
+  font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  word-break: break-all; white-space: pre-wrap;
+}
+.manual-copy-card textarea:focus { outline: none; border-color: #6b7bff; }
+.manual-copy-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.manual-copy-actions button {
+  border: 0; border-radius: 7px; padding: 7px 14px; cursor: pointer;
+  background: #2b2b2b; color: #c9c9c9; font-family: inherit; font-weight: 500; font-size: 12px; line-height: normal;
+}
+.manual-copy-actions button:hover { background: #383838; color: #fff; }
 
 /* ---- 右下角控制条 ---- */
 /* z-index 比 .editor 低一号：两者同为最大值时按 DOM 顺序后者在上，
@@ -4076,6 +4207,11 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .confirm-card p { color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .confirm-actions button { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .confirm-actions button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .manual-copy-card { background: #fff; color: var(--zwa-text); border-color: var(--zwa-border-strong); box-shadow: 0 20px 50px var(--zwa-shadow); }
+:host([data-zwa-theme="light"]) .manual-copy-card p { color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .manual-copy-card textarea { background: #f7f8fa; color: var(--zwa-text); border-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .manual-copy-actions button { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
+:host([data-zwa-theme="light"]) .manual-copy-actions button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
 :host([data-zwa-theme="light"]) .thumb { border-color: var(--zwa-border-strong); background: #fff; }
 :host([data-zwa-theme="light"]) .size-badge { box-shadow: 0 2px 8px var(--zwa-shadow); }
 `;

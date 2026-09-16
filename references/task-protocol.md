@@ -144,6 +144,8 @@ curl -X POST <api-base>/delete \
 
 **地址是绝对路径**，直接打开即可。执行要求文件规定只扫描任务目录顶层 `*.json`，排除 `archive/`、`attachments/` 与临时/损坏文件；复制提示词之后新增的页面任务也会被发现。客户端在任务目录或执行要求地址缺失、非绝对路径时拒绝复制（fail-closed）。
 
+嵌入式浏览器（Devin/Codex 内置浏览器、iframe 预览）会以权限策略拒绝剪贴板写入，此时组件自动降级：`navigator.clipboard` → `document.execCommand('copy')` → 弹出可选中的文本框（已自动全选）让用户手动 `⌘C/Ctrl+C`。三级都不可用才提示手动复制，不会谎报「已复制」——所以看到手动复制层是预期行为，不是故障。
+
 ## 归档
 
 `done` / `cancelled` 的任务不该一直混在待办清单里。归档把它们移入 `<任务目录>/archive/<页面>-<哈希>.json`，与活动任务同一套结构。
