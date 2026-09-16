@@ -79,7 +79,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.27.17';
+export const RUNTIME_VERSION = '0.28.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -123,6 +123,7 @@ export async function ensureEndpointManifest(workspace, endpoint) {
     routes: {
       tasks: 'GET /tasks',
       updateTask: 'PATCH /<groupId>/tasks/<taskId>',
+      acceptTasks: 'POST /accept-tasks',
       execution: 'GET|POST /execution',
       completeRound: 'POST /complete-round',
       board: 'GET /board',
@@ -1163,6 +1164,68 @@ export function createStore(workspace, options = {}) {
   };
 
   /**
+   * 人工验收：把 `review`（待验收）任务批量置为 `done`，推进进度条最后一段。
+   *
+   * 这是协议「done 只能由主线程浏览器验收后回写」的执行入口。此前子 agent 能
+   * 经 PATCH 写 review，而 review→done 除裸 PATCH 外没有任何面向人的入口，
+   * 主线程只好让用户「去浏览器点验收」——面板上看不到那个按钮，于是每次都
+   * 卡在同一个地方。验收必须是显式的人工动作，所以由这个接口承担，
+   * 而不是让任何自动化路径顺手把任务标成已完成。
+   *
+   * 只动 `review`：todo 还没开工、doing 正在改、blocked 没做成，都不能被
+   * 「验收」吞掉；它们连同伴随的 task-agent 身份一起如实回报，不伪装成通过。
+   */
+  const acceptTasks = async (options = {}) => {
+    // 身份由适配器从请求头注入。这个动作等价于「人看过页面了」，因此
+    // 只认主线程/人工路径：子 agent 自查自己写的代码不算验收。
+    if (options.actor === 'task-agent') {
+      throw new Error('task-agent cannot accept tasks; main thread verification is required');
+    }
+    const round = Number.isInteger(options.round) && options.round > 0 ? options.round : null;
+    const wanted = Array.isArray(options.ids) && options.ids.length
+      ? new Set(options.ids.map(String))
+      : null;
+    const groups = await listGroups();
+    const at = nowIso();
+    const accepted = [];
+    const pending = [];
+    for (const group of groups) {
+      let changed = false;
+      for (const task of group.tasks) {
+        // 传入 round 时只验收该轮；不传则是对全部待验收任务的一次性确认。
+        if (round != null && task.round !== round) continue;
+        if (wanted && !wanted.has(task.id)) continue;
+        if (task.status === 'review') {
+          task.status = 'done';
+          task.completedAt = at;
+          task.history.push({ at, event: 'accepted', detail: '主线程验收通过' });
+          task.updatedAt = at;
+          accepted.push({ groupId: group.id, id: task.id, round: task.round ?? null });
+          changed = true;
+        } else if (!TERMINAL_STATUS_SET.has(task.status)) {
+          pending.push({ id: task.id, status: task.status });
+        }
+      }
+      if (changed) {
+        group.updatedAt = at;
+        await writeGroup(group);
+      }
+    }
+    if (accepted.length) {
+      notifyChange();
+      await releaseRoundIfDelivered();
+    }
+    return {
+      round,
+      accepted: accepted.length,
+      tasks: accepted,
+      // 未通过验收的任务照实列出：验收动作绝不顺带把它们也标成完成。
+      pending,
+      summary: await roundSummary(),
+    };
+  };
+
+  /**
    * 清理无主附件，避免工作区堆积垃圾文件。
    * 保活集合必须来自磁盘上全部任务组与归档文件，而不是调用方涉及的那
    * 一组：attachments/ 是所有页面共用的目录，只看单组会把别的页面仍在
@@ -1471,6 +1534,7 @@ export function createStore(workspace, options = {}) {
     diagnostics,
     appendTasks: input => queueWrite(() => appendTasks(input)),
     updateTask: (groupId, patch) => queueWrite(() => updateTask(groupId, patch)),
+    acceptTasks: options => queueWrite(() => acceptTasks(options)),
     removeTasks: (groupIdOrUrl, options) => queueWrite(() => removeTasks(groupIdOrUrl, options)),
     archiveTasks: (groupIdOrUrl, options) => queueWrite(() => archiveTasks(groupIdOrUrl, options)),
     completeRound: round => queueWrite(() => completeRound(round)),

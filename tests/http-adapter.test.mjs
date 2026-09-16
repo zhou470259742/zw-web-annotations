@@ -477,6 +477,44 @@ test('blocked task reopens to todo through the PATCH endpoint', async () => {
     assert.equal(reopened.json().task.status, 'todo');
   });
 });
+
+/**
+ * 验收端点：主线程人工路径能写 done，子 agent 身份被拒。
+ * 这条锁死「让用户去浏览器点验收」那个死循环的修复——界面上有按钮，
+ * 接口也认主线程，模型不必再把验收甩给用户。
+ */
+test('accept-tasks promotes review to done for the human path and rejects task-agent', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-accept-'));
+  await withServer(dir, async port => {
+    const saved = await request(port, { method: 'POST', path: '/__zw-web-annotations/append', body: { page, tasks: [makeTask()] } });
+    const groupId = saved.json().groupId;
+    const base = `/__zw-web-annotations/${encodeURIComponent(groupId)}/tasks/task_1`;
+    // 任务先走到待验收：这是子 agent 交活后的常态
+    await request(port, { method: 'PATCH', path: base, body: { status: 'doing' } });
+    await request(port, { method: 'PATCH', path: base, body: { status: 'review' } });
+
+    // 子 agent 自查不算验收
+    const selfCheck = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/accept-tasks',
+      body: { ids: ['task_1'] }, headers: { 'x-zwa-client': 'task-agent' },
+    });
+    assert.equal(selfCheck.status, 400);
+    assert.match(selfCheck.json().error, /task-agent cannot accept tasks/);
+
+    // 主线程人工路径放行
+    const accepted = await request(port, {
+      method: 'POST', path: '/__zw-web-annotations/accept-tasks', body: { ids: ['task_1'] },
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.json().accepted, 1);
+    assert.deepEqual(accepted.json().pending, []);
+
+    const listed = await request(port, { path: '/__zw-web-annotations/tasks' });
+    const task = listed.json().groups[0].tasks.find(t => t.id === 'task_1');
+    assert.equal(task.status, 'done');
+    assert.ok(task.completedAt, '验收时刻落盘');
+  });
+});
 test('GET/POST /board-prefs persists the board theme inside the project', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'zcode-http-prefs-'));
   await withServer(dir, async port => {

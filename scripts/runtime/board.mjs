@@ -274,8 +274,10 @@ export function renderBoardHtml({ version = '' } = {}) {
   .card-act:hover { color: var(--text); border-color: var(--text-faint); background: var(--hover); }
   .card-act.del:hover { color: var(--st-blocked); border-color: var(--st-blocked); }
   .card-act.reopen:hover { color: var(--st-todo); border-color: var(--st-todo); }
+  .card-act.accept:hover { color: var(--st-review); border-color: var(--st-review); }
   .card-act.armed { opacity: 1; color: #fff; font-weight: 600; background: var(--st-blocked); border-color: var(--st-blocked); }
   .card-act.reopen.armed { background: var(--st-todo); border-color: var(--st-todo); }
+  .card-act.accept.armed { background: var(--st-review); border-color: var(--st-review); }
   .empty { font-size: 11px; color: var(--text-empty); padding: 8px 4px; text-align: center; }
   .empty-note { flex: none; font-size: 12px; color: var(--text-dim); padding: 0 2px 10px; }
   .error { max-width: 420px; text-align: center; color: var(--st-blocked); }
@@ -459,6 +461,9 @@ export function renderBoardHtml({ version = '' } = {}) {
           + (t.status === 'cancelled' ? '<button type="button" class="card-act del" data-action="purge-archived" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="从归档中永久删除这条任务">删除</button>' : ''))
         : ((t.pendingInstruction ? '<span class="tag pending" title="已提交新要求（下一轮处理）：' + esc(t.pendingInstruction) + '">新要求</span>' : '')
           + (t.round != null ? '<span class="tag round">第 ' + esc(t.round) + ' 轮</span>' : '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>')
+          // 待验收卡的正式人工出口：done 只能由主线程验收后回写，
+          // 看板上给不出这个按钮，用户就只能被指去点一个不存在的东西。
+          + (t.status === 'review' ? '<button type="button" class="card-act accept" data-action="accept" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="验收通过：确认这处改动符合要求，标记为已完成">验收</button>' : '')
           + (t.status === 'blocked' ? '<button type="button" class="card-act reopen" data-action="reopen" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="重新入列：回到待处理，等下一轮处理">重新加入</button>' : '')))
       + '</div>'
       + '</div>';
@@ -716,7 +721,7 @@ export function renderBoardHtml({ version = '' } = {}) {
   var boardRoot = document.getElementById('board');
   var armedBtn = null;
   var armedTimer = null;
-  var CONFIRM_LABELS = { 'purge-archived': '确认删除', 'reopen': '确认入列' };
+  var CONFIRM_LABELS = { 'purge-archived': '确认删除', 'reopen': '确认入列', 'accept': '确认验收' };
   function disarmAction() {
     if (armedBtn) {
       armedBtn.textContent = armedBtn.dataset.label;
@@ -754,6 +759,13 @@ export function renderBoardHtml({ version = '' } = {}) {
         method: 'PATCH',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ status: 'todo' }),
+      });
+    } else if (action === 'accept') {
+      // 验收走 /accept-tasks：主线程人工路径，不带 task-agent 声明。
+      call = fetch('./accept-tasks', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ ids: [taskId] }),
       });
     }
     if (call) {

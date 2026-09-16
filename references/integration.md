@@ -130,7 +130,7 @@ app.use(createAnnotationsMiddleware({
 
 **建议始终显式传 `dir`**，与安装器初始化的目录保持一致。
 
-接口一览（Vite 插件同一套，前缀随 `endpoint` 选项）：`GET /tasks`、`GET|POST /execution`、`POST /complete-round`、`PATCH /<groupId>/tasks/<taskId>`（`blocked→todo` 为人工重新入列转移）、`GET /board`（只读任务看板）、`GET /archive`（归档只读总览，供看板展示历史任务）、`POST /purge-archive`（清理归档：整组/全部，或按 `ids`/`statuses` 任务粒度删除）、`GET|POST /board-prefs`（看板偏好，主题记忆落盘 `.zwa/runtime/board-prefs.json`）、`GET /events`（SSE）、`GET /health`。看板在浏览器打开 `<同源><route>/board` 即可用：整页铺满视口、滚动在各面板内部，右上角切换看板/表格布局与明亮/暗色主题（默认暗色、记忆在项目里），已归档任务并入看板终态列，支持关键词搜索与状态/页面/归档过滤，并经 SSE 实时刷新；看板仅提供两个人工清理动作（已取消卡的归档删除、阻塞卡重新入列），均带二次确认。
+接口一览（Vite 插件同一套，前缀随 `endpoint` 选项）：`GET /tasks`、`GET|POST /execution`、`POST /complete-round`、`POST /accept-tasks`（人工验收 `review→done`：传 `round` 验收本轮全部待验收任务，或传 `ids` 验收指定任务；带 `x-zwa-client: task-agent` 会被拒绝）、`PATCH /<groupId>/tasks/<taskId>`（`blocked→todo` 为人工重新入列转移）、`GET /board`（只读任务看板）、`GET /archive`（归档只读总览，供看板展示历史任务）、`POST /purge-archive`（清理归档：整组/全部，或按 `ids`/`statuses` 任务粒度删除）、`GET|POST /board-prefs`（看板偏好，主题记忆落盘 `.zwa/runtime/board-prefs.json`）、`GET /events`（SSE）、`GET /health`。看板在浏览器打开 `<同源><route>/board` 即可用：整页铺满视口、滚动在各面板内部，右上角切换看板/表格布局与明亮/暗色主题（默认暗色、记忆在项目里），已归档任务并入看板终态列，支持关键词搜索与状态/页面/归档过滤，并经 SSE 实时刷新；看板仅提供三个带二次确认的人工动作：待验收卡的「验收」、已取消卡的归档「删除」、阻塞卡的「重新加入」。
 
 自动注入只作用于 `text/html` 且**未被压缩**的响应；遇到 gzip/brotli 正文会原样放行，不会写坏内容。若你的 dev server 在中间件之前就把 HTML 发走了，改用 `injectAnnotatorScript()` 手动注入：
 

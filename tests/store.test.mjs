@@ -620,6 +620,80 @@ test('blocked task can be reopened to todo by the human path', async () => {
 });
 
 /**
+ * 验收是「done 只能由主线程浏览器复核后回写」的落地路径。
+ *
+ * 回归背景：此前子 agent 能写 review，而 review→done 除裸 PATCH 外没有任何
+ * 面向人的入口，主线程只好让用户「去浏览器点验收」——界面上根本没有那个按钮，
+ * 于是反复卡在同一处。这几条测试锁死：人工路径能验收、子 agent 不能自查自收、
+ * 验收只动 review 不吞掉其它状态、按轮次验收不会越界。
+ */
+test('acceptTasks lets the human path confirm review tasks to done', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+  await submitReview(store, id, 'task_abc', '改了 src/pages/X.vue 第 12 行，build 通过');
+
+  const result = await store.acceptTasks({ ids: ['task_abc'] });
+  assert.equal(result.accepted, 1);
+  assert.deepEqual(result.pending, []);
+  const accepted = (await store.readGroup(id)).tasks[0];
+  assert.equal(accepted.status, 'done');
+  // 验收时刻单独记账，验收耗时才有据可查
+  assert.ok(accepted.completedAt);
+});
+
+test('acceptTasks refuses the task-agent identity', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+  await submitReview(store, id, 'task_abc');
+
+  // 子 agent 自证自己刚写的代码不算验收，否则「待验收」这一环形同虚设
+  await assert.rejects(
+    () => store.acceptTasks({ actor: 'task-agent', ids: ['task_abc'] }),
+    /task-agent cannot accept tasks/,
+  );
+  assert.equal((await store.readGroup(id)).tasks[0].status, 'review', '被拒后状态不动');
+});
+
+test('acceptTasks only promotes review and reports the rest as pending', async () => {
+  const store = await tempStore();
+  const base = task();
+  await store.appendTasks({
+    page,
+    tasks: [base, { ...base, id: 'task_2', element: { ...base.element, selector: '#b' } }],
+  });
+  const id = pageKey(page.url);
+  await submitReview(store, id, 'task_abc');
+  // task_2 留在 todo：验收不能把还没开工的任务顺带标成完成
+
+  const result = await store.acceptTasks({});
+  assert.equal(result.accepted, 1);
+  assert.deepEqual(result.pending, [{ id: 'task_2', status: 'todo' }]);
+  const byId = Object.fromEntries((await store.readGroup(id)).tasks.map(t => [t.id, t.status]));
+  assert.equal(byId.task_abc, 'done');
+  assert.equal(byId.task_2, 'todo', '验收不顺带吞掉 todo');
+});
+
+test('acceptTasks scopes to a round when one is given', async () => {
+  const store = await tempStore();
+  await store.appendTasks({ page, tasks: [task()] });
+  const id = pageKey(page.url);
+  const reviewed = await submitReview(store, id, 'task_abc');
+  const round = reviewed.task.round;
+  assert.ok(round, '进入 review 会定稿轮次');
+
+  // 别的轮次一个都不该命中：整批验收被指到错误轮次时必须是 0，而不是全收
+  const elsewhere = await store.acceptTasks({ round: round + 1 });
+  assert.equal(elsewhere.accepted, 0);
+  assert.equal((await store.readGroup(id)).tasks[0].status, 'review');
+
+  const scoped = await store.acceptTasks({ round });
+  assert.equal(scoped.accepted, 1);
+  assert.equal((await store.readGroup(id)).tasks[0].status, 'done');
+});
+
+/**
  * 回归：轮次在途时模式锁生效；但交付不只发生在 complete-round——直接
  * 归档（POST /archive）把本轮任务收走后 activeRound 必须释放，否则模式
  * 锁永不解除（实测第 8 轮直接归档后面板锁死）。

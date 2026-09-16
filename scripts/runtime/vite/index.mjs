@@ -269,6 +269,19 @@ export function zwAnnotations(options = {}) {
             return sendJson(res, 200, { ok: true, ...result });
           }
 
+          // 人工验收（review→done）。身份只认请求头：带 task-agent 声明的
+          // 调用方是在自证自己刚写的代码，不算主线程浏览器验收，由 store 拒绝。
+          if (req.method === 'POST' && route === '/accept-tasks') {
+            const payload = parseBody(await readBody(req));
+            const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
+            const result = await getStore().acceptTasks({
+              round: payload.round == null ? null : Number(payload.round),
+              ids: Array.isArray(payload.ids) ? payload.ids : null,
+              ...(actor ? { actor } : {}),
+            });
+            return sendJson(res, 200, { ok: true, ...result });
+          }
+
           // 源码变化时哈希变化，必然重新拉取。
           if (req.method === 'GET' && route === '/client.js') {
             const source = await clientSource();

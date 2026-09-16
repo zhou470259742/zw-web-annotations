@@ -211,6 +211,18 @@ export function createAnnotationsMiddleware(options = {}) {
         const result = await store.completeRound(Number(payload.round));
         return sendJson(res, 200, { ok: true, ...result });
       }
+      // 人工验收（review→done）：身份只认请求头，task-agent 自查不算验收。
+      if (req.method === 'POST' && route === '/accept-tasks') {
+        const raw = await readBody(req);
+        const payload = raw ? JSON.parse(raw) : {};
+        const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
+        const result = await store.acceptTasks({
+          round: payload.round == null ? null : Number(payload.round),
+          ids: Array.isArray(payload.ids) ? payload.ids : null,
+          ...(actor ? { actor } : {}),
+        });
+        return sendJson(res, 200, { ok: true, ...result });
+      }
       if (req.method === 'POST' && route === '/append') {
         const raw = await readBody(req);
         const result = await store.appendTasks(raw ? JSON.parse(raw) : {});

@@ -733,6 +733,7 @@ export function mountAnnotator(options = {}) {
             <button type="button" data-act="mode" data-mode="queue" title="按队列：本轮复核归档后自动继续下一轮（本轮处理期间不可切换）">队列</button>
           </div>
           <span class="progress-label" data-el="progressLabel"></span>
+          <button type="button" class="accept-btn hidden" data-act="accept-round" data-el="acceptBtn" title="把本轮待验收的改动一次确认通过（已完成的不受影响）">验收本轮</button>
           <button type="button" class="archive-btn hidden" data-act="archive-round" data-el="archiveBtn" title="把本轮已完成的任务移入归档（交付）">归档本轮</button>
           <span class="progress-pct" data-el="progressPct"></span>
         </div>
@@ -1199,6 +1200,44 @@ export function mountAnnotator(options = {}) {
     renderMessage();
   }
 
+  /**
+   * 人工验收：把待验收的任务确认通过（review→done）。
+   *
+   * 这是「done 由主线程浏览器验收后回写」的落地按钮。回写不带
+   * x-zwa-client: task-agent —— 带那个声明会被服务端当成子 agent 自查而拒绝，
+   * 那样又把用户推回「没有可点入口」的死路。
+   *
+   * 全部验收完成后才提示可归档：轮次里还有别的状态时，归档本轮会被服务端
+   * 以 obstacles 拒绝，提前说「可以归档了」是假回执。
+   */
+  async function acceptTasks({ ids = null, round = null } = {}) {
+    try {
+      const response = await fetch(`${config.endpoint}/accept-tasks`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
+        body: JSON.stringify({ ids, round }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      await loadRemoteTasks({ quiet: true });
+      const accepted = data.accepted || 0;
+      const pending = Array.isArray(data.pending) ? data.pending : [];
+      if (!accepted) {
+        setReceipt('没有待验收的任务。', 4000);
+      } else if (pending.length) {
+        // 只报通过的数目，并说清还剩什么没通过 —— 验收不顺带标记未完成的任务
+        const detail = pending.map(p => STATUS_LABELS[p.status] || p.status).join('、');
+        setReceipt(`已验收 ${accepted} 项；还有 ${pending.length} 项未收尾（${detail}），不能归档本轮。`, 7000);
+      } else {
+        setReceipt(`已验收 ${accepted} 项，本轮可归档。`, 5000);
+      }
+      return data;
+    } catch (error) {
+      setReceipt(`验收失败：${error.message}`, 6000);
+      return null;
+    }
+  }
+
   /* ---------------- 渲染 ---------------- */
 
   function renderCapsule() {
@@ -1335,6 +1374,9 @@ export function mountAnnotator(options = {}) {
       : '';
     // 全部完成时换成绿色并常驻，直到归档（交付）——这是「本轮收工」的信号
     fill.dataset.done = p.total && p.percent >= 100 ? 'on' : 'off';
+    // 有等待验收的任务就露出「验收本轮」：这是 done 的正式入口，
+    // 与 100% 后的「归档本轮」分工不同（先验收、后归档），两者可同时在场。
+    $('[data-el="acceptBtn"]').classList.toggle('hidden', !(p.counts.review > 0));
     $('[data-el="archiveBtn"]').classList.toggle('hidden', !(p.total && p.percent >= 100));
   }
 
@@ -1537,6 +1579,10 @@ export function mountAnnotator(options = {}) {
         ? ' title="本批已整批锁定读取，暂不可就地修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"'
         : ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"')
       : '';
+    // review = 子 agent 已交活、等人看过页面确认。这是唯一面向人的验收入口：
+    // 以前 done 只能靠裸 PATCH 回写，主线程没有可点的东西，于是反复让用户
+    // 「去浏览器点验收」——面板上根本没有那个按钮。验收必须是显式人工动作。
+    const reviewable = task.status === 'review';
     return `
     <article class="item${task.id === state.editingId ? ' editing' : ''}${locked || batchQueued ? ' locked' : ''}" data-item="${task.id}">
       <div class="item-head">
@@ -1544,6 +1590,7 @@ export function mountAnnotator(options = {}) {
         <span class="item-title">${escapeHtml(title)}</span>
         ${locked ? '<span class="lock-note" title="正在处理中，暂不可修改或删除">🔒 处理中</span>' : ''}
         ${batchQueued ? '<span class="lock-note" title="已锁定进当前处理批次：整批读取后按顺序完成，暂不可修改或删除；新要求可通过详情提交，下一轮处理">🔒 本批待处理</span>' : ''}
+        ${reviewable ? `<button type="button" class="link accept" data-accept="${escapeHtml(task.id)}" title="验收通过：确认这处改动符合要求，标记为已完成">✓ 验收</button>` : ''}
         ${current ? `<button type="button" class="link" data-details="${escapeHtml(task.id)}" title="查看元素详情">详情</button>` : ''}
         ${locked || batchQueued
           ? ''
@@ -1697,6 +1744,22 @@ export function mountAnnotator(options = {}) {
             if (localTask) removeTask(id);
             else if (remote) removeRemoteTask(remote.group, remote.task);
           },
+        });
+      };
+    });
+    list.querySelectorAll('[data-accept]').forEach(el => {
+      el.onclick = () => {
+        const id = el.dataset.accept;
+        const task = findTask(id) || findRemoteTask(id)?.task;
+        if (!task) return;
+        askConfirm({
+          title: '验收通过这条标注？',
+          detail: `「${truncate(task.instruction || '未填写', 30)}」将标记为已完成并计入验收进度。`
+            // detail 走 textContent，换行不会渲染，用整句拼接
+            + (task.result ? ` 处理者回写：${truncate(task.result, 160)}` : ''),
+          confirmText: '确认验收',
+          danger: false,
+          onConfirm: () => acceptTasks({ ids: [id] }),
         });
       };
     });
@@ -2587,6 +2650,32 @@ export function mountAnnotator(options = {}) {
   }
 
   /**
+   * 验收本轮：把当前轮所有待验收（review）的改动一次确认通过。
+   *
+   * 这是给「一次看完整批改动」准备的快捷入口——逐条点验收在七八条时要
+   * 点七八次。仍走同一个 confirm 二次确认，且服务端只挑 review 置 done，
+   * blocked/doing/todo 一个都不会被顺带标成完成。
+   */
+  function acceptRound() {
+    const scope = roundScope();
+    const review = scope.dispatched.filter(t => t.status === 'review');
+    if (!review.length) {
+      setReceipt('本轮没有待验收的任务。', 4000);
+      return;
+    }
+    const round = state.serverRound && Object.prototype.hasOwnProperty.call(state.serverRound, 'activeRound')
+      ? state.serverRound.activeRound
+      : (Number.isInteger(state.execution?.activeRound) ? state.execution.activeRound : scope.currentRound);
+    askConfirm({
+      title: `验收本轮 ${review.length} 项改动？`,
+      detail: `第 ${round ?? '当前'} 轮里 ${review.length} 项待验收标注将标记为已完成；未收尾的任务不受影响。`,
+      confirmText: `验收 ${review.length} 项`,
+      danger: false,
+      onConfirm: () => acceptTasks({ round: round ?? null }),
+    });
+  }
+
+  /**
    * 归档本轮：把全部任务组里已完成（done/cancelled）的任务移入归档。
    * 这是轮次的「交付」动作——验收通过后 100% 绿条常驻，由用户点此按钮
    * （或下一轮复制提示词时自动）完成交付。只动已完成任务，
@@ -2993,6 +3082,7 @@ export function mountAnnotator(options = {}) {
           }
         }
       } else if (act === 'copy') copyPrompt();
+      else if (act === 'accept-round') acceptRound();
       else if (act === 'archive-round') archiveRound();
       else if (act === 'mode') setExecutionMode(event.target?.dataset?.mode);
       else if (act === 'manual') {
@@ -3810,9 +3900,17 @@ const CSS_TEXT = `
   background: transparent; color: #6fd39a; font-family: inherit; font-size: 11px; font-weight: 600;
 }
 .progress-head .archive-btn:hover { background: #1f3d2b; }
+/* 验收本轮按钮：有任务处于待验收时出现，是 done 的正式人工入口（先前只能裸 PATCH） */
+.progress-head .accept-btn {
+  border: 1px solid #c9a35a; border-radius: 5px; padding: 2px 8px; cursor: pointer;
+  background: transparent; color: #e0b968; font-family: inherit; font-size: 11px; font-weight: 600;
+}
+.progress-head .accept-btn:hover { background: #3a3120; }
 .panel .tag.warn { color: #d8a45a; }
 .panel button.link { border: 0; background: none; cursor: pointer; padding: 0; color: #c9c9c9; font: inherit; }
 .panel button.link.danger { color: #e07a7a; font-size: 12px; }
+/* 待验收任务的「✓ 验收」：与删除同为行内链接，但用验收色区分语义 */
+.panel button.link.accept { color: #e0b968; font-size: 12px; }
 /* 处理中的任务：整条降饱和 + 输入框禁改，明确传达「已锁定，别动」 */
 .panel .item.locked { border-color: #4a4a52; background: #191a1d; }
 .panel .item.locked .item-title { color: #9a9aa2; }
@@ -3924,6 +4022,9 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .mode-switch button:disabled:hover { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .progress-head .archive-btn { border-color: #2e9e57; color: #2e9e57; }
 :host([data-zwa-theme="light"]) .progress-head .archive-btn:hover { background: #e7f6ee; }
+:host([data-zwa-theme="light"]) .progress-head .accept-btn { border-color: #a8791f; color: #8a6a1f; }
+:host([data-zwa-theme="light"]) .progress-head .accept-btn:hover { background: #fbf3e2; }
+:host([data-zwa-theme="light"]) .panel button.link.accept { color: #8a6a1f; }
 :host([data-zwa-theme="light"]) *::-webkit-scrollbar-thumb { background: #c9cdd8; border: 2px solid transparent; border-radius: 999px; background-clip: padding-box; }
 :host([data-zwa-theme="light"]) *::-webkit-scrollbar-thumb:hover { background-color: #b0b6c4; }
 :host([data-zwa-theme="light"]) .panel-list,

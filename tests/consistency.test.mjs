@@ -84,9 +84,11 @@ test('board page ships with the runtime and renders all statuses safely', async 
   assert.match(source, /BOARD_COLUMNS/, '看板列布局必须由 BOARD_COLUMNS 定义');
   assert.match(source, /data-stack/, '合并列必须带 data-stack 标识');
   assert.match(source, /col-half/, '合并列的上下两半必须各自独立滚动');
-  // 两个人工清理动作：归档删除（任务粒度 purge）与阻塞任务重新入列（blocked→todo）
+  // 三个人工动作：待验收卡的验收（review→done）、归档删除（任务粒度 purge）、阻塞任务重新入列（blocked→todo）
+  assert.match(source, /data-action="accept"/, '待验收卡必须有验收按钮');
   assert.match(source, /data-action="purge-archived"/, '归档卡必须有删除按钮');
   assert.match(source, /data-action="reopen"/, '阻塞卡必须有重新入列按钮');
+  assert.match(source, /fetch\('\.\/accept-tasks'/, '验收动作必须走 /accept-tasks 人工路径接口');
   assert.match(source, /purge-archive/, '删除动作必须走 /purge-archive 任务粒度接口');
   // 时间格式契约：完成时间统一 YYYY-MM-DD HH:mm:ss 固定格式，禁止回落 toLocaleString
   assert.match(source, /getFullYear\(\) \+ '-'/, '日期必须用固定 YYYY-MM-DD 格式');
@@ -106,6 +108,21 @@ test('both adapters expose GET /archive and board-prefs backed by the store', as
     assert.match(source, /route === '\/board-prefs'/, `${adapter} 缺少 /board-prefs 路由`);
     assert.match(source, /writeBoardPrefs/, `${adapter} 偏好写入必须走 store.writeBoardPrefs`);
   }
+});
+
+test('both adapters expose the human acceptance route with the task-agent guard', async () => {
+  // 验收端点必须在两个适配器上一致：只有 Vite 有而 http 适配器没有的话，
+  // 非 Vite 项目的主线程又会回到「没有可点/可调入口」的老问题。
+  for (const adapter of ['../scripts/runtime/vite/index.mjs', '../scripts/runtime/adapters/http.mjs']) {
+    const source = await fs.readFile(new URL(adapter, import.meta.url), 'utf8');
+    assert.match(source, /route === '\/accept-tasks'/, `${adapter} 缺少 POST /accept-tasks`);
+    assert.match(source, /acceptTasks/, `${adapter} 验收必须走 store.acceptTasks`);
+    // 身份只认请求头：适配器要把 task-agent 声明透传给 store 才能拦住自查自收
+    assert.match(source, /x-zwa-client'\] === 'task-agent'/, `${adapter} 必须从请求头判定 task-agent`);
+  }
+  // 接口清单要声明这条路由，模型读协议后才知道有验收入口可用
+  const storeSource = await fs.readFile(new URL('../scripts/runtime/core/store.mjs', import.meta.url), 'utf8');
+  assert.match(storeSource, /acceptTasks: 'POST \/accept-tasks'/, 'endpoint.json 必须声明验收路由');
 });
 
 test('a store created without dir writes into the installer tasks dir', async () => {
