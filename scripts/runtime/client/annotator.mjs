@@ -739,6 +739,10 @@ export function mountAnnotator(options = {}) {
         <div class="progress-track" title="">
           <div class="progress-fill" data-el="progressFill"></div>
         </div>
+        <!-- 次要状态单独占一行：排队数与「为什么停住」的提示合起来经常超过
+             首行剩余宽度，挤在首行会被省略号吃掉——而那恰恰是用户最需要
+             看到的信息（进度停在某个百分比时的原因）。 -->
+        <div class="progress-note" data-el="progressNote"></div>
       </div>
       <div class="panel-list" data-el="list"></div>
       <footer><span class="panel-msg" data-el="msg"></span></footer>
@@ -1309,9 +1313,21 @@ export function mountAnnotator(options = {}) {
     const scopeName = scope.mode === 'queue' ? '队列·本轮' : '本轮';
     $('[data-el="progressLabel"]').textContent = p.total
       ? `${scopeName} 待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
-        + (scope.queued ? ` · 下一轮 ${scope.queued}` : '')
-        + runnerHint(scope)
       : (scope.queued ? `下一轮 ${scope.queued} 条 · 复制提示词开始` : '还没有任务');
+    // 排队数与状态提示走独立一行：两者都可能很长，放在首行会被 ellipsis
+    // 截掉，而「为什么停在某个百分比」正是这条进度最重要的补充信息。
+    const note = $('[data-el="progressNote"]');
+    if (note) {
+      // 没有在途轮次时首行已经写了「下一轮 N 条」，再补一行就是重复
+      const noteText = p.total
+        ? [
+            scope.queued ? `下一轮排队 ${scope.queued} 条` : '',
+            runnerHint(scope).replace(/^ · /, ''),
+          ].filter(Boolean).join(' · ')
+        : '';
+      note.textContent = noteText;
+      note.classList.toggle('hidden', !noteText);
+    }
     fill.parentElement.title = p.total
       ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
         + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）\n`
@@ -3692,6 +3708,13 @@ const CSS_TEXT = `
   color: #9a9a9a; font-size: 11px;
 }
 .progress-pct { color: #dedaff; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* 次要状态行（排队数 / 阻塞原因）：可换行，不省略——这里的信息不能丢 */
+.progress-note {
+  margin-top: 5px;
+  color: #b99a5f; font-size: 10px; line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+.progress-note.hidden { display: none; }
 .progress-track {
   position: relative; height: 6px; border-radius: 999px;
   background: #2b2b2b; overflow: hidden;
@@ -3891,6 +3914,7 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel-progress { border-bottom-color: var(--zwa-border); }
 :host([data-zwa-theme="light"]) .progress-label { color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .progress-pct { color: #4f5bd5; }
+:host([data-zwa-theme="light"]) .progress-note { color: #8a6a1f; }
 :host([data-zwa-theme="light"]) .progress-track { background: #e8eaf0; }
 :host([data-zwa-theme="light"]) .mode-switch { border-color: var(--zwa-border-strong); }
 :host([data-zwa-theme="light"]) .mode-switch button { color: var(--zwa-text-muted); }
