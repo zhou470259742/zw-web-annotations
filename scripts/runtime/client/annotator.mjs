@@ -279,29 +279,57 @@ function componentTrail(el) {
  * 该元素自己声明了这个颜色，改「这个区域文字」时去改祖先变量，一次影响全站。
  * 这里遍历 CSSOM 找到真正命中该元素的规则，从而区分「自身声明」与「继承」。
  */
-function declaredProps(el) {
-  const props = new Set();
-  let warned = 0;
-  const visit = rules => {
-    for (const rule of rules || []) {
-      // 先处理"有选择器的普通规则"。不能反过来用 `if (rule.cssRules) continue`
-      // 判断：支持 CSS 嵌套后，普通的样式规则也带一个（通常为空的）cssRules，
-      // 空列表是真值，那样会把所有规则统统跳过，ownStyles 恒为空、
-      // 每个属性都被误报成"继承"，比不判断更糟。
-      if (rule.selectorText && rule.style) {
-        try {
-          if (el.matches(rule.selectorText)) for (const p of rule.style) props.add(p);
-        } catch {
-          // 跨域样式表、嵌套里的 & 选择器、:has() 等无法匹配，跳过
-          warned++;
-        }
-      }
-      // 分组规则（@media/@supports/@layer）本身没有选择器，需要下钻
+/**
+ * CSSOM 规则扁平缓存：整张样式表树的遍历结果只算一次。
+ * 每次标注都全量 walk + matches 会卡 ~1s（EP+项目 SCSS 数千条规则）。
+ * 失效条件保守取 styleSheets 数量变化——开发态 Vite 注入新表时自然重建。
+ */
+let flatRuleCache = null;
+function flatRules() {
+  const sheets = Array.from(document.styleSheets || []);
+  if (flatRuleCache && flatRuleCache.count === sheets.length) return flatRuleCache.rules;
+  const rules = [];
+  const visit = list => {
+    for (const rule of list || []) {
+      if (rule.selectorText && rule.style) rules.push(rule);
       if (rule.cssRules && rule.cssRules.length) visit(rule.cssRules);
     }
   };
-  for (const sheet of Array.from(document.styleSheets || [])) {
-    try { visit(sheet.cssRules); } catch { warned++; }
+  for (const sheet of sheets) {
+    try { visit(sheet.cssRules); } catch { /* 跨域样式表跳过 */ }
+  }
+  flatRuleCache = { count: sheets.length, rules };
+  return rules;
+}
+
+/**
+ * 选择器类名令牌预筛：selector 中（:not() 之外）出现的 .cls 若元素并不具备，
+ * matches() 必然 false，直接跳过——几千条规则里真正需要 matches 的只剩个位数。
+ * 注意 :not(.x) 里的类名不能用于前置排除（缺 .x 反而可能命中），先剥离。
+ */
+const NOT_BLOCK = /:not\([^)]*\)/g;
+const CLASS_TOKEN = /\.(-?[_a-zA-Z]+[_a-zA-Z0-9-]*)/g;
+function couldMatch(el, selectorText) {
+  const positive = selectorText.replace(NOT_BLOCK, '');
+  const tokens = positive.match(CLASS_TOKEN);
+  if (!tokens || !tokens.length) return true; // 无类名令牌：无法预筛，交给 matches
+  for (const t of tokens) {
+    if (!el.classList || !el.classList.contains(t.slice(1))) return false;
+  }
+  return true;
+}
+
+function declaredProps(el) {
+  const props = new Set();
+  let warned = 0;
+  for (const rule of flatRules()) {
+    if (!rule.selectorText || !rule.style) continue;
+    if (!couldMatch(el, rule.selectorText)) continue;
+    try {
+      if (el.matches(rule.selectorText)) for (const p of rule.style) props.add(p);
+    } catch {
+      warned++;
+    }
   }
   return { props, warned };
 }
@@ -528,7 +556,8 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID) {
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const full = await mod.domToCanvas(document.documentElement, {
-      scale: 1,
+      // 上下文图只是定位证据，0.75 采样清晰度足够且省 ~40% 栅格成本
+      scale: 0.75,
       // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）
       filter: (node) => !(node && node.id === hostId),
     });
@@ -3090,7 +3119,10 @@ export function mountAnnotator(options = {}) {
 
     const element = describeElement(target);
     const existing = findTaskBySelector(element.selector);
-    state.pendingShot = captureContextShot(config.endpoint, element.rect);
+    // 截图推迟一拍启动：让编辑器/弹窗先渲染，DOM 序列化不占 pick 帧
+    state.pendingShot = new Promise(res =>
+      setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+    );
     if (existing) {
       existing.element = element;
       persistLocal();
@@ -3498,7 +3530,9 @@ export function mountAnnotator(options = {}) {
       // 手动任务的 element 为 null，直接取 .selector 会抛 TypeError，
       // 导致页面上只要有一条手动任务，api.add 就再也标不了元素。
       const existing = state.tasks.find(t => t.element?.selector === element.selector);
-      state.pendingShot = captureContextShot(config.endpoint, element.rect);
+      state.pendingShot = new Promise(res =>
+        setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+      );
       if (existing) {
         openEditorFor(existing.id);
         return { mode: 'edit', id: existing.id };
