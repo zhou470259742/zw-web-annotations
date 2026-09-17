@@ -127,6 +127,10 @@ export function createAnnotationsMiddleware(options = {}) {
     if (pathname === config.clientPath) {
       return sendJs(res, await clientSource());
     }
+    // 截图子模块：annotator 按需 dynamic import，独立文件不增大主包
+    if (pathname === `${config.route}/client/domshot.mjs`) {
+      return sendJs(res, await fs.readFile(path.resolve(here, '..', 'client', 'domshot.mjs'), 'utf8'));
+    }
 
     // 只读看板：所有页面的任务按状态分列，页面自行拉取 ./tasks 并经 SSE 实时刷新
     if (pathname === `${config.route}/board` && req.method === 'GET') {
@@ -208,7 +212,7 @@ export function createAnnotationsMiddleware(options = {}) {
       if (req.method === 'POST' && route === '/complete-round') {
         const raw = await readBody(req);
         const payload = raw ? JSON.parse(raw) : {};
-        const result = await store.completeRound(Number(payload.round));
+        const result = await store.completeRound(payload.round === 'active' ? 'active' : Number(payload.round));
         return sendJson(res, 200, { ok: true, ...result });
       }
       // 人工验收（review→done）：身份只认请求头，task-agent 自查不算验收。
@@ -217,7 +221,7 @@ export function createAnnotationsMiddleware(options = {}) {
         const payload = raw ? JSON.parse(raw) : {};
         const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
         const result = await store.acceptTasks({
-          round: payload.round == null ? null : Number(payload.round),
+          round: payload.round === 'active' ? 'active' : (payload.round == null ? null : Number(payload.round)),
           ids: Array.isArray(payload.ids) ? payload.ids : null,
           ...(actor ? { actor } : {}),
         });

@@ -436,7 +436,128 @@ export function describeElement(el) {
     inheritedStyles,
     frame: typeof window !== 'undefined' && window.top === window ? 'top' : 'nested',
     uniqueMatch: matchCount === 1,
+    locator: buildLocator(el, selector),
   };
+}
+
+/** 生成的/易漂移的 id 特征：Element Plus 的 el-id-*、Vue scoped data-v-*、构建期哈希 id。 */
+const VOLATILE_ID = /^(el-id-|van-|v-|uid-|radix-|headlessui-)|^data-v-|__[a-z0-9]{4,}/i;
+
+/**
+ * 稳定定位链兜底：selector 里的 el-id-* 是会话级生成 id，换个会话必失效。
+ * 这里产出两级降级定位——
+ *   stableSelector：跳过易漂移 id、只走标签+类名的选择器；
+ *   semantic：label/placeholder/name/role/就近文本等语义签名，
+ *   供模型在 selector 失效后仍能在源码/DOM 里精确找回元素。
+ */
+export function buildLocator(el, primarySelector) {
+  // 稳定选择器：逐级上溯，跳过易漂移 id，保留标签+稳定类名
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && node !== document.body && node !== document.documentElement) {
+    let part = node.tagName.toLowerCase();
+    if (node.id && !VOLATILE_ID.test(node.id)) {
+      part = '#' + cssEscape(node.id);
+      parts.unshift(part);
+      node = node.parentElement;
+      break; // 稳定 id 本身就是锚点，不必再上溯
+    }
+    const cls = node.classList ? Array.from(node.classList).filter(c => !VOLATILE_ID.test(c)).slice(0, 4) : [];
+    if (cls.length) part += '.' + cls.map(cssEscape).join('.');
+    const siblings = Array.from((node.parentElement && node.parentElement.children) || []).filter(s => s.tagName === node.tagName);
+    if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(node) + 1})`;
+    parts.unshift(part);
+    node = node.parentElement;
+    if (parts.length >= 5) break;
+  }
+  const stableSelector = parts.join(' > ');
+
+  // 语义签名：表单控件取关联 label 文本；按钮/链接取可访问名
+  const semantic = {};
+  const attr = (n) => el.getAttribute && el.getAttribute(n);
+  if (attr('placeholder')) semantic.placeholder = attr('placeholder');
+  if (attr('name')) semantic.name = attr('name');
+  if (attr('type')) semantic.type = attr('type');
+  if (attr('role')) semantic.role = attr('role');
+  if (attr('aria-label')) semantic.ariaLabel = attr('aria-label');
+  // 就近表单标签：Element Plus .el-form-item__label / 通用 label[for] / 前一个 label 兄弟
+  const formItem = el.closest && el.closest('.el-form-item, .filter-cell, .search-item, .form-item, label');
+  if (formItem) {
+    const lbl = formItem.querySelector('.el-form-item__label, .cell-label, .item-label, label');
+    if (lbl) semantic.fieldLabel = trim(lbl.innerText, 60);
+    else if (formItem.tagName === 'LABEL') semantic.fieldLabel = trim(formItem.innerText, 60);
+  }
+  if (!semantic.fieldLabel && el.id && !VOLATILE_ID.test(el.id)) {
+    const lab = document.querySelector(`label[for="${cssEscape(el.id)}"]`);
+    if (lab) semantic.fieldLabel = trim(lab.innerText, 60);
+  }
+  const txt = trim(el.innerText || el.textContent, 60);
+  if (txt && ['button', 'a', 'span', 'div'].includes(el.tagName.toLowerCase())) semantic.text = txt;
+  const headers = { placeholder: semantic.placeholder, fieldLabel: semantic.fieldLabel, text: semantic.text, name: semantic.name, type: semantic.type, role: semantic.role, ariaLabel: semantic.ariaLabel };
+  for (const k of Object.keys(headers)) if (headers[k] == null) delete headers[k];
+
+  return { stableSelector: stableSelector !== primarySelector ? stableSelector : null, semantic: Object.keys(headers).length ? headers : null };
+}
+
+/* ------------------------------------------------------------------ *
+ * 全视口上下文截图（dom→canvas，modern-screenshot 随运行时 vendored）
+ * ------------------------------------------------------------------ */
+
+let domshotModule = null;
+/** 懒加载 vendored 截图库：只在首次标注时才下载，不占页面首屏。 */
+async function loadDomshot(endpoint) {
+  if (domshotModule !== null) return domshotModule || null;
+  try {
+    domshotModule = await import(`${endpoint}/client/domshot.mjs`);
+  } catch {
+    domshotModule = false; // 加载失败记住失败，不为每次标注重复打 404
+  }
+  return domshotModule || null;
+}
+
+/**
+ * 全视口截图 + 目标元素高亮框。
+ * 只截元素本身看不出它在页面哪里——整页底图上画出红框位置才是
+ * 处理者要的上下文。失败（跨域资源污染画布等）静默返回 null，
+ * 截图是增强证据不是阻断点。
+ */
+export async function captureContextShot(endpoint, rect, hostId = HOST_ID) {
+  try {
+    const mod = await loadDomshot(endpoint);
+    if (!mod || !rect) return null;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const full = await mod.domToCanvas(document.documentElement, {
+      scale: 1,
+      // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）
+      filter: (node) => !(node && node.id === hostId),
+    });
+    const sx = full.width / document.documentElement.scrollWidth || 1;
+    const sy = full.height / document.documentElement.scrollHeight || 1;
+    const out = document.createElement('canvas');
+    out.width = vw;
+    out.height = vh;
+    const ctx = out.getContext('2d');
+    const offX = -Math.round(window.scrollX * sx);
+    const offY = -Math.round(window.scrollY * sy);
+    ctx.drawImage(full, offX, offY);
+    const rx = Math.round(rect.x), ry = Math.round(rect.y), rw = Math.round(rect.width), rh = Math.round(rect.height);
+    // 遮罩压暗四周、高亮元素区域（二次绘制恢复亮区再描红框）
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
+    ctx.fillRect(0, 0, vw, vh);
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(rx - 4, ry - 4, rw + 8, rh + 8);
+    ctx.clip();
+    ctx.drawImage(full, offX, offY);
+    ctx.restore();
+    ctx.strokeStyle = '#FF584D';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(rx - 4, ry - 4, rw + 8, rh + 8);
+    return out.toDataURL('image/png');
+  } catch {
+    return null;
+  }
 }
 
 /* ------------------------------------------------------------------ *
@@ -503,6 +624,8 @@ export function mountAnnotator(options = {}) {
     editingIsNew: false,
     /** 新建标注待确认的元素上下文 */
     pendingElement: null,
+    /** 点选瞬间发起、确认时可能仍在途的全视口截图（Promise<dataUrl|null>） */
+    pendingShot: null,
     /** 是否正在编辑一个手动添加的任务（无关联元素） */
     manualMode: false,
     /** 当前编辑任务的待提交图片（确认时才写入任务） */
@@ -2500,6 +2623,21 @@ export function mountAnnotator(options = {}) {
   }
 
   function finishConfirm(task) {
+    // 点选瞬间发起的全视口截图：已 resolve 就地挂入，在途则落地后补挂并
+    // 二次同步——截图是定位证据，不应阻塞用户连续标注。
+    const shot = state.pendingShot;
+    state.pendingShot = null;
+    if (shot && task && task.element) {
+      shot.then(dataUrl => {
+        if (!dataUrl) return;
+        task.images = [
+          { id: `ctx_${Date.now().toString(36)}`, name: 'context-page.png', source: 'auto-context', mimeType: 'image/png', dataUrl },
+          ...(task.images || []),
+        ].slice(0, 8); // 与服务端 MAX_IMAGES_PER_TASK 对齐，自动图不挤掉用户贴图
+        persistLocal();
+        scheduleSync();
+      });
+    }
     persistLocal();
     scheduleSync();
     renderPins();
@@ -2926,6 +3064,7 @@ export function mountAnnotator(options = {}) {
 
     const element = describeElement(target);
     const existing = findTaskBySelector(element.selector);
+    state.pendingShot = captureContextShot(config.endpoint, element.rect);
     if (existing) {
       existing.element = element;
       persistLocal();
@@ -3326,6 +3465,7 @@ export function mountAnnotator(options = {}) {
       // 手动任务的 element 为 null，直接取 .selector 会抛 TypeError，
       // 导致页面上只要有一条手动任务，api.add 就再也标不了元素。
       const existing = state.tasks.find(t => t.element?.selector === element.selector);
+      state.pendingShot = captureContextShot(config.endpoint, element.rect);
       if (existing) {
         openEditorFor(existing.id);
         return { mode: 'edit', id: existing.id };

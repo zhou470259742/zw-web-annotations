@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 export const STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'cancelled'];
 export const STATUS_SET = new Set(STATUSES);
@@ -79,7 +80,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.29.0';
+export const RUNTIME_VERSION = '0.30.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -370,6 +371,23 @@ export function createStore(workspace, options = {}) {
    * 锁只包住读—改—写临界区；异常/进程崩溃留下的锁在超时后才回收，
    * 避免一个短暂的残留文件永久阻塞任务系统。
    */
+  /**
+   * 任务创建时的 git HEAD 快照：处理者据此知道标注发生时的代码基线，
+   * 工作区被并发改动/回退后可精确复现标注现场。非 git 目录静默为空。
+   */
+  let cachedGitHead;
+  const gitHeadOf = () => {
+    if (cachedGitHead !== undefined) return cachedGitHead;
+    try {
+      cachedGitHead = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+        cwd: root, timeout: 3000, stdio: ['ignore', 'pipe', 'ignore'],
+      }).toString().trim() || null;
+    } catch {
+      cachedGitHead = null;
+    }
+    return cachedGitHead;
+  };
+
   const acquireFileLock = async () => {
     await fs.mkdir(path.dirname(lockFile), { recursive: true });
     const started = Date.now();
@@ -591,6 +609,9 @@ export function createStore(workspace, options = {}) {
 
   const completeRound = async round => {
     const summary = await roundSummary();
+    // "active" 是调用方不知道轮次号时的别名：交付的一定是服务端权威当前轮，
+    // 省掉一次 GET /execution 往返，也消除轮次号拼错时的 mismatch 噪声。
+    if (round === 'active' || round === '"active"') round = summary.activeRound;
     if (!round || summary.activeRound !== round) throw new Error('active round mismatch');
     if (!summary.complete) {
       return { action: 'blocked', round, summary, obstacles: summary.obstacles };
@@ -1018,6 +1039,19 @@ export function createStore(workspace, options = {}) {
       const existing = byId.get(incoming.id) || (incoming.element?.selector ? bySelector.get(incoming.element.selector) : null);
       if (existing) {
         if (incoming.element) existing.element = incoming.element;
+        // 图片按引用键增量合并（自动上下文截图在任务确认后异步补挂，
+        // 不合并的话文件落了盘但任务 JSON 里永远没有这条引用）。
+        if (Array.isArray(incoming.images) && incoming.images.length) {
+          const seen = new Set((existing.images || []).map(i => i.file || i.name || i.id).filter(Boolean));
+          const merged = [...(existing.images || [])];
+          for (const img of incoming.images) {
+            const key = img.file || img.name || img.id;
+            if (key && seen.has(key)) continue;
+            if (key) seen.add(key);
+            merged.push(img);
+          }
+          existing.images = merged.slice(0, MAX_IMAGES_PER_TASK);
+        }
         // 指令变更的两条路径：
         // - todo（含未领取的本批任务）：处理者还没开始，原位更新、留在本批；
         // - 非 todo（doing/review/done/blocked）：批次已冻结、当前指令对应着
@@ -1054,6 +1088,8 @@ export function createStore(workspace, options = {}) {
         const created = {
           result: null,
           ...incoming,
+          // 创建时刻的代码基线：并发改动/回退后可复现标注现场
+          meta: { ...(incoming.meta && typeof incoming.meta === 'object' ? incoming.meta : {}), gitHead: gitHeadOf() },
           instruction: typeof incoming.instruction === 'string' ? incoming.instruction : '',
           // 新任务只能从 todo 进入状态机；浏览器旧缓存或伪造请求携带的
           // doing/done/cancelled 都不能跳过领取、待验收和验收阶段。
@@ -1119,7 +1155,14 @@ export function createStore(workspace, options = {}) {
         task.completedAt = null;
         task.history.push({ at, event: 'reopened', detail: 'explicit reopen' });
       }
-      if (patch.status === 'doing') task.startedAt = task.startedAt || at;
+      if (patch.status === 'doing') {
+        task.startedAt = task.startedAt || at;
+        // 处理者归属：多 agent 并行时 doing 不再匿名，其余调用方与人工
+        // 验收都能看清这条正被谁处理（assignee 由调用方自报/请求头注入）
+        task.assignee = typeof patch.assignee === 'string' && patch.assignee.trim()
+          ? patch.assignee.trim().slice(0, 64)
+          : (patch.actor || task.assignee || null);
+      }
       // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
       if (patch.status === 'review') task.reviewAt = at;
       if (patch.status === 'done') task.completedAt = at;
@@ -1144,9 +1187,16 @@ export function createStore(workspace, options = {}) {
         }
       }
     }
-    if (typeof patch.result === 'string' && patch.result !== task.result) {
+    // result 支持字符串或结构化对象 {summary, files[], commit, evidence}：
+    // 验收方能直接拿到改动文件清单与提交号，不必从长文本里翻。
+    const isResultObject = patch.result && typeof patch.result === 'object' && !Array.isArray(patch.result);
+    if ((typeof patch.result === 'string' || isResultObject) && patch.result !== task.result) {
       task.result = patch.result;
-      task.history.push({ at, event: 'result_updated', detail: task.result });
+      task.history.push({
+        at,
+        event: 'result_updated',
+        detail: isResultObject ? (patch.result.summary || JSON.stringify(patch.result).slice(0, 500)) : task.result,
+      });
     }
     task.updatedAt = at;
     group.updatedAt = at;
@@ -1181,7 +1231,8 @@ export function createStore(workspace, options = {}) {
     if (options.actor === 'task-agent') {
       throw new Error('task-agent cannot accept tasks; main thread verification is required');
     }
-    const round = Number.isInteger(options.round) && options.round > 0 ? options.round : null;
+    let round = Number.isInteger(options.round) && options.round > 0 ? options.round : null;
+    if (options.round === 'active') round = (await roundSummary()).activeRound;
     const wanted = Array.isArray(options.ids) && options.ids.length
       ? new Set(options.ids.map(String))
       : null;

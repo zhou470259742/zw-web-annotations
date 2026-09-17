@@ -265,7 +265,7 @@ export function zwAnnotations(options = {}) {
 
           if (req.method === 'POST' && route === '/complete-round') {
             const payload = parseBody(await readBody(req));
-            const result = await getStore().completeRound(Number(payload.round));
+            const result = await getStore().completeRound(payload.round === 'active' ? 'active' : Number(payload.round));
             return sendJson(res, 200, { ok: true, ...result });
           }
 
@@ -275,7 +275,7 @@ export function zwAnnotations(options = {}) {
             const payload = parseBody(await readBody(req));
             const actor = req.headers['x-zwa-client'] === 'task-agent' ? 'task-agent' : undefined;
             const result = await getStore().acceptTasks({
-              round: payload.round == null ? null : Number(payload.round),
+              round: payload.round === 'active' ? 'active' : (payload.round == null ? null : Number(payload.round)),
               ids: Array.isArray(payload.ids) ? payload.ids : null,
               ...(actor ? { actor } : {}),
             });
@@ -285,6 +285,15 @@ export function zwAnnotations(options = {}) {
           // 源码变化时哈希变化，必然重新拉取。
           if (req.method === 'GET' && route === '/client.js') {
             const source = await clientSource();
+            res.statusCode = 200;
+            res.setHeader('content-type', 'application/javascript; charset=utf-8');
+            res.setHeader('cache-control', 'no-cache');
+            return res.end(source);
+          }
+
+          // 截图子模块：annotator 确认任务时按需 dynamic import 做全视口截图
+          if (req.method === 'GET' && route === '/client/domshot.mjs') {
+            const source = await fs.readFile(path.resolve(here, '..', 'client', 'domshot.mjs'), 'utf8');
             res.statusCode = 200;
             res.setHeader('content-type', 'application/javascript; charset=utf-8');
             res.setHeader('cache-control', 'no-cache');

@@ -10,11 +10,15 @@
  *   node scripts/cli.mjs doctor  [--root <项目目录>]            安装后自检
  *   node scripts/cli.mjs status  [--root <项目目录>]            只读版本体检（每次调用技能前先跑）
  *   node scripts/cli.mjs upgrade [--root <项目目录>] [--force]  兼容升级：替换运行时，不动任务数据
+ *   node scripts/cli.mjs tasks   [--root <项目目录>]            文件模式列出全部任务（dev server 掉线兜底）
+ *   node scripts/cli.mjs task-patch --root <项目目录> --group <组id> --task <任务id> [--status doing|review|...] [--result 文本|JSON] [--assignee 名称]
+ *                                                              文件模式直接改任务状态（dev server 掉线兜底）
  *
  * 输出统一为 JSON，方便 Agent 解析后向用户汇报。
  * 运行时位于技能自身的 scripts/runtime/，因此技能整个压缩发出去即可用。
  */
 import fs from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import path from 'node:path';
 import {
   installProject,
@@ -168,7 +172,29 @@ async function main() {
       const result = await upgradeProject(root, options);
       return { ok: true, command, ...result };
     }
-    return { ok: false, error: `未知命令：${command}`, valid: ['detect', 'inspect', 'plan', 'install', 'doctor', 'status', 'upgrade'] };
+    // ===== 任务文件直改（文件模式兜底）=====
+    // dev server 掉线时 HTTP 端点不可用，处理者仍需回写 doing/review 状态。
+    // 直接装载项目内 runtime 的 store（同一把文件锁/状态机），与线上路径
+    // 100% 同语义，绝不绕过状态机手改 JSON。
+    if (command === 'tasks' || command === 'task-patch') {
+      const storePath = path.join(root, '.zwa/runtime/core/store.mjs');
+      const mod = await import(pathToFileURL(storePath).href);
+      const store = mod.createStore(root);
+      if (command === 'tasks') {
+        const groups = await store.listGroups();
+        return { ok: true, command, groups: groups.map(g => ({ id: g.id, page: g.page?.url, tasks: g.tasks.map(t => ({ id: t.id, status: t.status, round: t.round ?? null, assignee: t.assignee ?? null, instruction: String(t.instruction || '').slice(0, 80) })) })) };
+      }
+      if (!args.group || !args.task) return { ok: false, command, error: 'task-patch 需要 --group 与 --task' };
+      const patch = { taskId: args.task };
+      if (args.status) patch.status = args.status;
+      if (args.assignee) patch.assignee = args.assignee;
+      if (args.result != null) {
+        try { patch.result = JSON.parse(args.result); } catch { patch.result = args.result; }
+      }
+      const result = await store.updateTask(args.group, patch);
+      return { ok: true, command, task: { id: result.task.id, status: result.task.status, round: result.task.round ?? null, assignee: result.task.assignee ?? null } };
+    }
+    return { ok: false, error: `未知命令：${command}`, valid: ['detect', 'inspect', 'plan', 'install', 'doctor', 'status', 'upgrade', 'tasks', 'task-patch'] };
   } catch (error) {
     return { ok: false, command, root, error: error.message };
   }

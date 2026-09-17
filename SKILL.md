@@ -28,6 +28,12 @@ description: 在当前工作区的前端项目里安装网页元素批量标注�
 
 ```bash
 node ~/.zcode/skills/zw-web-annotations/scripts/cli.mjs detect --root "$PWD"
+
+```bash
+# 0.30.0+：dev server 掉线时的文件模式任务操作（走同一把状态机与文件锁）
+node "<技能目录>/scripts/cli.mjs" tasks --root "<项目目录>"
+node "<技能目录>/scripts/cli.mjs" task-patch --root "<项目目录>" --group <组id> --task <任务id> --status doing --assignee <名字>
+```
 ```
 
 ## 第零步：版本体检（每次调用都先做，包括处理任务时）

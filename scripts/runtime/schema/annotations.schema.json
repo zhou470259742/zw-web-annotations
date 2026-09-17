@@ -170,8 +170,12 @@
         },
         "element": {
           "anyOf": [
-            { "$ref": "#/$defs/element" },
-            { "type": "null" }
+            {
+              "$ref": "#/$defs/element"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "history": {
@@ -183,8 +187,10 @@
         "result": {
           "type": [
             "string",
+            "object",
             "null"
-          ]
+          ],
+          "description": "处理回执：字符串或结构化对象 {summary, files[], commit, evidence}"
         },
         "reviewAt": {
           "type": [
@@ -203,6 +209,18 @@
         "pendingInstruction": {
           "type": "string",
           "description": "暂存的新要求：批次冻结后对非 todo 任务追加的指令，交付（complete-round）时应用为无轮次 todo 并移除本字段"
+        },
+        "assignee": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "处理者归属：进入 doing 时由调用方自报或请求头注入"
+        },
+        "meta": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "任务元数据（gitHead=创建时代码基线等）"
         }
       }
     },
@@ -334,6 +352,11 @@
             "string",
             "null"
           ]
+        },
+        "locator": {
+          "type": "object",
+          "additionalProperties": true,
+          "description": "稳定定位兜底链：{stableSelector, semantic:{placeholder,fieldLabel,text,name,type,role,ariaLabel}}"
         }
       }
     },
