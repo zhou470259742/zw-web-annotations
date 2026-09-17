@@ -1935,7 +1935,7 @@ export function mountAnnotator(options = {}) {
           openEditorFor(task.id);
           return;
         }
-        const target = resolveElement(task.element.selector);
+        const target = resolveElement(task.element);
         if (!target) {
           state.syncMessage = '该元素已不在当前页面，无法显示详情。';
           renderMessage();
@@ -1979,12 +1979,38 @@ export function mountAnnotator(options = {}) {
     });
   }
 
-  function resolveElement(selector) {
-    try {
-      return document.querySelector(selector);
-    } catch {
-      return null;
+  /**
+   * 元素解析：主 selector 优先；DOM 重建（内嵌视图切换/重渲染）后会话级
+   * el-id-* 选择器必然失效，按 0.30.0 采集的 locator 兜底链依次降级：
+   * stableSelector（无易漂移 id 的链）→ 语义签名（placeholder/fieldLabel/text）。
+   */
+  function resolveElement(selectorOrEl) {
+    const desc = typeof selectorOrEl === 'string' ? { selector: selectorOrEl } : (selectorOrEl || {});
+    const tryQ = (sel) => {
+      try { return sel ? document.querySelector(sel) : null; } catch { return null; }
+    };
+    let el = tryQ(desc.selector);
+    if (el) return el;
+    el = tryQ(desc.locator?.stableSelector);
+    if (el) return el;
+    const sem = desc.locator?.semantic;
+    if (!sem) return null;
+    // 语义兜底：placeholder 精确匹配 > 表单标签就近 > 可见文本
+    if (sem.placeholder) {
+      el = tryQ(`[placeholder="${CSS.escape(sem.placeholder)}"]`);
+      if (el) return el;
     }
+    if (sem.fieldLabel) {
+      const item = [...document.querySelectorAll('.el-form-item, .filter-cell, .search-item, .form-item')]
+        .find(i => (i.querySelector('.el-form-item__label, .cell-label, .item-label, label')?.innerText || '').trim().startsWith(sem.fieldLabel));
+      el = item?.querySelector('input, select, textarea, .el-select, button');
+      if (el) return el;
+    }
+    if (sem.text) {
+      el = [...document.querySelectorAll('button, a, span, div')].find(e => (e.innerText || '').trim() === sem.text);
+      if (el) return el;
+    }
+    return null;
   }
 
   function positionPin(pin, task) {
@@ -1993,7 +2019,7 @@ export function mountAnnotator(options = {}) {
       pin.style.display = 'none';
       return;
     }
-    const el = resolveElement(task.element.selector);
+    const el = resolveElement(task.element);
     if (!el) {
       pin.dataset.orphan = 'on';
       pin.style.display = 'none';
@@ -3324,6 +3350,13 @@ export function mountAnnotator(options = {}) {
     document.addEventListener('keydown', onKeydown, true);
     window.addEventListener('scroll', onScroll, true);
     window.addEventListener('resize', onResize, true);
+    // DOM 变化重排：SPA 内嵌视图切换/局部重渲染既不触发 scroll 也不触发
+    // resize，pin 会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
+    const domObserver = new MutationObserver(() => {
+      clearTimeout(domObserver._t);
+      domObserver._t = setTimeout(() => repositionPins(), 300);
+    });
+    domObserver.observe(document.body, { childList: true, subtree: true });
     document.addEventListener('visibilitychange', onVisibilityChange, true);
     window.addEventListener('pagehide', onPageHide, true);
 
@@ -3510,6 +3543,7 @@ export function mountAnnotator(options = {}) {
       window.removeEventListener('resize', onResize, true);
       document.removeEventListener('visibilitychange', onVisibilityChange, true);
       window.removeEventListener('pagehide', onPageHide, true);
+      domObserver.disconnect();
       document.documentElement.style.cursor = '';
       host.remove();
       delete window.__zwAnnotator;
