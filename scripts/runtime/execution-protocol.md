@@ -68,8 +68,10 @@ x-zwa-client: task-agent
 
 ## 多 agent 并行
 
-- 扇出单元是**任务文件**：一个任务文件（= 一个页面）交给一个子 agent；同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆。
+- **默认并行**：轮次任务 ≥6 项且涉及文件域互不重叠时，按文件所有权切分并行子 agent 扇出；文件有交集的归并到同一 agent（冲突域大于并行收益时仍可串行，但要在轮次开工时说明取舍理由）。
+- 扇出单元是**任务文件/文件域**：一个任务文件（= 一个页面）交给一个子 agent；同一页面内的多项任务归同一个 agent，不要按任务 ID 再拆；跨文件但共享同一源码文件（如多个报表页共用 FleetTreeSelector/positioning.ts）的任务必须归同一 agent。
 - 不同任务文件之间天然隔离，可放心并行；**不要让两个 agent 同时改同一份源码**（任务 JSON 的写并发已由服务端串行化，源码没有）。
+- **工作区物理隔离（可选增强）**：纪律防冲突之外，可用技能自带 `workspace.mjs` 给每个子 agent 开独立工作区——`node <技能>/scripts/workspace.mjs open --root <项目> --task <id>`。git 项目走 `git worktree`（本地私有分支 `zwa/ws-<id>`，不 push 远端永不可见，merge 用 `--no-ff` 显式合回、冲突显式列出）；非 git 项目自动降级为整仓快照 + 哈希清单（merge 按「主线未动才可覆盖」判定，双改文件列为冲突整体拒绝）。子 agent 在返回的 `workspace` 路径内改码与提交，任务状态回写仍走主仓接口/CLI；主线程 `merge` 合回后统一验证再 `close` 清理。工作区默认不含 node_modules（`open --link` 可软链，但 merge 有污染闸拦截软链误入分支）。
 - **验收由主线程自己做完**（打开页面看渲染 → 调 `accept-tasks` 回写 `done`），浏览器操作集中在主线程，避免多个 agent 抢占同一个标签页。子 agent 交回 `review` 就算完成它的工作，不要让它继续去做验收，也不要让用户替它点。
 
 ## 收尾：轮次与执行模式
@@ -117,6 +119,9 @@ x-zwa-client: annotator        # 主线程/人工路径；带 task-agent 会被�
 - **任务自动带全视口上下文截图**：标注确认时自动截当前视口并高亮目标元素（红色描框+四周压暗），落盘 `attachments/<taskId>-ctx_*.png`；失败静默降级不影响任务创建。
 - **`element.locator` 稳定定位兜底**：`stableSelector`（跳过 `el-id-*` 等会话级 id）+ `semantic`（placeholder/fieldLabel/text/name/role 等语义签名）。主 `selector` 失效时按 locator 找元素。
 - **`task.assignee`**：PATCH `status:doing` 可带 `assignee`（缺省取 `x-zwa-client` 头），多 agent 并行时看清归谁处理。
+- **`task.meta.ctx` 运行时尾部快照**：任务创建时刻自动附带最近 40 条网络请求行（`{t,m,u,s,ms,err?}`，URL/方法/状态码/耗时，不录 body）+ 最近 30 条控制台 error/warn 与未捕获异常（`{t,lv,text}`）。「这个查询报错」「点了没反应」类标注优先读它定位，无需再手动回放；插件自身同步与 Vite/HMR 流量已过滤。
+- **框选/多选/冻结标注**：标注模式下**点按=元素点选、按住拖拽=框选**（合并手势，位移>8px 升格框选、选区<10px 回退点选、拖拽中 Esc 取消）；框选主元素取「框内覆盖面≥50%元素的最近公共祖先」（贴合选区时），否则 IoU 最优单元素，`element.rect`=整个选区，框内元素经全量矩形相交扫描+可见性过滤入 `meta.extraElements` 上限 12，松手自动带全视口上下文截图（红框描选区）；「冻结」按钮暂停全部 CSS 动画/transition + 视频；**Shift+点击** 累积多选元素（虚线高亮，上限 12），下一次普通点击确定主元素并把集合写入 `meta.extraElements`。Esc 级联：取消拖拽中的框选→清多选→关编辑器→退标注模式。
+- **doing 锁 TTL**：`PATCH status:'doing'` 领取时服务端写 `lockUntil=now+30min`；长任务 agent 周期性同态 PATCH `status:'doing'` 续期（心跳不堆 history）；锁过期由读路径惰性清扫释放回 `todo`（history 记 `lock_expired`），环境变量 `ZWA_DOING_LOCK_TTL_MS` 可调。
 - **`task.meta.gitHead`**：任务创建时自动记录工作区 git HEAD（短 sha），标注现场的代码基线。
 - **`result` 结构化**：支持对象 `{summary, files[], commit, evidence}`。
 - **`round:"active"` 别名**：`complete-round` / `accept-tasks` 接受 `"active"` 自动解析当前轮。

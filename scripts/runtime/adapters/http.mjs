@@ -149,6 +149,21 @@ export function createAnnotationsMiddleware(options = {}) {
     }
 
     const route = pathname.slice(config.route.length) || '/';
+    // 任务附件回源：服务端落盘的图片没有 dataUrl，浏览器需经接口取回
+    if (req.method === 'GET' && route.startsWith('/files/')) {
+      const name = path.basename(decodeURIComponent(route.slice(7)));
+      if (!name || name.includes('..')) return sendJson(res, 400, { error: 'invalid file name' });
+      const file = path.join(store.attachmentsDir, name);
+      try {
+        const buf = await fs.readFile(file);
+        res.statusCode = 200;
+        res.setHeader('content-type', { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }[path.extname(name).slice(1).toLowerCase()] || 'application/octet-stream');
+        res.setHeader('cache-control', 'no-cache');
+        return res.end(buf);
+      } catch {
+        return sendJson(res, 404, { error: 'attachment not found' });
+      }
+    }
     if (req.method === 'GET' && route === '/events') {
       // SSE 实时推送：任务文件变化时通知页面立即拉取，轮询（10s）作为兜底
       ensureWatcher();

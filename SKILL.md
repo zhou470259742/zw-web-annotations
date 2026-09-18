@@ -33,8 +33,15 @@ node ~/.zcode/skills/zw-web-annotations/scripts/cli.mjs detect --root "$PWD"
 # 0.30.0+：dev server 掉线时的文件模式任务操作（走同一把状态机与文件锁）
 node "<技能目录>/scripts/cli.mjs" tasks --root "<项目目录>"
 node "<技能目录>/scripts/cli.mjs" task-patch --root "<项目目录>" --group <组id> --task <任务id> --status doing --assignee <名字>
+
+# 0.31.0+：并行子 agent 工作区隔离（git worktree / 非 git 快照双模）
+node "<技能目录>/scripts/workspace.mjs" open  --root "<项目目录>" --task <任务id>   # 建工作区 → {mode,workspace}
+node "<技能目录>/scripts/workspace.mjs" diff  --root "<项目目录>" --task <任务id>   # 预览改动与冲突
+node "<技能目录>/scripts/workspace.mjs" merge --root "<项目目录>" --task <任务id>   # 合回主线（冲突显式列出）
+node "<技能目录>/scripts/workspace.mjs" close --root "<项目目录>" --task <任务id>   # 清理（--discard 放弃未合入改动）
+node "<技能目录>/scripts/workspace.mjs" list  --root "<项目目录>"                   # 活跃工作区
 ```
-```
+工作区落在 `<项目>/.zwa/.ws/<任务id>`。git 项目用本地私有分支 `zwa/ws-<id>` 物理隔离，非 git 项目自动降级为整仓快照 + 哈希清单判定安全覆盖。子 agent 在工作区内改码，状态回写仍走主仓接口/CLI；主线程统一 merge、验证、close。
 
 ## 第零步：版本体检（每次调用都先做，包括处理任务时）
 

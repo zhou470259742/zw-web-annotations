@@ -172,3 +172,26 @@ grep -rl "zcode-annotations\|__zw\|mountAnnotator" dist/ || echo "✅ 无残留"
 
 有输出才说明出了问题，请带上输出反馈。注意 `--mode production` 之类的参数不影响这个结论，
 因为关掉它的不是环境变量而是 `apply: 'serve'`。
+
+## 13. 任务文件在磁盘上、但接口看不到/验收返回 0
+
+症状：`accept-tasks` 返回 `accepted: 0`、`/tasks` 缺组、`activeRound` 被清空、`complete-round` 报 `active round mismatch`。
+
+**先查 diagnostics**——组文件 schema 校验失败会被隔离进 diagnostics 而不是崩溃：
+
+```bash
+curl -s http://localhost:<port>/__zw-web-annotations/tasks | python3 -c "import json,sys;print(json.load(sys.stdin).get('diagnostics'))"
+# [{"kind":"corrupt-group","file":"...json","message":"invalid task history: task_xxx"}, ...]
+```
+
+**典型根因**：绕过 PATCH 接口直接改任务 JSON，且写入的 `history` 条目格式不对。
+`validateGroup` 要求每条 history 是 `{at: string, event: string}`（detail 可选）；
+写 `{ts, from, to}` 之类的自创格式会让整组被判 corrupt → 服务端完全忽略该组 →
+roundSummary 自愈逻辑随后把 `activeRound` 清成 null，队列呈现「卡住不动」。
+
+**修复**：把非法 history 条目改回 `{at, event, detail}` 格式（或删掉），接口立即恢复可见；
+之后按 `accept-tasks` → `complete-round` 正常收尾。若自愈已把 `activeRound` 清空，
+在 `execution.json` 里把 `activeRound` 写回该轮次号再调 `complete-round`（无对应 API，此属合法 SSOT 修复）。
+
+**预防**：状态回写只走 `PATCH <api-base>/<groupId>/tasks/<taskId>`（服务端串行化写入+schema 校验）；
+dev server 掉线时用 `cli.mjs task-patch`（同一把状态机与文件锁），绝不手改任务 JSON。

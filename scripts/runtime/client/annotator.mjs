@@ -58,6 +58,107 @@ const STATUS_LABELS = {
 export const PROGRESS_WEIGHTS = { dispatch: 10, dev: 70, verify: 20 };
 
 /**
+ * 运行时尾部快照（被动录制）。
+ *
+ * 创建任务时把「最近 N 条网络请求 + 控制台错误/警告尾部」作为 meta.ctx
+ * 随任务落盘——「这个查询报错」类标注自带案发现场，处理者不必手动回放
+ * 定位。只录请求行（方法/URL/状态/耗时），不录 body，避免密码等敏感内容
+ * 进任务文件；标注插件自身的同步流量、Vite HMR 通道一律过滤。
+ */
+const runtimeTail = (() => {
+  const NET_MAX = 40;
+  const LOG_MAX = 30;
+  const net = [];
+  const logs = [];
+  const trunc = (v, n) => { const s = String(v ?? ''); return s.length > n ? `${s.slice(0, n)}…` : s; };
+  const pushNet = (e) => { net.push(e); if (net.length > NET_MAX) net.splice(0, net.length - NET_MAX); };
+  const pushLog = (e) => { logs.push(e); if (logs.length > LOG_MAX) logs.splice(0, logs.length - LOG_MAX); };
+  /** 插件自身与构建工具的流量不入快照（会污染尾部把业务请求挤出去） */
+  const skipUrl = (u) => /__zw-web-annotations|\/\.zwa\/|\/@vite\/|\/@fs\/|\/node_modules\/|sockjs|vite\/client|__webpack_hmr/.test(u);
+  const argText = (a) => {
+    if (typeof a === 'string') return a;
+    if (a instanceof Error) return `${a.message}${a.stack ? ' | ' + (a.stack.split('\n')[1] || '').trim() : ''}`;
+    try { return JSON.stringify(a) ?? String(a); } catch { return String(a); }
+  };
+
+  const install = () => {
+    if (typeof window === 'undefined' || window.__zwaTailInstalled) return;
+    window.__zwaTailInstalled = true;
+
+    if (typeof window.fetch === 'function') {
+      const of = window.fetch;
+      window.fetch = function (...args) {
+        const t0 = performance.now();
+        const url = trunc(typeof args[0] === 'string' ? args[0] : args[0]?.url, 240);
+        const method = trunc(args[1]?.method || args[0]?.method || 'GET', 10);
+        return Promise.resolve(of.apply(this, args)).then((res) => {
+          if (!skipUrl(url)) pushNet({ t: new Date().toISOString(), m: method, u: url, s: res.status, ms: Math.round(performance.now() - t0) });
+          return res;
+        }).catch((err) => {
+          if (!skipUrl(url)) pushNet({ t: new Date().toISOString(), m: method, u: url, s: 0, ms: Math.round(performance.now() - t0), err: trunc(err?.message || err, 160) });
+          throw err;
+        });
+      };
+    }
+
+    const X = window.XMLHttpRequest?.prototype;
+    if (X?.open && X?.send) {
+      const origOpen = X.open;
+      const origSend = X.send;
+      X.open = function (m, u, ...rest) { this.__zwaM = trunc(m, 10); this.__zwaU = trunc(u, 240); return origOpen.call(this, m, u, ...rest); };
+      X.send = function (...args) {
+        const t0 = performance.now();
+        const rec = (s, err) => {
+          if (this.__zwaU && !skipUrl(this.__zwaU)) {
+            pushNet({ t: new Date().toISOString(), m: this.__zwaM || 'GET', u: this.__zwaU, s, ms: Math.round(performance.now() - t0), ...(err ? { err } : {}) });
+          }
+        };
+        this.addEventListener('loadend', () => rec(this.status));
+        this.addEventListener('error', () => rec(0, 'network error'));
+        this.addEventListener('timeout', () => rec(0, 'timeout'));
+        this.addEventListener('abort', () => rec(0, 'aborted'));
+        return origSend.apply(this, args);
+      };
+    }
+
+    for (const lv of ['error', 'warn']) {
+      const orig = console[lv];
+      if (typeof orig !== 'function') continue;
+      console[lv] = function (...args) {
+        try { pushLog({ t: new Date().toISOString(), lv, text: trunc(args.map(argText).join(' '), 400) }); } catch { /* 快照失败不影响原输出 */ }
+        return orig.apply(this, args);
+      };
+    }
+
+    // capture 阶段才能拿到资源加载错误（img/script/link 的 error 事件不冒泡）
+    window.addEventListener('error', (e) => {
+      const el = e.target;
+      if (el && el !== window && (el.src || el.href)) {
+        pushLog({ t: new Date().toISOString(), lv: 'error', text: `resource ${String(el.tagName || '').toLowerCase()}: ${trunc(el.src || el.href, 200)}` });
+      } else if (e.message) {
+        pushLog({ t: new Date().toISOString(), lv: 'error', text: trunc(`${e.message} @${e.filename || ''}:${e.lineno || ''}`, 400) });
+      }
+    }, true);
+    window.addEventListener('unhandledrejection', (e) => {
+      pushLog({ t: new Date().toISOString(), lv: 'error', text: `unhandledrejection: ${trunc(e.reason?.message || e.reason, 300)}` });
+    });
+  };
+
+  install();
+
+  return {
+    /** 任务创建时刻的尾部快照（拷贝数组，后续流量不回溯污染已落盘任务） */
+    snapshot() {
+      return {
+        capturedAt: new Date().toISOString(),
+        network: net.slice(),
+        console: logs.slice(),
+      };
+    },
+  };
+})();
+
+/**
  * 项目总体进度。
  *
  * 三段按「已达成该阶段的任务数 / 有效任务数」计分：
@@ -242,6 +343,7 @@ function componentTrail(el) {
   // 模型拿到「文件是 A、名字是 B」这组自相矛盾的线索。
   let ownFile = '';
   let ownName = '';
+  let ownInst = null;
   try {
     let cur = el && el.__vueParentComponent;
     let depth = 0;
@@ -251,6 +353,7 @@ function componentTrail(el) {
       if (depth === 0) {
         ownFile = file || '';
         ownName = name;
+        ownInst = cur;
       }
       if (file && !files.includes(file)) files.push(file);
       if (name && !names.includes(name)) names.push(name);
@@ -260,6 +363,27 @@ function componentTrail(el) {
   } catch {
     // 生产构建或非 Vue 环境不暴露该属性，属正常情况
   }
+  // props 浅快照：只收原始值（对象/数组记类型或长度），限前 8 键——
+  // 「这个列宽不对」类标注带着组件当时的入参，模型不必猜调用方传了什么。
+  let props = null;
+  try {
+    const p = ownInst && ownInst.props;
+    if (p) {
+      props = {};
+      for (const [k, v] of Object.entries(p).slice(0, 8)) {
+        if (v == null) props[k] = String(v);
+        else if (['string', 'number', 'boolean'].includes(typeof v)) props[k] = v;
+        else props[k] = Array.isArray(v) ? `[${v.length}]` : typeof v;
+      }
+      if (!Object.keys(props).length) props = null;
+    }
+  } catch { /* 快照失败不阻断标注 */ }
+  // 路由信息：组件实例经 appContext 拿到 $route，取不到降级 null
+  let route = null;
+  try {
+    const r = ownInst && ownInst.appContext && ownInst.appContext.config.globalProperties.$route;
+    if (r) route = { name: r.name || null, path: r.path || '' };
+  } catch { /* 同上 */ }
   return {
     // 元素真正所属的组件放最前（如 CampusBrand.vue），其后是逐级父组件
     componentFile: files[0] || '',
@@ -268,6 +392,8 @@ function componentTrail(el) {
     // 而不是拿父组件的名字顶上
     componentName: ownFile ? ownName : '',
     componentChain: names,
+    componentProps: props,
+    route,
   };
 }
 
@@ -435,6 +561,7 @@ export function describeElement(el) {
   }
 
   const compat = componentTrail(el);
+  const srcEl = el.closest && el.closest('[data-zwa-src]');
 
   return {
     tagName: el.tagName.toLowerCase(),
@@ -449,6 +576,10 @@ export function describeElement(el) {
     // 有组件来源就直接给文件，这是 Vue 项目里最有效的定位线索
     componentFile: compat.componentFile,
     componentName: compat.componentName,
+    componentProps: compat.componentProps,
+    route: compat.route,
+    // 编译期埋点（dev）：data-zwa-src="文件:行"——本元素或最近祖先的模板行
+    source: srcEl ? srcEl.getAttribute('data-zwa-src') : '',
     parentSummary: trim(el.parentElement && el.parentElement.innerText, 200),
     parentSelector: el.parentElement ? buildSelector(el.parentElement) : '',
     domSnippet: snippetOf(el, 800),
@@ -468,8 +599,8 @@ export function describeElement(el) {
   };
 }
 
-/** 生成的/易漂移的 id 特征：Element Plus 的 el-id-*、Vue scoped data-v-*、构建期哈希 id。 */
-const VOLATILE_ID = /^(el-id-|van-|v-|uid-|radix-|headlessui-)|^data-v-|__[a-z0-9]{4,}/i;
+/** 生成的/易漂移的 id 特征：Element Plus 的 el-id-*、el-table_<实例号>_*、Vue scoped data-v-*、构建期哈希 id。 */
+const VOLATILE_ID = /^(el-id-|van-|v-|uid-|radix-|headlessui-)|^data-v-|__[a-z0-9]{4,}|^el-table_\d+_/i;
 
 /**
  * 稳定定位链兜底：selector 里的 el-id-* 是会话级生成 id，换个会话必失效。
@@ -520,7 +651,9 @@ export function buildLocator(el, primarySelector) {
     if (lab) semantic.fieldLabel = trim(lab.innerText, 60);
   }
   const txt = trim(el.innerText || el.textContent, 60);
-  if (txt && ['button', 'a', 'span', 'div'].includes(el.tagName.toLowerCase())) semantic.text = txt;
+  // 文本签名白名单放宽到表格单元格/标签/标题——th.el-table_<实例>_column_*
+  // 选择器跨重挂载必失效，文本是表头唯一可靠的锚。
+  if (txt && ['button', 'a', 'span', 'div', 'th', 'td', 'label', 'li', 'p', 'h1', 'h2', 'h3', 'h4'].includes(el.tagName.toLowerCase())) semantic.text = txt;
   const headers = { placeholder: semantic.placeholder, fieldLabel: semantic.fieldLabel, text: semantic.text, name: semantic.name, type: semantic.type, role: semantic.role, ariaLabel: semantic.ariaLabel };
   for (const k of Object.keys(headers)) if (headers[k] == null) delete headers[k];
 
@@ -549,41 +682,97 @@ async function loadDomshot(endpoint) {
  * 处理者要的上下文。失败（跨域资源污染画布等）静默返回 null，
  * 截图是增强证据不是阻断点。
  */
+/**
+ * 页面快照缓存：domToCanvas 全页序列化 ~1s 是截图唯一瓶颈。
+ * 2s 内连续标注复用同一快照（页面几乎没变），二次标注近 0 延迟；
+ * 进入标注模式时预热，多数情况下用户点选时快照已就绪。
+ */
+const SHOT_CACHE_MS = 5000;
+/**
+ * 只内联这 ~90 个视觉关键 CSS 属性而非全量 ~350 个计算样式——
+ * domToCanvas 的瓶颈是 clone node 阶段逐节点内联样式（实测重页面 ~2.9s），
+ * 裁剪后整次序列化 ~0.6s（≈7×），证据图视觉保真度足够。
+ */
+const SHOT_STYLE_PROPS = ('display,position,inset,top,right,bottom,left,z-index,float,clear,' +
+  'width,height,min-width,min-height,max-width,max-height,' +
+  'margin,margin-top,margin-right,margin-bottom,margin-left,' +
+  'padding,padding-top,padding-right,padding-bottom,padding-left,box-sizing,' +
+  'border,border-width,border-style,border-color,border-radius,' +
+  'overflow,overflow-x,overflow-y,transform,transform-origin,visibility,opacity,' +
+  'color,background,background-color,background-image,background-position,background-size,background-repeat,' +
+  'font,font-family,font-size,font-weight,font-style,line-height,text-align,text-decoration,text-transform,' +
+  'letter-spacing,white-space,word-break,text-overflow,vertical-align,' +
+  'flex,flex-direction,flex-wrap,flex-grow,flex-shrink,flex-basis,' +
+  'grid-template-columns,grid-template-rows,grid-column,grid-row,' +
+  'gap,row-gap,column-gap,align-items,align-content,align-self,justify-content,justify-items,justify-self,order,' +
+  'box-shadow,outline,filter,clip-path,object-fit,object-position,aspect-ratio,' +
+  'cursor,pointer-events,user-select,list-style,content,fill,stroke,stroke-width').split(',');
+let _pageSnap = null; // { t, promise }
+export function pageSnapshot(endpoint, hostId = HOST_ID) {
+  const now = performance.now();
+  if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS) return _pageSnap.promise;
+  const promise = loadDomshot(endpoint)
+    .then(mod => (mod
+      ? mod.domToCanvas(document.documentElement, {
+        scale: 0.75,
+        includeStyleProperties: SHOT_STYLE_PROPS,
+        // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）
+        filter: node => !(node && node.id === hostId),
+      })
+      : null))
+    .catch(() => null);
+  _pageSnap = { t: now, promise };
+  return promise;
+}
+
 export async function captureContextShot(endpoint, rect, hostId = HOST_ID) {
   try {
-    const mod = await loadDomshot(endpoint);
-    if (!mod || !rect) return null;
+    if (!rect) return null;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const full = await mod.domToCanvas(document.documentElement, {
-      // 上下文图只是定位证据，0.75 采样清晰度足够且省 ~40% 栅格成本
-      scale: 0.75,
-      // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）
-      filter: (node) => !(node && node.id === hostId),
-    });
+    const full = await pageSnapshot(endpoint, hostId);
+    if (!full) return null;
     const sx = full.width / document.documentElement.scrollWidth || 1;
     const sy = full.height / document.documentElement.scrollHeight || 1;
     const out = document.createElement('canvas');
     out.width = vw;
     out.height = vh;
     const ctx = out.getContext('2d');
-    const offX = -Math.round(window.scrollX * sx);
-    const offY = -Math.round(window.scrollY * sy);
-    ctx.drawImage(full, offX, offY);
+    // 当前视口在采样图里的切片（文档坐标×采样比），铺满整个输出画布：
+    // 内容与视口严格 1:1，高亮红框按视口坐标描即精确命中；
+    // 旧写法按原尺寸画 0.75 图只占 75% 画布，红框会偏右下 1/3。
+    const srcX = Math.round(window.scrollX * sx);
+    const srcY = Math.round(window.scrollY * sy);
+    const srcW = Math.min(Math.round(vw * sx), full.width - srcX);
+    const srcH = Math.min(Math.round(vh * sy), full.height - srcY);
+    const drawView = () => ctx.drawImage(full, srcX, srcY, srcW, srcH, 0, 0, vw, vh);
+    drawView();
     const rx = Math.round(rect.x), ry = Math.round(rect.y), rw = Math.round(rect.width), rh = Math.round(rect.height);
-    // 遮罩压暗四周、高亮元素区域（二次绘制恢复亮区再描红框）
+    // 遮罩压暗四周、亮区只重绘红框那一小条（不整幅二次绘制）
     ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
     ctx.fillRect(0, 0, vw, vh);
-    ctx.save();
-    ctx.beginPath();
-    ctx.rect(rx - 4, ry - 4, rw + 8, rh + 8);
-    ctx.clip();
-    ctx.drawImage(full, offX, offY);
-    ctx.restore();
+    ctx.drawImage(
+      full,
+      srcX + (rx - 4) * sx, srcY + (ry - 4) * sy,
+      (rw + 8) * sx, (rh + 8) * sy,
+      rx - 4, ry - 4, rw + 8, rh + 8,
+    );
     ctx.strokeStyle = '#FF584D';
     ctx.lineWidth = 3;
     ctx.strokeRect(rx - 4, ry - 4, rw + 8, rh + 8);
-    return out.toDataURL('image/png');
+    // 双图策略（读图才耗 token）：
+    //   ctx  = 目标 + 周边 ~480px 语境的裁剪图，挂 images[] 做默认证据
+    //          （~300 token/次，全视口 ~1300 的零头）；
+    //   full = 全视口，走 meta.fullShot 独立通道落盘备查——不占 images，
+    //          处理者需要页面全局语境时按路径取，不读零成本。
+    const PAD = 240;
+    const cx = Math.max(0, rx - PAD), cy = Math.max(0, ry - PAD);
+    const cw = Math.min(vw - cx, rw + PAD * 2), ch = Math.min(vh - cy, rh + PAD * 2);
+    const crop = document.createElement('canvas');
+    crop.width = cw;
+    crop.height = ch;
+    crop.getContext('2d').drawImage(out, cx, cy, cw, ch, 0, 0, cw, ch);
+    return { ctx: crop.toDataURL('image/png'), full: out.toDataURL('image/png') };
   } catch {
     return null;
   }
@@ -659,6 +848,24 @@ export function mountAnnotator(options = {}) {
     manualMode: false,
     /** 当前编辑任务的待提交图片（确认时才写入任务） */
     pendingImages: [],
+    /** 待定拖拽：mousedown 即记录起点，位移超阈值升格为框选（点按不移动=点选） */
+    marquee: null,
+    /** 框选松手后吞掉紧随的 click（避免同一动作又触发一次元素点选） */
+    suppressClick: false,
+    /** 胶囊拖拽松手后吞掉紧随的 click（避免拖动又触发按钮动作） */
+    suppressUiClick: false,
+    /** 胶囊最后一次实测矩形（面板展开、胶囊隐藏时锚定面板用） */
+    lastDockRect: null,
+    /** 胶囊布局：{x,y,side:'left'|'right'|null,pinned}，localStorage 持久化 */
+    dockLayout: loadDockLayout(),
+    /** Shift+点击累积的多选元素上下文（合并进下一任务的 meta.extraElements） */
+    multiPick: [],
+    /** 待合并进新任务 meta 的附加上下文（region/extraElements） */
+    pendingMeta: null,
+    /** 动画/视频冻结状态（捕捉动画瞬态标注） */
+    frozen: false,
+    _frozenVideos: [],
+    _freezeStyle: null,
     /** 详情区当前展示的元素信息 */
     detailsElement: null,
     syncState: 'idle',
@@ -794,6 +1001,26 @@ export function mountAnnotator(options = {}) {
     <div class="editor-images hidden" data-el="editorImages"></div>
   `;
 
+  // 框选取样框与多选标记层（Shift+点击累积的元素高亮）
+  const marqueeEl = document.createElement('div');
+  marqueeEl.className = 'marquee hidden';
+  const marqueeLabel = document.createElement('div');
+  marqueeLabel.className = 'marquee-label';
+  marqueeEl.append(marqueeLabel);
+  const pickmarks = document.createElement('div');
+  pickmarks.className = 'pickmarks';
+
+  // 图片预览灯箱：列表/编辑器里的缩略图点击后整屏查看
+  const viewer = document.createElement('div');
+  viewer.className = 'viewer hidden';
+  viewer.innerHTML = '<img alt="预览">';
+  viewer.addEventListener('click', () => viewer.classList.add('hidden'));
+  const showViewer = src => {
+    if (!src) return;
+    viewer.querySelector('img').src = src;
+    viewer.classList.remove('hidden');
+  };
+
   // 图钉层
   const pins = document.createElement('div');
   pins.className = 'pins';
@@ -810,6 +1037,11 @@ export function mountAnnotator(options = {}) {
   bar.className = 'bar';
   bar.innerHTML = `
     <div class="dock" data-el="dock">
+      <span class="dock-edge-tab" data-el="edgeTab" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="15 6 9 12 15 18"></polyline>
+        </svg>
+      </span>
       <button type="button" class="dock-btn" data-act="toggle" data-el="dockToggle" title="开启/关闭标注模式 (Esc)">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
           <path d="M4 20h4L20 8a2.8 2.8 0 1 0-4-4L4 16v4z"></path>
@@ -833,20 +1065,22 @@ export function mountAnnotator(options = {}) {
            这里做成悬停浮出，收起状态下也能一步完成。面板里的同名按钮保留，
            键盘用户与需要看清文字的场景仍走面板。 -->
       <div class="dock-float" data-el="dockFloat">
-        <button type="button" class="dock-float-btn" data-act="manual" title="手动添加任务">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
-            <line x1="12" y1="5" x2="12" y2="19"></line>
-            <line x1="5" y1="12" x2="19" y2="12"></line>
-          </svg>
-          <span>手动</span>
-        </button>
-        <button type="button" class="dock-float-btn" data-act="copy" title="复制提示词">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
-            <rect x="9" y="9" width="11" height="11" rx="2.5"></rect>
-            <path d="M6.5 15H5.5A1.5 1.5 0 0 1 4 13.5v-8A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5v1"></path>
-          </svg>
-          <span>复制</span>
-        </button>
+        <div class="dock-float-row">
+          <button type="button" class="dock-float-btn" data-act="manual" title="手动添加任务">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+            <span>手动</span>
+          </button>
+          <button type="button" class="dock-float-btn" data-act="copy" title="复制提示词">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="9" y="9" width="11" height="11" rx="2.5"></rect>
+              <path d="M6.5 15H5.5A1.5 1.5 0 0 1 4 13.5v-8A1.5 1.5 0 0 1 5.5 4h8A1.5 1.5 0 0 1 15 5.5v1"></path>
+            </svg>
+            <span>复制</span>
+          </button>
+        </div>
       </div>
       <!-- 收起态的进度条：展开面板时刻意不显示（面板顶部已有完整的一根，
            两处同时出现是重复信息）。全部任务验收完成后自动消失。 -->
@@ -872,6 +1106,7 @@ export function mountAnnotator(options = {}) {
       <div class="panel-tools">
         <button type="button" data-act="toggle" data-el="toggleBtn" title="进入/退出标注模式">标注</button>
         <button type="button" data-act="manual" title="手动添加任务">手动</button>
+        <button type="button" data-act="freeze" title="冻结页面动画与视频（捕捉动画/闪烁瞬态），再点恢复">冻结</button>
         <button type="button" class="primary" data-act="copy" title="复制处理提示词">复制提示词</button>
         <button type="button" class="ghost-danger push-right" data-act="clear" title="清空全部标注">清空</button>
       </div>
@@ -952,7 +1187,7 @@ export function mountAnnotator(options = {}) {
     </div>
   `;
 
-  shadow.append(outline, sizeBadge, veil, spotlight, pins, clickShield, editor, confirmBox, manualCopy, bar, toast);
+  shadow.append(outline, sizeBadge, veil, spotlight, marqueeEl, pickmarks, pins, clickShield, editor, confirmBox, manualCopy, bar, toast, viewer);
 
   const $ = sel => shadow.querySelector(sel);
   const $$ = sel => Array.from(shadow.querySelectorAll(sel));
@@ -968,11 +1203,16 @@ export function mountAnnotator(options = {}) {
       const reduced = state.tasks.map(task => ({
         ...task,
         images: Array.isArray(task.images) ? task.images.map(({ dataUrl, ...image }) => image) : task.images,
+        // meta.fullShot 同款剥离：磁盘副本不带二进制，内存原样保留待同步
+        meta: task.meta?.fullShot?.dataUrl ? { ...task.meta, fullShot: { file: task.meta.fullShot.file } } : task.meta,
       }));
       try {
         localStorage.setItem(storageKey, JSON.stringify({ tasks: reduced, outbox: state.outbox }));
-        state.tasks = reduced;
-        state.syncMessage = '本地空间不足，已保留文字标注；图片将在同步后恢复。';
+        // 剥离只作用于 localStorage 磁盘副本，绝不能回写 state.tasks——
+        // 内存里的 dataUrl 一旦丢掉，后续同步推给服务端的就是
+        // 既无 dataUrl 也无 file 的空壳，ctx 截图永久丢失（已踩过）。
+        // 服务端存图成功后会以 file 路径回写，重启后从远端恢复。
+        state.syncMessage = '本地空间不足，标注保留在内存中，同步后自动恢复。';
       } catch {
         // 内存仍保留任务；outbox 不清空，后续服务恢复/用户重试时仍可同步。
         state.syncMessage = '本地空间不足，标注保留在当前页面，请尽快同步。';
@@ -1658,8 +1898,8 @@ export function mountAnnotator(options = {}) {
 
   function renderMessage() {
     const text = activeMessage() || (state.active
-      ? '点击页面元素即可就地输入要求。'
-      : '点击“标注”后，在页面上点选元素。');
+      ? '点按选元素、按住拖拽框选区域。'
+      : '点击“标注”后，在页面上点选元素或拖拽框选。');
     const msgEl = $('[data-el="msg"]');
     msgEl.textContent = text;
     // 提示行单行省略显示，完整文案靠悬停 title 兜底
@@ -1738,7 +1978,11 @@ export function mountAnnotator(options = {}) {
       ? (task.images || []).length
         ? `${task.images.length} 张图片`
         : '无关联元素'
-      : `${truncate(task.element.selector, 40)} · ${task.element.rect.width}×${task.element.rect.height}`;
+      : (() => {
+          // 源码定位优先：File.vue:行 比生成的 el-table_15_column_* 更可读
+          const src = task.element.source ? ` ${task.element.source.split(/[/\\]/).slice(-2).join('/')}` : '';
+          return `${src}${src ? ' · ' : ''}${truncate(task.element.selector, 40)} · ${task.element.rect.width}×${task.element.rect.height}`;
+        })();
     // 面板编辑规则（收敛为一条）：**只有 todo 可直接改当前指令**。
     // 非 todo（doing/review/done/blocked）的列表输入框一律只读——它们的当前
     // 指令对应着在途工作或已验收的结论，随手一改会作废它。要提交新要求，
@@ -1762,7 +2006,7 @@ export function mountAnnotator(options = {}) {
     const pending = typeof task.pendingInstruction === 'string' && task.pendingInstruction.trim();
     const thumbs = (task.images || []).length
       ? `<div class="item-thumbs">${task.images
-          .map(img => (img.dataUrl ? `<img src="${escapeHtml(img.dataUrl)}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`))
+          .map(img => { const src = imageSrc(img, config.endpoint); return src ? `<img src="${escapeHtml(src)}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`; })
           .join('')}</div>`
       : '';
     const readonlyAttr = readonly ? ' readonly' : '';
@@ -2023,21 +2267,37 @@ export function mountAnnotator(options = {}) {
     el = tryQ(desc.locator?.stableSelector);
     if (el) return el;
     const sem = desc.locator?.semantic;
-    if (!sem) return null;
-    // 语义兜底：placeholder 精确匹配 > 表单标签就近 > 可见文本
-    if (sem.placeholder) {
-      el = tryQ(`[placeholder="${CSS.escape(sem.placeholder)}"]`);
+    if (sem) {
+      // 语义兜底：placeholder 精确匹配 > 表单标签就近 > 可见文本
+      if (sem.placeholder) {
+        el = tryQ(`[placeholder="${CSS.escape(sem.placeholder)}"]`);
+        if (el) return el;
+      }
+      if (sem.fieldLabel) {
+        const item = [...document.querySelectorAll('.el-form-item, .filter-cell, .search-item, .form-item')]
+          .find(i => (i.querySelector('.el-form-item__label, .cell-label, .item-label, label')?.innerText || '').trim().startsWith(sem.fieldLabel));
+        el = item?.querySelector('input, select, textarea, .el-select, button');
+        if (el) return el;
+      }
+      if (sem.text) {
+        el = [...document.querySelectorAll('button, a, span, div, th, td, label, li, p, h1, h2, h3, h4')].find(e => (e.innerText || '').trim() === sem.text);
+        if (el) return el;
+      }
+    }
+    // 末级兜底（不依赖 locator.semantic——老任务该字段为 null 也能走）：
+    // ① tagName + 顶层 text 精确匹配；② xpath 结构路径 + tagName 校验
+    // （防结构偏移后钉到错误元素——钉错比不钉更误导）。
+    const tag = desc.tagName;
+    const txt = trim(desc.text, 60);
+    if (tag && txt) {
+      el = [...document.querySelectorAll(tag)].find(e => (e.innerText || '').trim().slice(0, 60) === txt);
       if (el) return el;
     }
-    if (sem.fieldLabel) {
-      const item = [...document.querySelectorAll('.el-form-item, .filter-cell, .search-item, .form-item')]
-        .find(i => (i.querySelector('.el-form-item__label, .cell-label, .item-label, label')?.innerText || '').trim().startsWith(sem.fieldLabel));
-      el = item?.querySelector('input, select, textarea, .el-select, button');
-      if (el) return el;
-    }
-    if (sem.text) {
-      el = [...document.querySelectorAll('button, a, span, div')].find(e => (e.innerText || '').trim() === sem.text);
-      if (el) return el;
+    if (desc.xpath && tag) {
+      try {
+        el = document.evaluate(desc.xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+        if (el && el.tagName && el.tagName.toLowerCase() === tag) return el;
+      } catch { /* xpath 求值失败按未命中处理 */ }
     }
     return null;
   }
@@ -2072,6 +2332,17 @@ export function mountAnnotator(options = {}) {
       const task = findTask(pin.dataset.pin);
       if (task) positionPin(pin, task);
     });
+    renderPickmarks(); // 多选高亮随图钉一起重排
+    // 编辑器开着时补定位：打开瞬间目标元素可能尚未重建（视图切换竞态），
+    // 弹窗落到了「未命中回退位（贴胶囊）」；元素就绪后搬回元素旁。
+    // 已对齐（left≈rect.left）则不动，且 focus:false——不抢光标打断输入。
+    if (isEditing()) {
+      const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
+      const target = elDesc ? resolveElement(elDesc) : null;
+      if (target && Math.abs(editor.getBoundingClientRect().left - target.getBoundingClientRect().left) > 24) {
+        placeEditor(elDesc, $('[data-el="editorInput"]'), { focus: false });
+      }
+    }
   }
 
   function flashPin(taskId, on) {
@@ -2123,6 +2394,22 @@ export function mountAnnotator(options = {}) {
         '组件',
         `<code title="${escapeHtml(element.componentFile)}">${escapeHtml(short)}</code>` +
           (element.componentName ? ` <span class="dim">${escapeHtml(element.componentName)}</span>` : ''),
+      ]);
+    }
+    // 源码行级定位（dev 埋点）：File.vue:行号 + 一键在编辑器中打开
+    if (element.source) {
+      const [file, line] = String(element.source).split(/:(\d+)$/).filter(Boolean);
+      const shortFile = String(file || element.source).split(/[/\\]/).slice(-2).join('/');
+      rows.push([
+        '源码',
+        `<code title="${escapeHtml(element.source)}">${escapeHtml(shortFile)}${line ? `:${line}` : ''}</code>` +
+          ` <a class="src-open" href="${config.endpoint}/open?file=${encodeURIComponent(element.source)}" target="_blank" rel="noopener">打开源码</a>`,
+      ]);
+    }
+    if (element.componentProps && Object.keys(element.componentProps).length) {
+      rows.push([
+        'Props',
+        Object.entries(element.componentProps).map(([k, v]) => `<code>${escapeHtml(k)}</code><span class="dim">=${escapeHtml(truncate(String(v), 24))}</span>`).join(' '),
       ]);
     }
     const attrs = element.attributes && typeof element.attributes === 'object' ? Object.entries(element.attributes) : [];
@@ -2207,8 +2494,8 @@ export function mountAnnotator(options = {}) {
     toggle?.setAttribute('data-open', next ? 'on' : 'off');
     if (next) {
       // 展开详情时按内容重新测量弹窗位置，避免遮挡目标元素
-      const sel = state.editingId ? findTask(state.editingId)?.element?.selector : state.pendingElement?.selector;
-      placeEditor(sel || null, $('[data-el="editorInput"]'));
+      const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
+      placeEditor(elDesc, $('[data-el="editorInput"]'));
     } else if (state.manualMode) {
       // 手动任务贴着面板上方定位，位置由弹窗高度算出；收起详情后若不安置一次，
       // 弹窗会停用展开时的高度，与面板之间空出一块。元素任务锚定在元素旁，
@@ -2311,7 +2598,7 @@ export function mountAnnotator(options = {}) {
       .map(
         image => `
       <div class="thumb" data-thumb="${image.id}">
-        <img src="${escapeHtml(image.dataUrl)}" alt="${escapeHtml(image.name)}">
+        <img src="${escapeHtml(imageSrc(image, config.endpoint))}" alt="${escapeHtml(image.name)}">
         <span class="thumb-size">${image.width ? `${image.width}×${image.height}` : ''}</span>
         <button type="button" class="link danger" data-drop-image="${image.id}" title="移除">✕</button>
       </div>`,
@@ -2376,7 +2663,7 @@ export function mountAnnotator(options = {}) {
     syncEditorInput();
     fillDetails(task.element || null);
     toggleDetails(!!options.expandDetails);
-    placeEditor(task.element?.selector, input);
+    placeEditor(task.element, input);
     renderList();
   }
 
@@ -2396,7 +2683,7 @@ export function mountAnnotator(options = {}) {
     syncEditorInput();
     fillDetails(element);
     toggleDetails(false);
-    placeEditor(element.selector, input);
+    placeEditor(element, input);
   }
 
   /** 打开手动任务编辑器：不关联页面元素，可粘贴图片。 */
@@ -2462,8 +2749,15 @@ export function mountAnnotator(options = {}) {
       const selector = focusSelectorForEditor();
       return selector ? resolveElement(selector) : null;
     })();
-    if (el) {
-      const rect = el.getBoundingClientRect();
+    // 框选任务的高亮按用户实际画出的区域（meta.region），不只亮主元素：
+    // 框住一组控件时聚光孔要罩住整组，而不是其中一个零件
+    const metaRegion = state.editingId
+      ? findTask(state.editingId)?.meta?.region
+      : state.pendingMeta?.region;
+    if (el || metaRegion) {
+      const rect = metaRegion
+        ? { left: metaRegion.x, top: metaRegion.y, width: metaRegion.width, height: metaRegion.height }
+        : el.getBoundingClientRect();
       const pad = 5;
       // 0 尺寸（元素被隐藏/移除）没有可高亮的区域，退回纯遮罩
       if (rect.width > 0 && rect.height > 0) {
@@ -2501,7 +2795,7 @@ export function mountAnnotator(options = {}) {
     return Number.isFinite(top) && top > 0 ? top : null;
   }
 
-  function placeEditor(selector, input) {
+  function placeEditor(selector, input, opts = {}) {
     editor.classList.remove('hidden');
     // 弹窗隐藏时 scrollHeight 恒为 0，openEditor* 在取消隐藏前调用的
     // syncEditorInput 会把输入条高度算成 0（首开 16px、二开 37px，
@@ -2553,7 +2847,8 @@ export function mountAnnotator(options = {}) {
         // 面板已收起：编辑器要落在胶囊与悬浮按钮之上，否则会压住刚点的
         // 「手动/复制」按钮（收起态下这两个按钮正在悬停显示，被盖住会显得点不动）。
         // 悬浮层隐藏时仍有布局几何，可直接测量，无需关心当前是否悬停。
-        left = vw - width - 18;
+        // 胶囊可拖拽换位：编辑器右缘对齐胶囊右缘，不再写死右下角。
+        left = clampNum(bar.getBoundingClientRect().right - width, GAP, vw - width - GAP);
         const clusterTop = editorClusterTop();
         top = (clusterTop ?? vh - 72) - height - GAP;
       }
@@ -2566,6 +2861,8 @@ export function mountAnnotator(options = {}) {
     editor.style.top = `${top}px`;
     updateFocusFx();
     setTimeout(() => {
+      // focus:false 用于 DOM 稳定后的补定位——不打断正在进行的输入
+      if (opts.focus === false) return;
       input.focus();
       // 光标放到末尾，便于继续编辑已有内容
       const len = input.value.length;
@@ -2584,6 +2881,7 @@ export function mountAnnotator(options = {}) {
     state.manualMode = false;
     state.pendingElement = null;
     state.pendingImages = [];
+    state.pendingMeta = null;
     $('[data-el="editorInput"]').value = '';
     updateFocusFx();
     renderEditorImages();
@@ -2683,12 +2981,15 @@ export function mountAnnotator(options = {}) {
     const shot = state.pendingShot;
     state.pendingShot = null;
     if (shot && task && task.element) {
-      shot.then(dataUrl => {
-        if (!dataUrl) return;
+      shot.then(pair => {
+        if (!pair || !pair.ctx) return;
+        // images[] 只挂裁剪图（默认证据，~300 token）；全视口走
+        // meta.fullShot 独立通道落盘备查，不占默认读图负载。
         task.images = [
-          { id: `ctx_${Date.now().toString(36)}`, name: 'context-page.png', source: 'auto-context', mimeType: 'image/png', dataUrl },
+          { id: `ctx_${Date.now().toString(36)}`, name: 'context.png', source: 'auto-context', mimeType: 'image/png', dataUrl: pair.ctx },
           ...(task.images || []),
         ].slice(0, 8); // 与服务端 MAX_IMAGES_PER_TASK 对齐，自动图不挤掉用户贴图
+        if (pair.full) task.meta = { ...(task.meta || {}), fullShot: { dataUrl: pair.full } };
         persistLocal();
         scheduleSync();
       });
@@ -2698,6 +2999,8 @@ export function mountAnnotator(options = {}) {
     renderPins();
     renderList();
     renderMessage();
+    // 暖下一张快照：连续标注时 2s 内复用，二次截图近 0 延迟
+    pageSnapshot(config.endpoint);
     // 关闭弹窗但保持标注模式，方便连续点选
     editor.classList.add('hidden');
     state.editingId = null;
@@ -2744,6 +3047,8 @@ export function mountAnnotator(options = {}) {
       completedAt: null,
       element: null,
       images: images || [],
+      // 创建时刻的运行时尾部快照：最近的网络请求与控制台错误，随任务落盘
+      meta: { ctx: runtimeTail.snapshot(), ...consumePendingMeta() },
       history: [{ at, event: 'created', detail: 'manual task' }],
       result: null,
     };
@@ -2764,6 +3069,8 @@ export function mountAnnotator(options = {}) {
       completedAt: null,
       element,
       images: images || [],
+      // 创建时刻的运行时尾部快照：最近的网络请求与控制台错误，随任务落盘
+      meta: { ctx: runtimeTail.snapshot(), ...consumePendingMeta() },
       history: [{ at, event: 'created', detail: 'picked in page' }],
       result: null,
     };
@@ -3030,7 +3337,224 @@ export function mountAnnotator(options = {}) {
     return target === host || host.contains(target);
   }
 
+  /* ---------------- 框选 / 多选 / 动画冻结 ---------------- */
+
+  /** 点按→框选的位移阈值：超过才算拖拽，之下保持点选语义 */
+  const DRAG_THRESHOLD = 8;
+  /** 框选最小有效尺寸：拖出又拖回、选区过小 → 回退为点选 */
+  const MIN_REGION = 10;
+
+  function setFrozen(next) {
+    state.frozen = next;
+    if (next) {
+      if (!state._freezeStyle) {
+        const s = document.createElement('style');
+        s.textContent = '*,*::before,*::after{animation-play-state:paused!important;transition:none!important}';
+        state._freezeStyle = s;
+      }
+      if (!state._freezeStyle.isConnected) document.head.append(state._freezeStyle);
+      state._frozenVideos = [...document.querySelectorAll('video')].filter(v => !v.paused && !v.ended);
+      state._frozenVideos.forEach(v => { try { v.pause(); } catch { /* 忽略 */ } });
+    } else {
+      state._freezeStyle?.remove();
+      (state._frozenVideos || []).forEach(v => { try { v.play().catch(() => {}); } catch { /* 忽略 */ } });
+      state._frozenVideos = [];
+    }
+    const btn = shadow.querySelector('[data-act="freeze"]');
+    if (btn) btn.dataset.active = next ? 'on' : 'off';
+    state.syncMessage = next
+      ? '已冻结页面动画与视频（用于捕捉动画/闪烁瞬态），再点恢复。'
+      : '已恢复动画播放。';
+    renderMessage();
+  }
+
+  /** 多选标记高亮：跟随 repositionPins 刷新（滚动/重排时贴住元素） */
+  function renderPickmarks() {
+    pickmarks.innerHTML = '';
+    for (const el of state.multiPick) {
+      const node = resolveElement(el.selector);
+      if (!node) continue;
+      const r = node.getBoundingClientRect();
+      const mark = document.createElement('div');
+      mark.className = 'pickmark';
+      Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+      pickmarks.append(mark);
+    }
+  }
+
+  function clearMultiPick() {
+    state.multiPick = [];
+    renderPickmarks();
+  }
+
+  /** 取走待合并 meta（region/extraElements），同时清空——消费语义，不污染下一任务 */
+  function consumePendingMeta() {
+    const m = state.pendingMeta;
+    state.pendingMeta = null;
+    return m && Object.keys(m).length ? m : {};
+  }
+
+  /**
+   * 元素在该点是否「用户实际可见」：该点栈顶（首个非自身 UI 的元素）
+   * 必须等于它或落在它内部——被弹层/遮罩盖住时栈顶是无关元素，判不可见。
+   */
+  function isTopmostVisible(el, x, y) {
+    const stack = document.elementsFromPoint(x, y) || [];
+    const top = stack.find(s => s.nodeType === 1 && !isOwnUi(s));
+    return !!top && (top === el || el.contains(top));
+  }
+
+  /**
+   * 全量矩形相交扫描：一次性遍历 DOM，收集与选区相交且有可见部分的元素。
+   * 相比网格点采样——零漏网，且对被部分遮住的元素按「可见比例」如实裁剪；
+   * 只在 mouseup 跑一次（约 30~60ms / 万级节点），不在拖拽路径上。
+   * 可见性按 2×2 采样验证：任一采样点栈顶落在候选内部即算可见。
+   */
+  function collectRegionCandidates(rect) {
+    const regionArea = rect.width * rect.height;
+    const candidates = [];
+    const walk = parent => {
+      for (const el of parent.children) {
+        if (el.nodeType !== 1 || isOwnUi(el) || el === document.documentElement || el === document.body) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) {
+          const interW = Math.min(rect.x + rect.width, r.right) - Math.max(rect.x, r.left);
+          const interH = Math.min(rect.y + rect.height, r.bottom) - Math.max(rect.y, r.top);
+          if (interW > 0 && interH > 0) {
+            const inter = interW * interH;
+            const union = regionArea + r.width * r.height - inter;
+            // 可见性验证：取相交区中心 + 三分点，任一点栈顶落在元素内即可见
+            const ix = Math.max(rect.x, r.left);
+            const iy = Math.max(rect.y, r.top);
+            const pts = [
+              [ix + interW / 2, iy + interH / 2],
+              [ix + interW / 4, iy + interH / 4],
+              [ix + (interW * 3) / 4, iy + (interH * 3) / 4],
+            ];
+            if (pts.some(([px, py]) => isTopmostVisible(el, px, py))) {
+              candidates.push({ el, inter, iou: union > 0 ? inter / union : 0, area: r.width * r.height });
+            }
+          }
+        }
+        walk(el); // 不可剪枝：overflow/absolute 子元素可能越出父矩形
+      }
+    };
+    walk(document.body);
+    return candidates;
+  }
+
+  /** 拖拽中的轻量估计：粗网格采样去重计数（不跑 describeElement），150ms 节流刷新徽标。 */
+  function estimateRegionCount(rect) {
+    const cols = Math.min(6, Math.max(2, Math.floor(rect.width / 60)));
+    const rows = Math.min(6, Math.max(2, Math.floor(rect.height / 60)));
+    const seen = new Set();
+    for (let i = 0; i <= cols; i++) {
+      for (let j = 0; j <= rows; j++) {
+        const stack = document.elementsFromPoint(rect.x + (rect.width * i) / cols, rect.y + (rect.height * j) / rows) || [];
+        const top = stack.find(s => s.nodeType === 1 && !isOwnUi(s) && s !== document.documentElement && s !== document.body);
+        if (top) seen.add(top);
+      }
+    }
+    return seen.size;
+  }
+
+  /**
+   * 框选收尾。
+   * 候选：全量矩形相交扫描（零漏网）+ 可见性过滤（被遮罩盖死的不收）。
+   * 主元素：IoU 几何匹配——「与选区形状最接近」的元素（框按钮得按钮、
+   * 框表格得表格），IoU<0.05（基本框在空白）退回中心点兜底。
+   * 其余按相交面积降序进 meta.extraElements（上限 12，selector 去重）。
+   */
+  function pickRegion(rect) {
+    const region = {
+      x: Math.round(rect.x), y: Math.round(rect.y),
+      width: Math.round(rect.width), height: Math.round(rect.height),
+    };
+    const candidates = collectRegionCandidates(rect);
+    candidates.sort((a, b) => b.iou - a.iou || b.inter - a.inter);
+    // 最近公共祖先：覆盖面 ≥50% 的候选若 ≥2 个，主元素优先取它们的 LCA——
+    // 用户框住「一组控件」时想要的是共同容器（表单项行/卡片），不是某个零件。
+    // 但祖先自身须基本填满选区（≥50%），过大说明框的是大容器里的零散零件，
+    // 此时退回 IoU 最大的单个元素。
+    const covered = candidates.filter(c => c.area > 0 && c.inter / c.area >= 0.5);
+    let lcaEl = null;
+    if (covered.length >= 2) {
+      let lca = covered[0].el;
+      while (lca && lca !== document.body && !covered.every(c => lca === c.el || lca.contains(c.el))) {
+        lca = lca.parentElement;
+      }
+      if (lca && lca !== document.body && lca !== document.documentElement && !isOwnUi(lca)) {
+        const lr = lca.getBoundingClientRect();
+        const iw = Math.min(rect.x + rect.width, lr.right) - Math.max(rect.x, lr.left);
+        const ih = Math.min(rect.y + rect.height, lr.bottom) - Math.max(rect.y, lr.top);
+        if (iw * ih >= rect.width * rect.height * 0.5) lcaEl = lca;
+      }
+    }
+    let primaryEl = lcaEl || (candidates.length && candidates[0].iou >= 0.05 ? candidates[0].el : null);
+    if (!primaryEl) {
+      const centerEl = document.elementFromPoint(
+        Math.round(rect.x + rect.width / 2),
+        Math.round(rect.y + rect.height / 2),
+      );
+      if (centerEl && centerEl.nodeType === 1 && !isOwnUi(centerEl)) primaryEl = centerEl;
+    }
+    const element = primaryEl ? describeElement(primaryEl) : null;
+    if (element) element.rect = { ...region };
+    const seenSel = new Set(element ? [element.selector] : []);
+    const extras = [];
+    for (const c of [...candidates].sort((a, b) => b.inter - a.inter)) {
+      if (c.el === primaryEl) continue;
+      const d = describeElement(c.el);
+      if (seenSel.has(d.selector)) continue;
+      seenSel.add(d.selector);
+      extras.push(d);
+      if (extras.length >= 12) break;
+    }
+    state.pendingMeta = { region, extraElements: extras };
+    // 与点选一致：松手即发起全视口上下文截图，按框选区域高亮
+    state.pendingShot = new Promise(res =>
+      setTimeout(() => captureContextShot(config.endpoint, region).then(res), 0)
+    );
+    if (element) {
+      const existing = findTaskBySelector(element.selector);
+      if (existing) {
+        existing.element = element;
+        existing.meta = { ...(existing.meta || {}), ...consumePendingMeta() };
+        persistLocal();
+        openEditorFor(existing.id);
+        return;
+      }
+      state.pendingElement = element;
+      openEditorForNew(element);
+    } else {
+      // 选区中心是空白：退化为手动任务，区域与采样仍在 meta 里
+      openEditorForManual();
+    }
+  }
+
   function onMove(event) {
+    // 待定拖拽：位移未超阈值时仍按点选处理（继续 hover 高亮，不显示选框）；
+    // 超过阈值升格为框选——只更新选框与计数徽标，不再弹悬停高亮
+    const m = state.marquee;
+    if (m) {
+      const dx = event.clientX - m.x0;
+      const dy = event.clientY - m.y0;
+      if (!m.moved && Math.max(Math.abs(dx), Math.abs(dy)) > DRAG_THRESHOLD) m.moved = true;
+      if (m.moved) {
+        const x = Math.min(m.x0, event.clientX);
+        const y = Math.min(m.y0, event.clientY);
+        const w = Math.abs(dx);
+        const h = Math.abs(dy);
+        marqueeEl.classList.remove('hidden');
+        Object.assign(marqueeEl.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` });
+        // 拖拽中节流显示框内元素数，松手前即知覆盖量
+        if (!m._t || performance.now() - m._t > 150) {
+          m._t = performance.now();
+          marqueeLabel.textContent = `≈${estimateRegionCount({ x, y, width: w, height: h })} 个元素`;
+        }
+        return;
+      }
+    }
     if (!state.active || state.editingId || state.editingIsNew) return;
     const target = event.target;
     if (isOwnUi(target)) return;
@@ -3071,7 +3595,39 @@ export function mountAnnotator(options = {}) {
     if (!target || target.nodeType !== 1) return;
     if (!shouldBlockPageEvent({ ownUi: isOwnUi(target), editing: isEditing(), active: state.active })) return;
     event.preventDefault();
-    if (isEditing()) event.stopPropagation();
+    if (isEditing()) { event.stopPropagation(); return; }
+    // 合并手势：按下即进入「待定拖拽」——位移超阈值升格为框选（onMove），
+    // 原地松手=点选（click 流程照常）。不 stopPropagation：页面照旧收到
+    // mousedown，与点选时的透传行为一致。
+    if (state.active && !isOwnUi(target)) {
+      state.marquee = { x0: event.clientX, y0: event.clientY, moved: false };
+    }
+  }
+
+  /**
+   * 框选松手：拖出过面积 → 建区域任务；原地点击（未移动）→ 让 click 照常走点选。
+   * moved 时吞掉紧随的 click——mousedown/mouseup 已构成一次完整框选，
+   * 再放行 click 会对落点元素重复开一次编辑。
+   */
+  function onMouseUp(event) {
+    if (!state.marquee) return;
+    const m = state.marquee;
+    state.marquee = null;
+    marqueeEl.classList.add('hidden');
+    const w = Math.abs(event.clientX - m.x0);
+    const h = Math.abs(event.clientY - m.y0);
+    // 未移动，或拖出又拖回导致选区过小 → 视为点选，放行 click 走正常点选流程
+    if (!m.moved || w < MIN_REGION || h < MIN_REGION) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+    armClickSuppress('suppressClick');
+    pickRegion({
+      x: Math.min(m.x0, event.clientX),
+      y: Math.min(m.y0, event.clientY),
+      width: Math.abs(event.clientX - m.x0),
+      height: Math.abs(event.clientY - m.y0),
+    });
   }
 
   /**
@@ -3096,7 +3652,30 @@ export function mountAnnotator(options = {}) {
   function onClick(event) {
     const target = event.target;
     if (!target || target.nodeType !== 1) return;
+    // 框选松手后的残余 click：吞掉，不进入点选流程
+    if (state.suppressClick) {
+      state.suppressClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      return;
+    }
     if (!shouldBlockPageEvent({ ownUi: isOwnUi(target), editing: isEditing(), active: state.active })) return;
+
+    // Shift+点击 = 多选累积：不建任务、不开编辑，只收进 multiPick 打高亮
+    if (event.shiftKey && state.active && !isEditing()) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      const d = describeElement(target);
+      const idx = state.multiPick.findIndex(e => e.selector === d.selector);
+      if (idx >= 0) state.multiPick.splice(idx, 1);
+      else if (state.multiPick.length < 12) state.multiPick.push(d);
+      renderPickmarks();
+      state.syncMessage = `已选 ${state.multiPick.length} 个元素；普通点击主元素后填写说明，多选集合随任务存入 meta.extraElements（Shift+点击增减，Esc 清空）。`;
+      renderMessage();
+      return;
+    }
 
     // 编辑器已打开时忽略页面点击，避免未确认的输入被静默丢弃。
     if (isEditing()) {
@@ -3118,6 +3697,12 @@ export function mountAnnotator(options = {}) {
     if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
     const element = describeElement(target);
+    // 多选收尾：普通点击把累积的 multiPick 并入本次任务的 meta.extraElements
+    if (state.multiPick.length) {
+      const extras = state.multiPick.filter(e => e.selector !== element.selector);
+      if (extras.length) state.pendingMeta = { extraElements: extras };
+      clearMultiPick();
+    }
     const existing = findTaskBySelector(element.selector);
     // 截图推迟一拍启动：让编辑器/弹窗先渲染，DOM 序列化不占 pick 帧
     state.pendingShot = new Promise(res =>
@@ -3125,6 +3710,7 @@ export function mountAnnotator(options = {}) {
     );
     if (existing) {
       existing.element = element;
+      if (state.pendingMeta) existing.meta = { ...(existing.meta || {}), ...consumePendingMeta() };
       persistLocal();
       openEditorFor(existing.id);
       return;
@@ -3141,6 +3727,12 @@ export function mountAnnotator(options = {}) {
    */
   function onKeydown(event) {
     if (event.key === 'Escape') {
+      if (!viewer.classList.contains('hidden')) {
+        event.preventDefault();
+        event.stopPropagation();
+        viewer.classList.add('hidden');
+        return;
+      }
       if (!$('[data-el="manualCopy"]').classList.contains('hidden')) {
         event.preventDefault();
         event.stopPropagation();
@@ -3157,6 +3749,22 @@ export function mountAnnotator(options = {}) {
         event.preventDefault();
         event.stopPropagation();
         closeEditor();
+        return;
+      }
+      // 拖拽中的框选可 Esc 取消；残余 click 要吞掉避免松手后误点选
+      if (state.marquee) {
+        event.preventDefault();
+        event.stopPropagation();
+        state.marquee = null;
+        marqueeEl.classList.add('hidden');
+        armClickSuppress('suppressClick');
+        return;
+      }
+      // 多选集合是标注模式的子状态，先清它再退标注模式
+      if (state.multiPick.length) {
+        event.preventDefault();
+        event.stopPropagation();
+        clearMultiPick();
         return;
       }
       if (state.active) {
@@ -3199,15 +3807,175 @@ export function mountAnnotator(options = {}) {
       outline.style.display = 'none';
       hideSizeBadge();
       closeEditor();
+      // 退出标注模式顺带复位子状态：拖拽中、多选集合
+      state.marquee = null;
+      marqueeEl.classList.add('hidden');
+      clearMultiPick();
     }
     // 进/出标注模式各自给一条提示。之前只在 Esc 退出分支里写消息，
     // 点「标注」进入时消息不变，于是上一条（比如上一轮的「已退出…」）
     // 会一直挂着，看起来像操作没生效。放在这里可保证两条路径一致，
     // 也覆盖 API 调用的 start/stop。
-    state.syncMessage = next ? '已进入标注模式（按 Esc 可退出）。' : '已退出标注模式。';
+    if (next) pageSnapshot(config.endpoint); // 进入即预热页面快照：首次点选截图近 0 延迟
+    state.syncMessage = next
+      ? '已进入标注模式：点按选元素、按住拖拽框选区域（Esc 退出）。'
+      : '已退出标注模式。';
     renderCapsule();
     renderPanelMeta();
     renderMessage();
+  }
+
+  /* ---------------- 胶囊拖拽 / 贴边吸附 / 布局持久化 ---------------- */
+
+  const DOCK_LAYOUT_KEY = 'zwa-dock-layout';
+  function loadDockLayout() {
+    try {
+      const v = JSON.parse(localStorage.getItem(DOCK_LAYOUT_KEY) || 'null');
+      return v && typeof v === 'object' ? v : null;
+    } catch { return null; }
+  }
+  function saveDockLayout() {
+    try { localStorage.setItem(DOCK_LAYOUT_KEY, JSON.stringify(state.dockLayout ?? null)); } catch { /* 忽略 */ }
+  }
+  const clampNum = (v, lo, hi) => Math.min(Math.max(lo, v), Math.max(lo, hi));
+
+  /** 把布局落到 .bar：free=left/top 定位；edge=贴边吸附耳片；null=回默认右下角 */
+  function applyDockLayout() {
+    const l = state.dockLayout;
+    bar.classList.remove('edge-left', 'edge-right', 'edge-bottom');
+    // pinned 字段已废弃（钉住按钮移除）：旧 localStorage 残留直接忽略，
+    // 贴边态一律为悬浮模式（悬停展开、移开缩回）
+    bar.classList.remove('pinned');
+    if (!l) {
+      // 回默认右下角：清掉全部内联定位，样式表 right:18/bottom:18 生效
+      ['left', 'top', 'right', 'bottom'].forEach(p => bar.style.removeProperty(p));
+      syncBarAnchored();
+      return;
+    }
+    // 定位时必须四边显式赋值：只设 left/top 而不盖 right/bottom，
+    // 样式表默认 right:18/bottom:18 会同时生效 → 双锚定把胶囊拉成几百 px 的空白条。
+    if (l.side === 'left' || l.side === 'right') {
+      bar.classList.add(`edge-${l.side}`);
+      bar.style.left = l.side === 'left' ? '0px' : 'auto';
+      bar.style.right = l.side === 'right' ? '0px' : 'auto';
+      // 钳制下限 vh-40：允许耳片沉到屏底角（snapY 也会给到这个值），
+      // 原先 vh-90 把沉底落点又顶回半腰——「拖不下去」就是它。
+      bar.style.top = `${clampNum(l.y ?? 140, 40, window.innerHeight - 40)}px`;
+      bar.style.bottom = 'auto';
+    } else if (Number.isFinite(l.x) && Number.isFinite(l.y)) {
+      bar.style.left = `${clampNum(l.x, 0, window.innerWidth - 90)}px`;
+      bar.style.right = 'auto';
+      // 与拖拽钳制一致：允许底部伸出屏外，保底 20px 抓手
+      bar.style.top = `${clampNum(l.y, 0, window.innerHeight - 20)}px`;
+      bar.style.bottom = 'auto';
+    }
+    syncBarAnchored();
+  }
+
+  /** 面板/回执跟随胶囊：贴胶囊上方、水平按胶囊所在半屏对齐；胶囊近顶时翻到下方 */
+  function syncBarAnchored() {
+    // 面板展开时胶囊隐藏、bar 塌成零点，直接量 bar 会锚错
+    // （右缘贴到胶囊左缘、高度取 0）——改用胶囊最后一次实测矩形。
+    const dockEl = $('[data-el="dock"]');
+    const live = dockEl ? dockEl.getBoundingClientRect() : null;
+    if (live && live.width > 10) {
+      state.lastDockRect = { left: live.left, right: live.right, top: live.top, bottom: live.bottom, width: live.width };
+    }
+    const r = (!state.collapsed && state.lastDockRect) ? state.lastDockRect : bar.getBoundingClientRect();
+    const vw = window.innerWidth, vh = window.innerHeight;
+    const panel = $('[data-el="panel"]');
+    bar.classList.toggle('flip-top', r.top < 80 && !(state.dockLayout && state.dockLayout.side));
+    const alignLeft = r.left + r.width / 2 < vw / 2;
+    if (alignLeft) {
+      panel.style.left = `${Math.max(8, r.left)}px`; panel.style.right = 'auto';
+      toast.style.left = `${Math.max(8, r.left)}px`; toast.style.right = 'auto';
+    } else {
+      panel.style.right = `${Math.max(8, vw - r.right)}px`; panel.style.left = 'auto';
+      toast.style.right = `${Math.max(8, vw - r.right)}px`; toast.style.left = 'auto';
+    }
+    if (r.top > 110) {
+      panel.style.bottom = `${vh - r.top + 8}px`; panel.style.top = 'auto';
+      toast.style.bottom = `${vh - r.top + 8}px`; toast.style.top = 'auto';
+    } else {
+      panel.style.top = `${Math.min(vh - 8, r.bottom + 8)}px`; panel.style.bottom = 'auto';
+      toast.style.top = `${Math.min(vh - 8, r.bottom + 8)}px`; toast.style.bottom = 'auto';
+    }
+  }
+
+  /**
+   * 胶囊拖拽：按下位移 >5px 进入拖动（left/top 直写），松手按落点判定——
+   * 距左/右缘 <90px 吸附成耳片（悬浮模式，悬停滑出），否则自由悬浮；
+   * 结果持久化 localStorage。从贴边耳片拖出时先摘 edge 类，
+   * 胶囊在指针下完整展开再跟手。
+   */
+  function onBarPointerDown(event) {
+    if (event.button !== 0) return;
+    if (event.target.closest('.panel')) return;
+    const rect = bar.getBoundingClientRect();
+    const startX = event.clientX, startY = event.clientY;
+    const offX = startX - rect.left, offY = startY - rect.top;
+    let dragging = false;
+    const move = ev => {
+      if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 5) {
+        dragging = true;
+        bar.classList.add('dragging');
+        // 从贴边耳片拖出：无条件摘 edge 类——不能只靠 dockLayout.side 判断，
+        // 布局状态丢失/不一致时耳片仍在但 side 为 null，胶囊会滑着移出屏幕。
+        bar.classList.remove('edge-left', 'edge-right', 'edge-bottom');
+        if (state.dockLayout && state.dockLayout.side) state.dockLayout.side = null;
+      }
+      if (!dragging) return;
+      // 底边不吸附，但允许拖出屏外：留 20px 抓手防整条丢进屏外拿不回来。
+      const nx = clampNum(ev.clientX - offX, 0, window.innerWidth - rect.width);
+      const ny = clampNum(ev.clientY - offY, 0, window.innerHeight - 20);
+      bar.style.left = `${nx}px`;
+      bar.style.top = `${ny}px`;
+      bar.style.right = 'auto';
+      bar.style.bottom = 'auto';
+      ev.preventDefault();
+    };
+    const up = (ev) => {
+      window.removeEventListener('pointermove', move, true);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('mouseup', up);
+      bar.classList.remove('dragging');
+      if (!dragging) return;
+      dragging = false; // 双监听（pointerup+mouseup）谁先触发谁生效，防止二次进入
+      armClickSuppress('suppressUiClick'); // 吞掉松手后的 click，防误触胶囊按钮
+      const r2 = bar.getBoundingClientRect();
+      // 吸附判定看胶囊最近「边缘」距屏缘：贴到屏缘松手即吸附。
+      // 不能用中心点——胶囊本身 ~190px 宽，贴缘时中心距缘近百像素，
+      // 中心阈值会永远差一点点吸不上（实测踩过）。
+      // 阈值 20px：只有真的贴到屏缘才吸附，离边一段距离松手保持自由悬浮
+      // （用户反馈 40px 太贪，拖在右下区域被误吸走）。
+      const EDGE_SNAP = 20;
+      // 只吸附左右贴边；底边/顶边一律当自由悬浮（用户明确不要上下吸附）
+      const side = r2.left < EDGE_SNAP ? 'left'
+        : window.innerWidth - r2.right < EDGE_SNAP ? 'right'
+        : null;
+      // 贴边后的耳片高度：默认跟随松手位置；落点已近底（距底 <90px）时
+      // 沉到屏底附近（耳片底留 ~26px），不在半腰留大空档也不死贴底缘。
+      const snapY = window.innerHeight - r2.bottom < 90
+        ? window.innerHeight - 60
+        : r2.top;
+      state.dockLayout = side
+        ? { side, y: snapY, pinned: false }
+        : { x: r2.left, y: r2.top, side: null, pinned: false };
+      saveDockLayout();
+      applyDockLayout();
+    };
+    window.addEventListener('pointermove', move, true);
+    window.addEventListener('pointerup', up, { once: true });
+    // 兜底：部分嵌入/合成事件流 pointerup 可能缺失，mouseup 一定到
+    window.addEventListener('mouseup', up, { once: true });
+  }
+
+  /** 武装「吞下一次 click」标志，350ms 后自愈。
+      松手点在胶囊/页面外时残余 click 到不了对应监听器，布尔标志不设过期
+      会挂住误吞下一次真实点击（悬浮展开后首次点按钮无效就是它）。 */
+  function armClickSuppress(key) {
+    state[key] = true;
+    setTimeout(() => { state[key] = false; }, 350);
   }
 
   function setCollapsed(next) {
@@ -3223,6 +3991,8 @@ export function mountAnnotator(options = {}) {
   function renderBar() {
     $('[data-el="dock"]').classList.toggle('hidden', !state.collapsed);
     $('[data-el="panel"]').classList.toggle('hidden', state.collapsed);
+    bar.classList.toggle('panel-open', !state.collapsed);
+    syncBarAnchored();
     if (!state.collapsed) renderList();
     renderCapsule();
     // 收起态不跑 renderList（不做列表渲染），收起条必须在这里单独刷新，
@@ -3285,6 +4055,20 @@ export function mountAnnotator(options = {}) {
     async event => {
       const target = event.target;
       if (!target || !target.closest) return;
+      // 胶囊拖拽松手后的残余 click：吞掉，不触发任何按钮动作
+      if (state.suppressUiClick) {
+        state.suppressUiClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+      // 缩略图点击 → 灯箱预览（列表 item-thumbs 与编辑器 thumb 两处都支持）
+      const thumbImg = target.closest && target.closest('.item-thumbs img, .thumb img');
+      if (thumbImg && thumbImg.src) {
+        event.preventDefault();
+        showViewer(thumbImg.src);
+        return;
+      }
       // 按钮内部还有文字与 svg 图标，真实点击常落在子元素上，
       // 因此必须用 closest() 向上查找带 data-act 的祖先元素。
       const dropBtn = target.closest('[data-drop-image]');
@@ -3305,6 +4089,7 @@ export function mountAnnotator(options = {}) {
       else if (act === 'theme') togglePanelTheme();
       else if (act === 'board') window.open(`${config.endpoint}/board`, '_blank');
       else if (act === 'toggle') setActive(!state.active);
+      else if (act === 'freeze') setFrozen(!state.frozen);
       else if (act === 'clear') {
         if (!state.tasks.length) {
           state.syncMessage = '还没有标注。';
@@ -3357,9 +4142,10 @@ export function mountAnnotator(options = {}) {
   function onResize() {
     repositionPins();
     hideSizeBadge();
+    syncBarAnchored();
     if (state.editingId || state.editingIsNew) {
-      const sel = state.editingId ? findTask(state.editingId)?.element?.selector : state.pendingElement?.selector;
-      placeEditor(sel || null, $('[data-el="editorInput"]'));
+      const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
+      placeEditor(elDesc, $('[data-el="editorInput"]'));
     }
   }
 
@@ -3377,11 +4163,13 @@ export function mountAnnotator(options = {}) {
     // mousedown 必须早于 click 拦下：页面控件的聚焦发生在 mousedown 阶段，
     // 只拦 click 的话输入框已经拿到焦点了。
     document.addEventListener('mousedown', onMouseDown, true);
+    document.addEventListener('mouseup', onMouseUp, true);
     document.addEventListener('focusout', onEditorFocusLeak, true);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
     window.addEventListener('scroll', onScroll, true);
     window.addEventListener('resize', onResize, true);
+    bar.addEventListener('pointerdown', onBarPointerDown);
     // DOM 变化重排：SPA 内嵌视图切换/局部重渲染既不触发 scroll 也不触发
     // resize，pin 会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
     const domObserver = new MutationObserver(() => {
@@ -3396,6 +4184,7 @@ export function mountAnnotator(options = {}) {
   // 版本由宿主（Vite 插件 / http 适配器）随 bootstrap 注入，与技能版本同源
   $('[data-el="panelVersion"]').textContent = config.version ? `v${config.version}` : '';
   restorePanelTheme();
+  applyDockLayout();
   renderBar();
   renderPins();
   renderMessage();
@@ -3585,8 +4374,38 @@ export function mountAnnotator(options = {}) {
     },
   };
 
+  // SPA 路由兼容：单路由内嵌多工作台的页面靠 query/path 切换子页面，
+  // URL 变化时必须整体重挂载，任务才能按新 page.url 重新归组，
+  // 否则上一「页面」的图钉会继续残留在切换后的工作台里。
+  installUrlWatcher();
+
   window.__zwAnnotator = api;
   return api;
+}
+
+let urlWatcherInstalled = false;
+function installUrlWatcher() {
+  if (urlWatcherInstalled || typeof window === 'undefined' || typeof history === 'undefined') return;
+  urlWatcherInstalled = true;
+  let lastUrl = canonicalPageUrl(location.href);
+  const remount = () => {
+    const next = canonicalPageUrl(location.href);
+    if (next === lastUrl) return;
+    lastUrl = next;
+    const cfg = window.__zwAnnotationsConfig || {};
+    try { window.__zwAnnotator?.destroy(); } catch { /* 销毁失败仍尝试重挂 */ }
+    mountAnnotator({ ...cfg });
+  };
+  for (const key of ['pushState', 'replaceState']) {
+    const orig = history[key];
+    if (typeof orig !== 'function') continue;
+    history[key] = function (...args) {
+      const ret = orig.apply(this, args);
+      remount();
+      return ret;
+    };
+  }
+  window.addEventListener('popstate', remount);
 }
 
 /** 同源接口优先；可通过 options.endpoint 覆盖。 */
@@ -3606,6 +4425,14 @@ export function detectEndpoint() {
 function cssEscape(value) {
   if (typeof CSS !== 'undefined' && CSS.escape) return CSS.escape(value);
   return String(value).replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+}
+
+/** 附件取址：内存 dataUrl 优先；已落盘的走同源 /files/ 接口回源 */
+function imageSrc(image, endpoint) {
+  if (image && image.dataUrl) return image.dataUrl;
+  const file = image && image.file;
+  if (file) return `${endpoint}/files/${encodeURIComponent(String(file).split(/[\\/]/).pop())}`;
+  return '';
 }
 
 function trim(value, max) {
@@ -3712,6 +4539,36 @@ const CSS_TEXT = `
   border: 2px solid #7c6cff; background: rgba(124,108,255,.12); border-radius: 3px;
 }
 
+/* ---- 框选取样框与多选标记 ---- */
+.marquee {
+  position: fixed; z-index: 2147483646; pointer-events: none;
+  border: 1.5px dashed #3b6ef0; background: rgba(59,110,240,.10); border-radius: 3px;
+}
+.marquee-label {
+  position: absolute; right: 4px; bottom: 4px;
+  padding: 2px 7px; border-radius: 4px;
+  background: #3b6ef0; color: #fff;
+  font: 600 11px/1.4 var(--zc-font); white-space: nowrap;
+}
+.pickmarks { position: fixed; inset: 0; z-index: 2147483639; pointer-events: none; }
+.pickmark {
+  position: fixed; pointer-events: none;
+  border: 1.5px dashed #f59e0b; background: rgba(245,158,11,.10); border-radius: 3px;
+}
+.dock-float-btn[data-on="on"] { background: #3b6ef0 !important; color: #fff !important; }
+
+/* ---- 图片预览灯箱 ---- */
+.viewer {
+  position: fixed; inset: 0; z-index: 2147483647;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(10, 14, 28, .82); cursor: zoom-out;
+}
+.viewer img {
+  max-width: 92vw; max-height: 92vh; border-radius: 8px;
+  box-shadow: 0 12px 48px rgba(0,0,0,.5); background: #fff;
+}
+.item-thumbs img, .thumb img { cursor: zoom-in; }
+
 /* ---- 悬停尺寸标签 ---- */
 .size-badge {
   position: fixed; z-index: 2147483646; pointer-events: none;
@@ -3786,6 +4643,10 @@ const CSS_TEXT = `
 }
 .detail-value code.wrap { word-break: break-all; }
 .detail-value .dim { color: #8a8a8a; }
+.detail-value a.src-open {
+  color: #7c6cff; text-decoration: none; font-size: 11px; white-space: nowrap;
+}
+.detail-value a.src-open:hover { text-decoration: underline; }
 .detail-value .ok { color: #7fbf8f; }
 .detail-value .warn { color: #d8a45a; }
 .swatch {
@@ -3963,13 +4824,54 @@ const CSS_TEXT = `
 /* ---- 右下角控制条 ---- */
 /* z-index 比 .editor 低一号：两者同为最大值时按 DOM 顺序后者在上，
    会让展开详情的弹窗被标注列表盖住。面板必须在遮罩之上、弹窗之下。 */
-.bar { position: fixed; right: 18px; bottom: 18px; z-index: 2147483646; font: 13px/1.5 var(--zc-font); }
+.bar {
+  position: fixed; right: 18px; bottom: 18px; z-index: 2147483646; font: 13px/1.5 var(--zc-font);
+  transition: left .18s ease, top .18s ease, right .18s ease;
+}
+.bar.dragging { transition: none; }
 .dock {
   position: relative;
   display: flex; align-items: center; gap: 2px;
   padding: 4px; border: 1px solid #3f3f3f; border-radius: 999px;
   background: #1c1c1c; box-shadow: 0 8px 22px rgba(0,0,0,.4);
+  cursor: grab; touch-action: none;
 }
+.dock button, .dock-edge-tab { cursor: pointer; }
+.bar.dragging .dock { cursor: grabbing; }
+/* ---- 贴边吸附：胶囊大部滑出屏幕，仅留 34px 耳片 ----
+   悬浮模式：悬停耳片/胶囊滑出完整条，移开自动缩回。
+   .bar 容器仍占着胶囊原位的整条隐形区域——贴边态必须给 .bar 也关掉
+   指针事件，否则鼠标扫过那片空白（未悬停耳片）也会触发 :hover 弹出。 */
+.bar.edge-right, .bar.edge-left { pointer-events: none; }
+.bar.edge-right .dock,
+.bar.edge-left .dock {
+  pointer-events: none;
+  transition: transform .18s ease;
+}
+/* 面板在 .bar 内：继承 none 会不可点，展开面板时单独恢复 */
+.bar.edge-right .panel, .bar.edge-left .panel { pointer-events: auto; }
+.bar.edge-right .dock { transform: translateX(calc(100% - 34px)); border-radius: 999px 0 0 999px; }
+.bar.edge-left .dock { transform: translateX(calc(-100% + 34px)); border-radius: 0 999px 999px 0; }
+.bar.edge-right:hover .dock, .bar.edge-left:hover .dock,
+.bar.panel-open .dock { transform: none; pointer-events: auto; }
+/* 耳片：收缩态下唯一可交互区，承接拖拽与悬停展开 */
+.dock-edge-tab {
+  display: none; position: absolute; top: 0; bottom: 0; width: 34px; z-index: 3;
+  align-items: center; justify-content: center;
+  color: #9a9a9a; pointer-events: auto; cursor: grab;
+  /* 不透明底：遮住耳片下层的钉住按钮等胶囊内容，
+     收缩态只能看到箭头，不会出现两图标叠影。 */
+  background: #1c1c1c;
+}
+.dock-edge-tab svg { width: 15px; height: 15px; flex: none; }
+.bar.edge-right .dock-edge-tab { display: flex; left: 0; border-radius: 999px 0 0 999px; }
+.bar.edge-left .dock-edge-tab { display: flex; right: 0; border-radius: 0 999px 999px 0; }
+.bar.edge-left .dock-edge-tab svg { transform: rotate(180deg); }
+.bar.edge-right:hover .dock-edge-tab, .bar.edge-left:hover .dock-edge-tab,
+.bar.panel-open .dock-edge-tab { display: none; }
+/* 近顶翻转：胶囊拖近视口顶部时，悬浮按钮与进度条改到下方 */
+.bar.flip-top .dock-float { bottom: auto; top: 100%; padding-top: 16px; padding-bottom: 0; }
+.bar.flip-top .dock-progress { bottom: auto; top: calc(100% + 6px); }
 .dock-btn {
   display: flex; align-items: center; gap: 5px;
   padding: 6px 11px; border: 0; border-radius: 999px; cursor: pointer;
@@ -3995,8 +4897,9 @@ const CSS_TEXT = `
    绝对定位的包含块是内边距盒，所以 left:4px 恰好落在按钮左边缘上；
    若用 right:0 会整体右对齐到胶囊右端，视觉上像是两个不相干的浮块。 */
 .dock-float {
-  position: absolute; left: 4px; bottom: 100%;
-  display: flex; align-items: flex-start; gap: 6px;
+  /* 与胶囊同宽：按钮均分整行，左右缘与药丸齐平。 */
+  position: absolute; left: 4px; right: 4px; bottom: 100%;
+  display: flex; flex-direction: column; gap: 6px;
   /* 边框盒底边贴住胶囊顶边，下内边距 16px 把「胶囊顶 → 按钮底」整段
      （其中 4~9px 处会叠着进度条）都纳入浮层盒子，指针上移途中始终在浮层内，
      不会丢 hover 导致闪烁。16px 是常量：进度条全部完成后会隐藏，
@@ -4016,8 +4919,10 @@ const CSS_TEXT = `
 .dock:has(:focus-visible) .dock-float {
   opacity: 1; visibility: visible; transform: translateY(0); pointer-events: auto;
 }
+.dock-float-row { display: flex; gap: 6px; }
+.dock-float-row > * { flex: 1; }
 .dock-float-btn {
-  display: flex; align-items: center; gap: 5px;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
   padding: 6px 11px; border: 1px solid #3f3f3f; border-radius: 999px; cursor: pointer;
   background: #1c1c1c; color: #d8d8d8; font-family: inherit; font-weight: 600; font-size: 12px; line-height: normal;
   box-shadow: 0 6px 18px rgba(0,0,0,.42);

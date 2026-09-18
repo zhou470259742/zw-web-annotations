@@ -12,6 +12,15 @@ export const MAX_TASK_ID_LENGTH = 64;
 export const MAX_INSTRUCTION_LENGTH = 4096;
 export const MAX_IMAGES_PER_TASK = 8;
 export const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+/**
+ * doing 锁 TTL：agent 领走任务后失联/崩溃时自动释放回 todo（借自 atc-kanban
+ * 的 30min 锁模型）。领取时写 lockUntil=now+TTL；长任务 agent 通过周期性
+ * PATCH status:'doing'（同状态心跳）续期；锁过期后由读路径惰性清扫释放。
+ * 环境变量 ZWA_DOING_LOCK_TTL_MS 可调；<=0 视为关闭 TTL。
+ */
+export const DOING_LOCK_TTL_MS = Number(process.env.ZWA_DOING_LOCK_TTL_MS) > 0
+  ? Number(process.env.ZWA_DOING_LOCK_TTL_MS)
+  : 30 * 60 * 1000;
 /** 正常处理流；同状态写入是幂等的，reopen 由 updateTask 的显式选项控制。 */
 export const STATUS_TRANSITIONS = {
   todo: new Set(['todo', 'doing', 'cancelled']),
@@ -80,7 +89,7 @@ export const ATTACHMENTS_DIRNAME = 'attachments';
  * 与 scripts/index.mjs 的 SKILL_VERSION 必须一致，由
  * tests/consistency.test.mjs 断言，避免两处各自漂移。
  */
-export const RUNTIME_VERSION = '0.30.0';
+export const RUNTIME_VERSION = '0.31.0';
 /**
  * 归档目录名。归档是「已从活动组移出、暂不销毁」的任务，与活动组同 schema，
  * 协议文档承诺的「删除已归档 JSON 与对应附件」依赖这个目录真实存在。
@@ -453,6 +462,33 @@ export function createStore(workspace, options = {}) {
   const persistAttachments = async (group, tasks) => {
     let written = 0;
     for (const task of tasks) {
+      // meta.fullShot：全视口备查图，独立通道——与 images 同规则落盘
+      // （taskId-full.png），回写 {file,bytes}。不进 images[]：处理者
+      // 默认只读裁剪图，需要页面全局语境时按此路径取，不占默认 token。
+      const fshot = task.meta && task.meta.fullShot;
+      if (fshot && typeof fshot === 'object') {
+        const parsed = parseDataUrl(fshot.dataUrl);
+        if (parsed) {
+          if (parsed.buffer.length > MAX_IMAGE_BYTES) {
+            throw new Error(`image too large: ${task.id}`);
+          }
+          await fs.mkdir(attachmentsDir, { recursive: true });
+          const name = `${safeId(task.id)}-full.${parsed.ext}`;
+          const dest = path.join(attachmentsDir, name);
+          const tmp = `${dest}.${crypto.randomUUID()}.tmp`;
+          await fs.writeFile(tmp, parsed.buffer, { mode: 0o600 });
+          await fs.rename(tmp, dest);
+          // 必须就地改字段而不是替换属性：created.meta 是 spread 拷贝，
+          // 与 incoming.meta 共享同一 fullShot 对象——替换属性只更新
+          // incoming 侧，写盘的 created.meta 里仍残留 dataUrl（已踩过）。
+          fshot.file = path.relative(root, dest).split(path.sep).join('/');
+          fshot.bytes = parsed.buffer.length;
+          delete fshot.dataUrl;
+          written++;
+        } else {
+          delete fshot.dataUrl;
+        }
+      }
       const images = Array.isArray(task.images) ? task.images : [];
       for (const image of images) {
         const parsed = parseDataUrl(image.dataUrl);
@@ -480,7 +516,52 @@ export function createStore(workspace, options = {}) {
     return written;
   };
 
-  const readGroup = async id => validateGroup(JSON.parse(await fs.readFile(fileFor(id), 'utf8')));
+  /**
+   * 过期 doing 锁原地清扫：status doing 且锁到期（lockUntil，或老任务无
+   * lockUntil 时按 startedAt+TTL 兜底）→ 放回 todo。返回释放条数。
+   * 只改内存对象，持久化由调用方决定（写路径顺手落盘，读路径走 sweepAndPersist）。
+   */
+  const sweepExpiredLocks = group => {
+    if (!Array.isArray(group.tasks)) return 0;
+    const now = Date.now();
+    const at = nowIso();
+    let released = 0;
+    for (const t of group.tasks) {
+      if (t.status !== 'doing') continue;
+      const lockTs = Date.parse(t.lockUntil || '');
+      const fallback = Date.parse(t.startedAt || '');
+      const deadline = Number.isFinite(lockTs)
+        ? lockTs
+        : (Number.isFinite(fallback) ? fallback + DOING_LOCK_TTL_MS : NaN);
+      if (!Number.isFinite(deadline) || deadline > now) continue;
+      t.status = 'todo';
+      t.lockUntil = null;
+      t.updatedAt = at;
+      t.history.push({ at, event: 'lock_expired', detail: `doing 锁超时释放（${t.assignee || '未署名'}），任务重新入列` });
+      released++;
+    }
+    return released;
+  };
+
+  /**
+   * 读路径惰性持久化：重读文件再扫一次后落盘。重新读取是关键——
+   * 快照与落盘之间可能有别的写操作已经改了状态，直接写旧快照会回滚它。
+   * queueWrite 串行化保证与并发写互不覆盖。
+   */
+  const sweepAndPersist = id => queueWrite(async () => {
+    try {
+      const g = validateGroup(JSON.parse(await fs.readFile(fileFor(id), 'utf8')));
+      if (sweepExpiredLocks(g) > 0) await writeGroup(g);
+    } catch { /* 组可能已删除/归档，忽略 */ }
+  });
+
+  const readGroup = async id => {
+    const group = validateGroup(JSON.parse(await fs.readFile(fileFor(id), 'utf8')));
+    // 惰性清扫：任何读路径（任务列表/详情/写前加载）都顺带释放死锁。
+    // 返回的内存对象已反映释放后状态；落盘排队重读再写，不占读延迟。
+    if (sweepExpiredLocks(group) > 0) sweepAndPersist(id).catch(() => {});
+    return group;
+  };
 
   const readGroupOrMissing = async id => {
     try {
@@ -1157,12 +1238,16 @@ export function createStore(workspace, options = {}) {
       }
       if (patch.status === 'doing') {
         task.startedAt = task.startedAt || at;
+        // doing 锁：领取即写死线，锁过期由 sweepExpiredLocks 惰性释放回 todo
+        task.lockUntil = new Date(Date.now() + DOING_LOCK_TTL_MS).toISOString();
         // 处理者归属：多 agent 并行时 doing 不再匿名，其余调用方与人工
         // 验收都能看清这条正被谁处理（assignee 由调用方自报/请求头注入）
         task.assignee = typeof patch.assignee === 'string' && patch.assignee.trim()
           ? patch.assignee.trim().slice(0, 64)
           : (patch.actor || task.assignee || null);
       }
+      // 离开 doing 的任何状态都释放锁（review/done/blocked/cancelled/todo）
+      if (patch.status !== 'doing') task.lockUntil = null;
       // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
       if (patch.status === 'review') task.reviewAt = at;
       if (patch.status === 'done') task.completedAt = at;
@@ -1186,6 +1271,14 @@ export function createStore(workspace, options = {}) {
           group.meta = { ...(group.meta || {}), round };
         }
       }
+    } else if (patch.status === 'doing' && task.status === 'doing') {
+      // doing→doing 同态 PATCH = 心跳续期：长任务 agent 周期保活，
+      // 锁死线后移，不堆 history（心跳不是状态事件）。
+      task.lockUntil = new Date(Date.now() + DOING_LOCK_TTL_MS).toISOString();
+      if (typeof patch.assignee === 'string' && patch.assignee.trim()) {
+        task.assignee = patch.assignee.trim().slice(0, 64);
+      }
+      task.updatedAt = at;
     }
     // result 支持字符串或结构化对象 {summary, files[], commit, evidence}：
     // 验收方能直接拿到改动文件清单与提交号，不必从长文本里翻。

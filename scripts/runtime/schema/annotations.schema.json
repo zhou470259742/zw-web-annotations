@@ -220,7 +220,14 @@
         "meta": {
           "type": "object",
           "additionalProperties": true,
-          "description": "任务元数据（gitHead=创建时代码基线等）"
+          "description": "任务元数据：gitHead=创建时代码基线；ctx=创建时刻运行时尾部快照 {capturedAt, network:[{t,m,u,s,ms,err?}], console:[{t,lv,text}]}（网络只录请求行不录 body；插件自身与构建工具流量已过滤）"
+        },
+        "lockUntil": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "doing 锁死线（ISO 时间）：领取 doing 时写入 now+TTL(30min)，同状态 doing PATCH 心跳续期，超时由服务端惰性清扫释放回 todo；ZWA_DOING_LOCK_TTL_MS 可调"
         }
       }
     },

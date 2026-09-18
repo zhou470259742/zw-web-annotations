@@ -22,6 +22,9 @@ const CLIENT_FILE = path.resolve(here, '..', 'client', 'annotator.mjs');
 // 只指向它而不内联协议文本——协议只维护这一份，提示词不再随文案演进膨胀。
 const PROTOCOL_FILE = path.resolve(here, '..', 'execution-protocol.md');
 const ROUTE_PREFIX = '/__zw-web-annotations';
+// 附件回源 MIME 表：与 adapters/http.mjs 的内联表保持一致，
+// 缺省会落入 catch 被误报成 attachment not found。
+const MIME = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' };
 
 /** 执行要求文件存在时返回绝对路径，供客户端复制进提示词；缺失返回 null（fail-closed）。 */
 async function protocolPathOrNull() {
@@ -31,6 +34,44 @@ async function protocolPathOrNull() {
   } catch {
     return null;
   }
+}
+
+/**
+ * 给 .vue 模板元素注入 data-zwa-src="相对路径:行"（dev 专用）。
+ * 用 baseParse 拿模板 AST 的元素起始偏移做纯文本插桩：比正则安全
+ * （不误碰 script/style/注释），比 vnode 运行期省（零运行时成本）。
+ * 元素只进不出——注入是纯静态属性，不改模板语义、不影响样式与逻辑。
+ * 嵌套 <template>/<slot>/Teleport 等抽象标签只遍历子节点不注入。
+ */
+function injectSourceAttrs(code, absFile, baseParse, projectRoot) {
+  const open = code.match(/<template(?:\s[^>]*)?>/);
+  if (!open) return null;
+  // 根 <template> 在合法 SFC 里最后一个闭合——用 lastIndexOf 覆盖嵌套场景
+  const close = code.lastIndexOf('</template>');
+  const contentStart = open.index + open[0].length;
+  if (close <= contentStart) return null;
+  const content = code.slice(contentStart, close);
+  const tplLine = code.slice(0, contentStart).split('\n').length;
+  const rel = projectRoot ? path.relative(projectRoot, absFile) : absFile;
+  const SKIP = new Set(['template', 'slot', 'component', 'Teleport', 'Transition', 'TransitionGroup', 'KeepAlive', 'Suspense']);
+  const edits = [];
+  const walk = (node) => {
+    if (!node || typeof node !== 'object') return;
+    if (node.type === 1 && node.tag && !SKIP.has(node.tag)) {
+      // 在 <tagName 后插入属性：loc.start.offset 是 '<' 的内容内偏移
+      edits.push([contentStart + node.loc.start.offset + 1 + node.tag.length,
+        ` data-zwa-src="${rel}:${tplLine + node.loc.start.line - 1}"`]);
+    }
+    for (const c of node.children || []) walk(c);
+    for (const b of node.branches || []) walk(b);
+    if (node.content && typeof node.content === 'object') walk(node.content);
+  };
+  walk(baseParse(content));
+  if (!edits.length) return null;
+  edits.sort((a, b) => b[0] - a[0]);
+  let out = code;
+  for (const [pos, text] of edits) out = out.slice(0, pos) + text + out.slice(pos);
+  return out;
 }
 
 /**
@@ -92,11 +133,22 @@ export function zwAnnotations(options = {}) {
     inject: options.inject !== false,
     collapsed: options.collapsed !== false,
     meta: options.meta,
+    // 源码行级埋点：dev 模式下给 .vue 模板元素注入 data-zwa-src="文件:行"，
+    // 标注时经 closest() 直达渲染它的模板行（vue-inspector 同款思路）。
+    // 仅 dev（本插件 apply:'serve'），生产构建与产物零影响；可经
+    // ZW_ANNOTATIONS_SOURCE=off 单独关闭。
+    injectSource: options.injectSource !== false && !isDisabled(process.env.ZW_ANNOTATIONS_SOURCE),
     // 临时关闭：enabled: false 或环境变量 ZW_ANNOTATIONS=off。
     // 环境变量优先，便于不改配置文件就关掉（改配置要重启，改 env 也要重启，
     // 但 env 不必动仓库里被 git 跟踪的文件）。
     enabled: options.enabled !== false && !isDisabled(process.env.ZW_ANNOTATIONS),
   };
+
+  let projectRoot = '';
+  // @vue/compiler-dom 是 @vitejs/plugin-vue 的既有依赖，懒加载解析失败时
+  // 注入静默降级为不埋点，不影响 dev server 与页面运行。
+  let compilerDomP = null;
+  const loadCompilerDom = () => (compilerDomP ||= import('@vue/compiler-dom').catch(() => null));
 
   /** @type {import('../core/store.mjs').createStore extends (...a:any)=>infer R ? R : never} */
   let store = null;
@@ -135,6 +187,25 @@ export function zwAnnotations(options = {}) {
   return {
     name: 'zw-web-annotations',
     apply: 'serve',
+
+    configResolved(cfg) {
+      projectRoot = cfg.root;
+    },
+
+    /** dev 模板埋点：.vue 源码在 vue() 编译前经本 transform 注入 data-zwa-src。 */
+    async transform(code, id) {
+      if (!config.enabled || !config.injectSource) return null;
+      const file = id.split('?')[0];
+      if (!file.endsWith('.vue') || file.includes('node_modules')) return null;
+      const compiler = await loadCompilerDom();
+      if (!compiler) return null;
+      try {
+        const out = injectSourceAttrs(code, file, compiler.baseParse, projectRoot);
+        return out ? { code: out, map: null } : null;
+      } catch {
+        return null; // 埋点失败不阻断编译
+      }
+    },
 
     async transformIndexHtml(html) {
       if (!config.enabled || !config.inject) return html;
@@ -194,6 +265,24 @@ export function zwAnnotations(options = {}) {
         if (!config.enabled) return sendJson(res, 404, { error: 'annotations disabled', hint: 'ZW_ANNOTATIONS=off' });
         const url = new URL(req.url, 'http://localhost');
         const route = url.pathname.slice(config.endpoint.length) || '/';
+
+        // 在编辑器中打开源码行：标注详情里的「打开源码」链接。
+        // file 形如 src/views/X.vue:287（项目相对路径）；仅允许 workspace 内文件。
+        if (req.method === 'GET' && route === '/open') {
+          const spec = url.searchParams.get('file') || '';
+          const [rel, line] = spec.split(/:(\d+)$/).filter(Boolean);
+          const abs = path.resolve(projectRoot || process.cwd(), rel || '');
+          const root = path.resolve(projectRoot || process.cwd());
+          if (!abs.startsWith(root + path.sep)) return sendJson(res, 403, { error: 'outside workspace' });
+          try {
+            const { spawn } = await import('node:child_process');
+            const editor = process.env.ZW_ANNOTATIONS_EDITOR || 'code';
+            spawn(editor, ['-g', `${abs}:${line || '1'}`], { detached: true, stdio: 'ignore' }).unref();
+            return sendJson(res, 200, { ok: true, file: abs, line: line || '1', editor });
+          } catch (e) {
+            return sendJson(res, 500, { error: String(e?.message || e) });
+          }
+        }
 
         if (req.method === 'GET' && route === '/events') {
           // SSE 实时推送：任务文件变化时通知页面立即拉取，轮询（10s）作为兜底。
@@ -298,6 +387,22 @@ export function zwAnnotations(options = {}) {
             res.setHeader('content-type', 'application/javascript; charset=utf-8');
             res.setHeader('cache-control', 'no-cache');
             return res.end(source);
+          }
+
+          // 任务附件回源：服务端落盘的图片没有 dataUrl，浏览器需经接口取回
+          if (req.method === 'GET' && route.startsWith('/files/')) {
+            const name = path.basename(decodeURIComponent(route.slice(7)));
+            if (!name || name.includes('..')) return sendJson(res, 400, { error: 'invalid file name' });
+            const file = path.join(getStore().attachmentsDir, name);
+            try {
+              const buf = await fs.readFile(file);
+              res.statusCode = 200;
+              res.setHeader('content-type', MIME[path.extname(name).slice(1).toLowerCase()] || 'application/octet-stream');
+              res.setHeader('cache-control', 'no-cache');
+              return res.end(buf);
+            } catch {
+              return sendJson(res, 404, { error: 'attachment not found' });
+            }
           }
 
           // 只读看板：所有页面的任务按状态分列，页面自行拉取 ./tasks 并经 SSE 实时刷新。
