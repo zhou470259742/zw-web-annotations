@@ -3872,7 +3872,7 @@ export function mountAnnotator(options = {}) {
     syncBarAnchored();
   }
 
-  /** 面板/回执跟随胶囊：贴胶囊上方、水平按胶囊所在半屏对齐；胶囊近顶时翻到下方 */
+  /** 面板跟随胶囊：贴胶囊上方、水平按胶囊所在半屏对齐；胶囊近顶时翻到下方（toast 已改顶部居中，不再锚定） */
   function syncBarAnchored() {
     // 面板展开时胶囊隐藏、bar 塌成零点，直接量 bar 会锚错
     // （右缘贴到胶囊左缘、高度取 0）——改用胶囊最后一次实测矩形。
@@ -3888,17 +3888,13 @@ export function mountAnnotator(options = {}) {
     const alignLeft = r.left + r.width / 2 < vw / 2;
     if (alignLeft) {
       panel.style.left = `${Math.max(8, r.left)}px`; panel.style.right = 'auto';
-      toast.style.left = `${Math.max(8, r.left)}px`; toast.style.right = 'auto';
     } else {
       panel.style.right = `${Math.max(8, vw - r.right)}px`; panel.style.left = 'auto';
-      toast.style.right = `${Math.max(8, vw - r.right)}px`; toast.style.left = 'auto';
     }
     if (r.top > 110) {
       panel.style.bottom = `${vh - r.top + 8}px`; panel.style.top = 'auto';
-      toast.style.bottom = `${vh - r.top + 8}px`; toast.style.top = 'auto';
     } else {
       panel.style.top = `${Math.min(vh - 8, r.bottom + 8)}px`; panel.style.bottom = 'auto';
-      toast.style.top = `${Math.min(vh - 8, r.bottom + 8)}px`; toast.style.bottom = 'auto';
     }
   }
 
@@ -4950,11 +4946,11 @@ const CSS_TEXT = `
 .dock-progress-fill[data-done="on"] { background: linear-gradient(90deg, #4fbf7a, #6fd39a); }
 
 /* ---- 收起状态的操作反馈浮条 ---- */
-/* 位置必须让开上方的悬浮按钮层（y 708~738），否则会盖住「手动/复制」并挡住点击；
-   所以整条落在浮层之上，且加 pointer-events:none——它只是回执，不需要交互，
-   即使因长文案增高也不会吞掉按钮的点击。right 与胶囊同轴对齐。 */
+/* 回执固定顶部居中：不再跟随胶囊/dock（原贴胶囊上方会压住右下快捷按钮区）；
+   且加 pointer-events:none——它只是回执，不需要交互，不会吞点击。 */
 .toast {
-  position: fixed; right: 18px; bottom: 102px; z-index: 2147483646;
+  /* 顶部居中回执：不再跟随 dock（原贴胶囊上方会压住右下快捷按钮区） */
+  position: fixed; left: 50%; top: 14px; transform: translateX(-50%); z-index: 2147483646;
   max-width: min(340px, calc(100vw - 36px));
   padding: 9px 13px; border: 1px solid #3f3f3f; border-radius: 10px;
   background: #1c1c1c; color: #ececec;
