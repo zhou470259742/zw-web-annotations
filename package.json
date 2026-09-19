@@ -1,6 +1,6 @@
 {
   "name": "zw-web-annotations",
-  "version": "0.31.9",
+  "version": "0.32.0",
   "private": true,
   "type": "module",
   "description": "AI agent skill: install web element batch-annotation into a frontend project with framework auto-detection. This directory is the single maintained copy (component source included).",

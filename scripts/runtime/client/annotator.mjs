@@ -2683,6 +2683,11 @@ export function mountAnnotator(options = {}) {
     fillDetails(task.element || null);
     toggleDetails(!!options.expandDetails);
     placeEditor(task.element, input);
+    // 选中元素虚线高亮：主元素+附带元素（点选/框选/图钉重开统一入口）
+    showSelectionMarks([
+      task.element?.selector ? resolveElement(task.element.selector) : null,
+      ...(task.meta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
+    ]);
     renderList();
   }
 
@@ -2703,6 +2708,10 @@ export function mountAnnotator(options = {}) {
     fillDetails(element);
     toggleDetails(false);
     placeEditor(element, input);
+    showSelectionMarks([
+      element.selector ? resolveElement(element.selector) : null,
+      ...(state.pendingMeta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
+    ]);
   }
 
   /** 打开手动任务编辑器：不关联页面元素，可粘贴图片。 */
@@ -2723,6 +2732,7 @@ export function mountAnnotator(options = {}) {
     fillDetails(null);
     toggleDetails(false);
     placeEditor(null, input);
+    showSelectionMarks([]); // 手动任务无关联元素，清掉可能残留的选中标记
     renderList();
   }
 
@@ -4277,6 +4287,24 @@ export function mountAnnotator(options = {}) {
     if (editor.classList.contains('hidden')) return;
     const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
     placeEditor(elDesc, $('[data-el="editorInput"]'), { focus: false });
+  }
+
+  /** 选中元素标虚线高亮（多选同款 regionmark），编辑器打开期间持续显示供确认 */
+  function showSelectionMarks(elements) {
+    regionMarks.innerHTML = '';
+    let n = 0;
+    for (const el of elements) {
+      if (!el || typeof el.getBoundingClientRect !== 'function') continue;
+      const r = el.getBoundingClientRect();
+      if (r.width <= 0 || r.height <= 0) continue;
+      const mark = document.createElement('div');
+      mark.className = 'regionmark';
+      mark._el = el;
+      Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+      regionMarks.append(mark);
+      n++;
+    }
+    regionMarks.classList.toggle('hidden', n === 0);
   }
 
   /** 框选命中标记随元素重排（标记存了元素引用，滚动/布局变化时按实时 rect 重画） */
