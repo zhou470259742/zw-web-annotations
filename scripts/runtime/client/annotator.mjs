@@ -3474,8 +3474,9 @@ export function mountAnnotator(options = {}) {
     candidates.sort((a, b) => b.iou - a.iou || b.inter - a.inter);
     // 最近公共祖先：覆盖面 ≥50% 的候选若 ≥2 个，主元素优先取它们的 LCA——
     // 用户框住「一组控件」时想要的是共同容器（表单项行/卡片），不是某个零件。
-    // 但祖先自身须基本填满选区（≥50%），过大说明框的是大容器里的零散零件，
-    // 此时退回 IoU 最大的单个元素。
+    // 但祖先须与选区双向贴合（覆盖选区 ≥50% 且被选区覆盖 ≥35%）——
+    // 单向阈值会让远超选区的大容器（整卡/整页）永远胜出，把不同区域的
+    // 多次框选归并到同一 selector 上。
     const covered = candidates.filter(c => c.area > 0 && c.inter / c.area >= 0.5);
     let lcaEl = null;
     if (covered.length >= 2) {
@@ -3487,7 +3488,11 @@ export function mountAnnotator(options = {}) {
         const lr = lca.getBoundingClientRect();
         const iw = Math.min(rect.x + rect.width, lr.right) - Math.max(rect.x, lr.left);
         const ih = Math.min(rect.y + rect.height, lr.bottom) - Math.max(rect.y, lr.top);
-        if (iw * ih >= rect.width * rect.height * 0.5) lcaEl = lca;
+        const inter = iw * ih;
+        // 双向贴合：祖先覆盖选区 ≥50% 且选区也覆盖祖先 ≥35%——
+        // 单向阈值会把「框一行控件」提升到整卡/整页容器（其面积远超选区），
+        // 导致后续框选同卡内其他元素时命中同一 selector 被并入已有标注
+        if (inter >= rect.width * rect.height * 0.5 && inter >= lr.width * lr.height * 0.35) lcaEl = lca;
       }
     }
     let primaryEl = lcaEl || (candidates.length && candidates[0].iou >= 0.05 ? candidates[0].el : null);
