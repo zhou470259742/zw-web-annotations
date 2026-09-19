@@ -3463,42 +3463,72 @@ export function mountAnnotator(options = {}) {
 
   /**
    * 框选收尾。
-   * 候选：全量矩形相交扫描（零漏网）+ 可见性过滤（被遮罩盖死的不收）。
-   * 主元素：IoU 几何匹配——「与选区形状最接近」的元素（框按钮得按钮、
-   * 框表格得表格），IoU<0.05（基本框在空白）退回中心点兜底。
-   * 其余按相交面积降序进 meta.extraElements（上限 12，selector 去重）。
+   * 候选：包容模式——只收「完全落在选区内」的元素（2px 容差 + 可见性过滤）。
+   * 主元素：嵌套层级中取「在框内的最高层级」（祖先也在框内时优先祖先）；
+   * 多个最高层元素时，其 LCA 仍在框内则取 LCA，否则取面积最大者。
+   * 零包容命中退回相交扫描兜底（IoU 最佳 / 选区中心点）。
+   * 其余最高层元素按面积降序进 meta.extraElements（上限 12，selector 去重）。
    */
   function pickRegion(rect) {
     const region = {
       x: Math.round(rect.x), y: Math.round(rect.y),
       width: Math.round(rect.width), height: Math.round(rect.height),
     };
-    const candidates = collectRegionCandidates(rect);
-    candidates.sort((a, b) => b.iou - a.iou || b.inter - a.inter);
-    // 最近公共祖先：覆盖面 ≥50% 的候选若 ≥2 个，主元素优先取它们的 LCA——
-    // 用户框住「一组控件」时想要的是共同容器（表单项行/卡片），不是某个零件。
-    // 但祖先须与选区双向贴合（覆盖选区 ≥50% 且被选区覆盖 ≥35%）——
-    // 单向阈值会让远超选区的大容器（整卡/整页）永远胜出，把不同区域的
-    // 多次框选归并到同一 selector 上。
-    const covered = candidates.filter(c => c.area > 0 && c.inter / c.area >= 0.5);
-    let lcaEl = null;
-    if (covered.length >= 2) {
-      let lca = covered[0].el;
-      while (lca && lca !== document.body && !covered.every(c => lca === c.el || lca.contains(c.el))) {
+    // 包容模式：只收「完全落在选区内」的元素（2px 容差），多层嵌套取
+    // 「在框内的最高层级」——祖先也在框内时优先祖先，深度零件让位整组容器。
+    const TOL = 2;
+    const contained = [];
+    const walk = parent => {
+      for (const el of parent.children) {
+        if (el.nodeType !== 1 || isOwnUi(el) || el === document.documentElement || el === document.body) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 &&
+            r.left >= rect.x - TOL && r.top >= rect.y - TOL &&
+            r.right <= rect.x + rect.width + TOL && r.bottom <= rect.y + rect.height + TOL) {
+          const pts = [
+            [r.left + r.width / 2, r.top + r.height / 2],
+            [r.left + 1, r.top + 1],
+            [r.right - 1, r.bottom - 1],
+          ];
+          if (pts.some(([px, py]) => isTopmostVisible(el, px, py))) contained.push(el);
+        }
+        walk(el); // 不可剪枝：absolute/overflow 子元素可能越出父矩形
+      }
+    };
+    walk(document.body);
+    const containedSet = new Set(contained);
+    // 最高层级：任一祖先也在 contained 里的元素剔除，留各自分支最外层
+    const topLevel = contained
+      .filter(el => {
+        let p = el.parentElement;
+        while (p && p !== document.body) {
+          if (containedSet.has(p)) return false;
+          p = p.parentElement;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+        return rb.width * rb.height - ra.width * ra.height;
+      });
+    let primaryEl = null;
+    if (topLevel.length === 1) {
+      primaryEl = topLevel[0];
+    } else if (topLevel.length >= 2) {
+      // 多个最高层元素：其 LCA 若也完全在框内 → LCA 为主元素（框住一组控件要公共容器）；
+      // LCA 超出框 → 取面积最大的最高层元素，其余进 extras
+      let lca = topLevel[0];
+      while (lca && lca !== document.body && !topLevel.every(e => lca === e || lca.contains(e))) {
         lca = lca.parentElement;
       }
-      if (lca && lca !== document.body && lca !== document.documentElement && !isOwnUi(lca)) {
-        const lr = lca.getBoundingClientRect();
-        const iw = Math.min(rect.x + rect.width, lr.right) - Math.max(rect.x, lr.left);
-        const ih = Math.min(rect.y + rect.height, lr.bottom) - Math.max(rect.y, lr.top);
-        const inter = iw * ih;
-        // 双向贴合：祖先覆盖选区 ≥50% 且选区也覆盖祖先 ≥35%——
-        // 单向阈值会把「框一行控件」提升到整卡/整页容器（其面积远超选区），
-        // 导致后续框选同卡内其他元素时命中同一 selector 被并入已有标注
-        if (inter >= rect.width * rect.height * 0.5 && inter >= lr.width * lr.height * 0.35) lcaEl = lca;
-      }
+      primaryEl = (lca && lca !== document.body && lca !== document.documentElement && !isOwnUi(lca) && containedSet.has(lca))
+        ? lca
+        : topLevel[0];
     }
-    let primaryEl = lcaEl || (candidates.length && candidates[0].iou >= 0.05 ? candidates[0].el : null);
+    // 零包容命中（框太小/全在元素边缘）→ 退回相交扫描兜底：IoU 最佳或选区中心点
+    const candidates = collectRegionCandidates(rect);
+    candidates.sort((a, b) => b.iou - a.iou || b.inter - a.inter);
+    if (!primaryEl && candidates.length && candidates[0].iou >= 0.05) primaryEl = candidates[0].el;
     if (!primaryEl) {
       const centerEl = document.elementFromPoint(
         Math.round(rect.x + rect.width / 2),
@@ -3510,9 +3540,10 @@ export function mountAnnotator(options = {}) {
     if (element) element.rect = { ...region };
     const seenSel = new Set(element ? [element.selector] : []);
     const extras = [];
-    for (const c of [...candidates].sort((a, b) => b.inter - a.inter)) {
-      if (c.el === primaryEl) continue;
-      const d = describeElement(c.el);
+    // extras 同为包容语义：其余最高层元素优先，不足时由相交候选补齐上下文
+    for (const el of [...topLevel, ...candidates.map(c => c.el)]) {
+      if (el === primaryEl) continue;
+      const d = describeElement(el);
       if (seenSel.has(d.selector)) continue;
       seenSel.add(d.selector);
       extras.push(d);
