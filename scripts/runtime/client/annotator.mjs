@@ -821,6 +821,9 @@ export function mountAnnotator(options = {}) {
   // 页面分组的展开/折叠状态必须跨页面持久：项目里同一份标注数据会被
   // 多个页面轮流查看，「当前页」随导航变化，而这个偏好属于整个项目。
   const groupOpenKey = `${SOURCE}:open-groups`;
+  // 注意：此 const 必须在 state 初始化（loadDockLayout() 调用）之前声明，
+  // 放后面会触发 TDZ ReferenceError 被 try/catch 静默吞掉 → 布局永远恢复不出来
+  const DOCK_LAYOUT_KEY = 'zwa-dock-layout';
   const state = {
     /** @type {Array<any>} 按添加时间排序，元素顺序即编号顺序 */
     tasks: [],
@@ -3832,7 +3835,6 @@ export function mountAnnotator(options = {}) {
 
   /* ---------------- 胶囊拖拽 / 贴边吸附 / 布局持久化 ---------------- */
 
-  const DOCK_LAYOUT_KEY = 'zwa-dock-layout';
   function loadDockLayout() {
     try {
       const v = JSON.parse(localStorage.getItem(DOCK_LAYOUT_KEY) || 'null');
