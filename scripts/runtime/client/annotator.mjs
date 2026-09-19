@@ -3696,7 +3696,8 @@ export function mountAnnotator(options = {}) {
       }
     }
     if (!state.active || state.editingId || state.editingIsNew) return;
-    const target = event.target;
+    // 悬停高亮与点选走同一归一化：圈出的就是点下去会选中的控件
+    const target = normalizePickTarget(event.target);
     if (isOwnUi(target)) return;
     state.hovered = target;
     if (!target || target.nodeType !== 1) {
@@ -3795,7 +3796,9 @@ export function mountAnnotator(options = {}) {
   }
 
   function onClick(event) {
-    const target = event.target;
+    // 控件归一化：点在控件内部零件时提升到控件根（el-select/el-input 等），
+    // 点选、Shift 多选、悬停高亮三处口径一致——悬停圈什么就选中什么
+    const target = normalizePickTarget(event.target);
     if (!target || target.nodeType !== 1) return;
     // 框选松手后的残余 click：吞掉，不进入点选流程
     if (state.suppressClick) {
@@ -3979,6 +3982,21 @@ export function mountAnnotator(options = {}) {
 
   function isComposing(event) {
     return event.isComposing || event.keyCode === 229;
+  }
+
+  /**
+   * 控件归一化：点在表单控件内部零件（.el-select__wrapper、内部 input 等）
+   * 时提升到控件根元素——同一控件不同位置点出的元素不一致、选择器还不稳定。
+   * 取「最外层」匹配祖先：el-select 套内部 input 时归到 select 而不是内层零件。
+   */
+  const PICK_CONTROL_SEL = '.el-select, .el-input, .el-textarea, .el-date-editor, .el-input-number, .el-radio-group, .el-checkbox-group, .el-switch, .el-cascader, .el-autocomplete, .el-slider, select, button';
+  function normalizePickTarget(el) {
+    if (!el || el.nodeType !== 1 || isOwnUi(el)) return el;
+    let best = null;
+    for (let p = el; p && p !== document.body; p = p.parentElement) {
+      if (p.matches && p.matches(PICK_CONTROL_SEL)) best = p;
+    }
+    return best || el;
   }
 
   function setActive(next) {
