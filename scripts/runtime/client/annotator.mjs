@@ -863,6 +863,14 @@ export function mountAnnotator(options = {}) {
     dockLayout: loadDockLayout(),
     /** Shift+点击累积的多选元素上下文（合并进下一任务的 meta.extraElements） */
     multiPick: [],
+    /** 与 multiPick 对齐的真实元素引用（DOM 引用不能塞进要持久化的 descriptor） */
+    multiPickEls: [],
+    /** 本次拾取的真实元素引用（主元素+附带元素），编辑器高亮标记用——
+        不经 selector 重新解析，防止解析回退到大容器把标记画成整卡 */
+    pendingMarkEls: [],
+    /** taskId → 真实元素引用（内存态）：重开编辑器时标记画当时选中的元素原样；
+        DOM 引用不能挂任务对象上——会随 JSON.stringify 污染 localStorage/服务端载荷 */
+    taskEls: new Map(),
     /** 待合并进新任务 meta 的附加上下文（region/extraElements） */
     pendingMeta: null,
     /** 动画/视频冻结状态（捕捉动画瞬态标注） */
@@ -2683,11 +2691,15 @@ export function mountAnnotator(options = {}) {
     fillDetails(task.element || null);
     toggleDetails(!!options.expandDetails);
     placeEditor(task.element, input);
-    // 选中元素虚线高亮：主元素+附带元素（点选/框选/图钉重开统一入口）
-    showSelectionMarks([
-      task.element?.selector ? resolveElement(task.element.selector) : null,
-      ...(task.meta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
-    ]);
+    // 选中元素虚线高亮：优先用确认时存下的真实元素引用（与当时选中完全一致），
+    // 没有才按 selector 解析——解析可能回退到大容器把标记画成整卡
+    const markEls = state.taskEls.get(task.id)?.length
+      ? state.taskEls.get(task.id)
+      : [
+          task.element?.selector ? resolveElement(task.element.selector) : null,
+          ...(task.meta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
+        ];
+    showSelectionMarks(markEls);
     renderList();
   }
 
@@ -2708,10 +2720,9 @@ export function mountAnnotator(options = {}) {
     fillDetails(element);
     toggleDetails(false);
     placeEditor(element, input);
-    showSelectionMarks([
-      element.selector ? resolveElement(element.selector) : null,
-      ...(state.pendingMeta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
-    ]);
+    showSelectionMarks(state.pendingMarkEls.length
+      ? state.pendingMarkEls
+      : [element.selector ? resolveElement(element.selector) : null]);
   }
 
   /** 打开手动任务编辑器：不关联页面元素，可粘贴图片。 */
@@ -2935,6 +2946,7 @@ export function mountAnnotator(options = {}) {
     state.pendingElement = null;
     state.pendingImages = [];
     state.pendingMeta = null;
+    state.pendingMarkEls = [];
     $('[data-el="editorInput"]').value = '';
     updateFocusFx();
     renderEditorImages();
@@ -2976,6 +2988,8 @@ export function mountAnnotator(options = {}) {
       }
 
       const task = isManual ? createManualTask(text, images) : createTask(element, text, images);
+      // 真实元素引用进内存 Map：重开编辑器时标记画「当时选中的元素」原样
+      if (state.pendingMarkEls.length) state.taskEls.set(task.id, [...state.pendingMarkEls]);
       state.tasks.push(task);
       state.editingId = null;
       finishConfirm(task);
@@ -3140,6 +3154,7 @@ export function mountAnnotator(options = {}) {
       return;
     }
     state.tasks = state.tasks.filter(t => t.id !== id);
+    state.taskEls.delete(id);
     queueOutbox('delete', { ids: [id] });
     if (state.editingId === id) closeEditor();
     persistLocal();
@@ -3437,6 +3452,7 @@ export function mountAnnotator(options = {}) {
 
   function clearMultiPick() {
     state.multiPick = [];
+    state.multiPickEls = [];
     renderPickmarks();
   }
 
@@ -3607,6 +3623,11 @@ export function mountAnnotator(options = {}) {
       if (centerEl && centerEl.nodeType === 1 && !isOwnUi(centerEl)) primaryEl = centerEl;
     }
     const element = primaryEl ? describeElement(primaryEl) : null;
+    // 真实元素引用进 pendingMarkEls：编辑器标记画「当时框中的最高层元素」原样，
+    // 不经 selector 重新解析（解析回退会把标记扩成大容器/整卡）
+    state.pendingMarkEls = primaryEl
+      ? [primaryEl, ...topLevel.filter(e => e !== primaryEl)]
+      : [];
     if (element) element.rect = { ...region };
     const seenSel = new Set(element ? [element.selector] : []);
     const extras = [];
@@ -3793,8 +3814,8 @@ export function mountAnnotator(options = {}) {
       if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
       const d = describeElement(target);
       const idx = state.multiPick.findIndex(e => e.selector === d.selector);
-      if (idx >= 0) state.multiPick.splice(idx, 1);
-      else if (state.multiPick.length < 12) state.multiPick.push(d);
+      if (idx >= 0) { state.multiPick.splice(idx, 1); state.multiPickEls.splice(idx, 1); }
+      else if (state.multiPick.length < 12) { state.multiPick.push(d); state.multiPickEls.push(target); }
       renderPickmarks();
       state.syncMessage = `已选 ${state.multiPick.length} 个元素；普通点击主元素或按 Enter 以最后选中项为主元素填写说明，多选集合随任务存入 meta.extraElements（Shift+点击增减，Esc 清空）。`;
       renderMessage();
@@ -3821,10 +3842,17 @@ export function mountAnnotator(options = {}) {
     if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
 
     const element = describeElement(target);
+    // 真实元素引用进 pendingMarkEls：标记画「当时点中的元素」原样，不经 selector 重解析
+    state.pendingMarkEls = [target];
     // 多选收尾：普通点击把累积的 multiPick 并入本次任务的 meta.extraElements
     if (state.multiPick.length) {
       const extras = state.multiPick.filter(e => e.selector !== element.selector);
       if (extras.length) state.pendingMeta = { extraElements: extras };
+      for (let i = 0; i < state.multiPick.length; i++) {
+        if (state.multiPick[i].selector !== element.selector && state.multiPickEls[i]) {
+          state.pendingMarkEls.push(state.multiPickEls[i]);
+        }
+      }
       clearMultiPick();
     }
     const existing = findTaskBySelector(element.selector);
@@ -3919,6 +3947,7 @@ export function mountAnnotator(options = {}) {
       const element = state.multiPick[state.multiPick.length - 1];
       const extras = state.multiPick.slice(0, -1);
       if (extras.length) state.pendingMeta = { extraElements: extras };
+      state.pendingMarkEls = [state.multiPickEls[state.multiPickEls.length - 1], ...state.multiPickEls.slice(0, -1)].filter(Boolean);
       clearMultiPick();
       state.pendingShot = new Promise(res =>
         setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
