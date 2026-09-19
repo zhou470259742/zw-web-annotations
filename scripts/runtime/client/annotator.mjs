@@ -3439,9 +3439,9 @@ export function mountAnnotator(options = {}) {
   /** 多选标记高亮：跟随 repositionPins 刷新（滚动/重排时贴住元素） */
   function renderPickmarks() {
     pickmarks.innerHTML = '';
-    for (const el of state.multiPick) {
-      const node = resolveElement(el.selector);
-      if (!node) continue;
+    // 从元素引用渲染而非 selector 解析：同类控件 selector 相同会解析到同一节点，标记塌缩
+    for (const node of state.multiPickEls) {
+      if (!node || !node.isConnected) continue;
       const r = node.getBoundingClientRect();
       const mark = document.createElement('div');
       mark.className = 'pickmark';
@@ -3813,7 +3813,9 @@ export function mountAnnotator(options = {}) {
       event.stopPropagation();
       if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
       const d = describeElement(target);
-      const idx = state.multiPick.findIndex(e => e.selector === d.selector);
+      // 取消判定按元素引用而非 selector：两个同类控件（如下拉框）可能生成
+      // 相同 selector，按串判重会把「点第二个」误当「取消第一个」→ 越点越少
+      const idx = state.multiPickEls.indexOf(target);
       if (idx >= 0) { state.multiPick.splice(idx, 1); state.multiPickEls.splice(idx, 1); }
       else if (state.multiPick.length < 12) { state.multiPick.push(d); state.multiPickEls.push(target); }
       renderPickmarks();
@@ -3846,12 +3848,11 @@ export function mountAnnotator(options = {}) {
     state.pendingMarkEls = [target];
     // 多选收尾：普通点击把累积的 multiPick 并入本次任务的 meta.extraElements
     if (state.multiPick.length) {
-      const extras = state.multiPick.filter(e => e.selector !== element.selector);
+      // 过滤按元素引用：同 selector 的不同元素（同类控件）不能被误剔出 extras
+      const extras = state.multiPick.filter((_, i) => state.multiPickEls[i] !== target);
       if (extras.length) state.pendingMeta = { extraElements: extras };
-      for (let i = 0; i < state.multiPick.length; i++) {
-        if (state.multiPick[i].selector !== element.selector && state.multiPickEls[i]) {
-          state.pendingMarkEls.push(state.multiPickEls[i]);
-        }
+      for (const n of state.multiPickEls) {
+        if (n && n !== target) state.pendingMarkEls.push(n);
       }
       clearMultiPick();
     }
