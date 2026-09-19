@@ -1012,6 +1012,10 @@ export function mountAnnotator(options = {}) {
   marqueeEl.append(marqueeLabel);
   const pickmarks = document.createElement('div');
   pickmarks.className = 'pickmarks';
+  // 框选拖拽预览层：实时描边「将命中的最高层包容元素」供用户确认选区；
+  // 松手即隐藏——纯预览，不进上下文截图
+  const regionMarks = document.createElement('div');
+  regionMarks.className = 'regionmarks hidden';
 
   // 图片预览灯箱：列表/编辑器里的缩略图点击后整屏查看
   const viewer = document.createElement('div');
@@ -1190,7 +1194,7 @@ export function mountAnnotator(options = {}) {
     </div>
   `;
 
-  shadow.append(outline, sizeBadge, veil, spotlight, marqueeEl, pickmarks, pins, clickShield, editor, confirmBox, manualCopy, bar, toast, viewer);
+  shadow.append(outline, sizeBadge, veil, spotlight, marqueeEl, pickmarks, regionMarks, pins, clickShield, editor, confirmBox, manualCopy, bar, toast, viewer);
 
   const $ = sel => shadow.querySelector(sel);
   const $$ = sel => Array.from(shadow.querySelectorAll(sel));
@@ -3446,6 +3450,50 @@ export function mountAnnotator(options = {}) {
     return candidates;
   }
 
+  /**
+   * 包容扫描：只收「完全落在选区内」的元素（2px 容差 + 可见性过滤），
+   * 并折算出「最高层级」集合——任一祖先也在 contained 里的元素剔除，
+   * 留各自分支最外层（祖先在框内优先祖先，深度零件让位整组容器）。
+   * pickRegion 与拖拽实时预览共用，保证预览=实际命中。
+   */
+  function collectContainedElements(rect) {
+    const TOL = 2;
+    const contained = [];
+    const walk = parent => {
+      for (const el of parent.children) {
+        if (el.nodeType !== 1 || isOwnUi(el) || el === document.documentElement || el === document.body) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0 &&
+            r.left >= rect.x - TOL && r.top >= rect.y - TOL &&
+            r.right <= rect.x + rect.width + TOL && r.bottom <= rect.y + rect.height + TOL) {
+          const pts = [
+            [r.left + r.width / 2, r.top + r.height / 2],
+            [r.left + 1, r.top + 1],
+            [r.right - 1, r.bottom - 1],
+          ];
+          if (pts.some(([px, py]) => isTopmostVisible(el, px, py))) contained.push(el);
+        }
+        walk(el); // 不可剪枝：absolute/overflow 子元素可能越出父矩形
+      }
+    };
+    walk(document.body);
+    const set = new Set(contained);
+    const topLevel = contained
+      .filter(el => {
+        let p = el.parentElement;
+        while (p && p !== document.body) {
+          if (set.has(p)) return false;
+          p = p.parentElement;
+        }
+        return true;
+      })
+      .sort((a, b) => {
+        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+        return rb.width * rb.height - ra.width * ra.height;
+      });
+    return { set, topLevel };
+  }
+
   /** 拖拽中的轻量估计：粗网格采样去重计数（不跑 describeElement），150ms 节流刷新徽标。 */
   function estimateRegionCount(rect) {
     const cols = Math.min(6, Math.max(2, Math.floor(rect.width / 60)));
@@ -3474,43 +3522,7 @@ export function mountAnnotator(options = {}) {
       x: Math.round(rect.x), y: Math.round(rect.y),
       width: Math.round(rect.width), height: Math.round(rect.height),
     };
-    // 包容模式：只收「完全落在选区内」的元素（2px 容差），多层嵌套取
-    // 「在框内的最高层级」——祖先也在框内时优先祖先，深度零件让位整组容器。
-    const TOL = 2;
-    const contained = [];
-    const walk = parent => {
-      for (const el of parent.children) {
-        if (el.nodeType !== 1 || isOwnUi(el) || el === document.documentElement || el === document.body) continue;
-        const r = el.getBoundingClientRect();
-        if (r.width > 0 && r.height > 0 &&
-            r.left >= rect.x - TOL && r.top >= rect.y - TOL &&
-            r.right <= rect.x + rect.width + TOL && r.bottom <= rect.y + rect.height + TOL) {
-          const pts = [
-            [r.left + r.width / 2, r.top + r.height / 2],
-            [r.left + 1, r.top + 1],
-            [r.right - 1, r.bottom - 1],
-          ];
-          if (pts.some(([px, py]) => isTopmostVisible(el, px, py))) contained.push(el);
-        }
-        walk(el); // 不可剪枝：absolute/overflow 子元素可能越出父矩形
-      }
-    };
-    walk(document.body);
-    const containedSet = new Set(contained);
-    // 最高层级：任一祖先也在 contained 里的元素剔除，留各自分支最外层
-    const topLevel = contained
-      .filter(el => {
-        let p = el.parentElement;
-        while (p && p !== document.body) {
-          if (containedSet.has(p)) return false;
-          p = p.parentElement;
-        }
-        return true;
-      })
-      .sort((a, b) => {
-        const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
-        return rb.width * rb.height - ra.width * ra.height;
-      });
+    const { set: containedSet, topLevel } = collectContainedElements(rect);
     let primaryEl = null;
     if (topLevel.length === 1) {
       primaryEl = topLevel[0];
@@ -3586,10 +3598,20 @@ export function mountAnnotator(options = {}) {
         const h = Math.abs(dy);
         marqueeEl.classList.remove('hidden');
         Object.assign(marqueeEl.style, { left: `${x}px`, top: `${y}px`, width: `${w}px`, height: `${h}px` });
-        // 拖拽中节流显示框内元素数，松手前即知覆盖量
+        // 拖拽中节流显示框内元素数 + 命中元素聚焦描边（预览=实际命中，松手即隐不进截图）
         if (!m._t || performance.now() - m._t > 150) {
           m._t = performance.now();
           marqueeLabel.textContent = `≈${estimateRegionCount({ x, y, width: w, height: h })} 个元素`;
+          const { topLevel } = collectContainedElements({ x, y, width: w, height: h });
+          regionMarks.innerHTML = '';
+          for (const el of topLevel.slice(0, 24)) {
+            const r = el.getBoundingClientRect();
+            const mark = document.createElement('div');
+            mark.className = 'regionmark';
+            Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+            regionMarks.append(mark);
+          }
+          regionMarks.classList.toggle('hidden', topLevel.length === 0);
         }
         return;
       }
@@ -3653,6 +3675,8 @@ export function mountAnnotator(options = {}) {
     const m = state.marquee;
     state.marquee = null;
     marqueeEl.classList.add('hidden');
+    regionMarks.classList.add('hidden');
+    regionMarks.innerHTML = '';
     const w = Math.abs(event.clientX - m.x0);
     const h = Math.abs(event.clientY - m.y0);
     // 未移动，或拖出又拖回导致选区过小 → 视为点选，放行 click 走正常点选流程
@@ -3796,6 +3820,8 @@ export function mountAnnotator(options = {}) {
         event.stopPropagation();
         state.marquee = null;
         marqueeEl.classList.add('hidden');
+        regionMarks.classList.add('hidden');
+        regionMarks.innerHTML = '';
         armClickSuppress('suppressClick');
         return;
       }
@@ -3874,6 +3900,8 @@ export function mountAnnotator(options = {}) {
       // 退出标注模式顺带复位子状态：拖拽中、多选集合
       state.marquee = null;
       marqueeEl.classList.add('hidden');
+      regionMarks.classList.add('hidden');
+      regionMarks.innerHTML = '';
       clearMultiPick();
     }
     // 进/出标注模式各自给一条提示。之前只在 Esc 退出分支里写消息，
@@ -4613,6 +4641,14 @@ const CSS_TEXT = `
 .pickmark {
   position: fixed; pointer-events: none;
   border: 1.5px dashed #f59e0b; background: rgba(245,158,11,.10); border-radius: 3px;
+}
+/* 框选拖拽预览：命中元素聚焦描边（实线蓝，区别于多选的琥珀虚线），松手即隐不进截图 */
+.regionmarks { position: fixed; inset: 0; z-index: 2147483639; pointer-events: none; }
+.regionmarks.hidden { display: none; }
+.regionmark {
+  position: fixed; pointer-events: none;
+  border: 1.5px solid #3b82f6; background: rgba(59,130,246,.12); border-radius: 3px;
+  box-shadow: 0 0 0 1px rgba(59,130,246,.25), inset 0 0 0 1px rgba(255,255,255,.35);
 }
 .dock-float-btn[data-on="on"] { background: #3b6ef0 !important; color: #fff !important; }
 
