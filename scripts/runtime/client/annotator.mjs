@@ -4769,13 +4769,15 @@ const CSS_TEXT = `
   background: #3b6ef0; color: #fff;
   font: 600 11px/1.4 var(--zc-font); white-space: nowrap;
 }
-.pickmarks { position: fixed; inset: 0; z-index: 2147483639; pointer-events: none; }
+/* 多选/框选标记层须在悬停 .outline（640）之上——已选标记是「确认态」，
+   悬停高亮盖在上面会把虚线框整体遮住，看起来像标记消失 */
+.pickmarks { position: fixed; inset: 0; z-index: 2147483641; pointer-events: none; }
 .pickmark {
   position: fixed; pointer-events: none;
   border: 1.5px dashed #f59e0b; background: rgba(245,158,11,.10); border-radius: 3px;
 }
 /* 框选命中预览：与 Shift 多选同款的琥珀虚线+浅填充，编辑器打开期间保留供确认（截图排除不进图） */
-.regionmarks { position: fixed; inset: 0; z-index: 2147483639; pointer-events: none; }
+.regionmarks { position: fixed; inset: 0; z-index: 2147483641; pointer-events: none; }
 .regionmarks.hidden { display: none; }
 .regionmark {
   position: fixed; pointer-events: none;
