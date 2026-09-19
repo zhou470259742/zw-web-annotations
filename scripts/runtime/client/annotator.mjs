@@ -2795,11 +2795,15 @@ export function mountAnnotator(options = {}) {
       ? findTask(state.editingId)?.meta?.region
       : state.pendingMeta?.region;
     if (el || metaRegion) {
-      let rect;
-      if (metaRegion) {
-        // meta.region 是画框时的冻结视口坐标，布局/滚动变化后必然失真——
-        // 优先用主元素+附带元素的实时矩形并集罩住整组，解析不到才回退 region
-        const live = [];
+      // 聚光孔 = 主元素+附带元素的实时矩形并集：框选（region）与 Shift 多选
+      // （extraElements）都要罩住整组。优先用拾取时存下的真实元素引用
+      // （taskEls/pendingMarkEls），旧任务才按 selector 解析；meta.region
+      // 冻结视口坐标只在元素全解析不到时兜底
+      const markEls = state.editingId ? state.taskEls.get(state.editingId) : state.pendingMarkEls;
+      const live = [];
+      if (markEls && markEls.length) {
+        for (const n of markEls) if (n && n.isConnected) live.push(n.getBoundingClientRect());
+      } else {
         if (el) live.push(el.getBoundingClientRect());
         const extras = state.editingId
           ? findTask(state.editingId)?.meta?.extraElements
@@ -2808,20 +2812,20 @@ export function mountAnnotator(options = {}) {
           const n = e && e.selector ? resolveElement(e.selector) : null;
           if (n) live.push(n.getBoundingClientRect());
         }
-        rect = live.length
-          ? {
-              left: Math.min(...live.map(r => r.left)),
-              top: Math.min(...live.map(r => r.top)),
-              width: Math.max(...live.map(r => r.right)) - Math.min(...live.map(r => r.left)),
-              height: Math.max(...live.map(r => r.bottom)) - Math.min(...live.map(r => r.top)),
-            }
-          : { left: metaRegion.x, top: metaRegion.y, width: metaRegion.width, height: metaRegion.height };
-      } else {
-        rect = el.getBoundingClientRect();
       }
+      const rect = live.length
+        ? {
+            left: Math.min(...live.map(r => r.left)),
+            top: Math.min(...live.map(r => r.top)),
+            width: Math.max(...live.map(r => r.right)) - Math.min(...live.map(r => r.left)),
+            height: Math.max(...live.map(r => r.bottom)) - Math.min(...live.map(r => r.top)),
+          }
+        : metaRegion
+          ? { left: metaRegion.x, top: metaRegion.y, width: metaRegion.width, height: metaRegion.height }
+          : null;
       const pad = 5;
       // 0 尺寸（元素被隐藏/移除）没有可高亮的区域，退回纯遮罩
-      if (rect.width > 0 && rect.height > 0) {
+      if (rect && rect.width > 0 && rect.height > 0) {
         // 不做视口夹取：孔必须与元素严格对齐，偏移的挖孔比出界更难看
         spotlight.style.left = `${rect.left - pad}px`;
         spotlight.style.top = `${rect.top - pad}px`;
