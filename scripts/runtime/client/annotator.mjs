@@ -3545,6 +3545,7 @@ export function mountAnnotator(options = {}) {
       const r = el.getBoundingClientRect();
       const mark = document.createElement('div');
       mark.className = 'regionmark';
+      mark._el = el; // 存引用供滚动/布局变化时跟随重排
       Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
       regionMarks.append(mark);
     }
@@ -4249,20 +4250,42 @@ export function mountAnnotator(options = {}) {
   // 输入或粘贴后同步提交按钮状态与输入框高度
   $('[data-el="editorInput"]').addEventListener('input', syncEditorInput);
 
+  /** 编辑器随锚点元素重排：滚动/缩放/侧栏开合都会移动元素，
+      编辑器锚定在元素旁，不跟着走就会与聚光圈错位 */
+  function repositionEditor() {
+    if (editor.classList.contains('hidden')) return;
+    const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
+    placeEditor(elDesc, $('[data-el="editorInput"]'), { focus: false });
+  }
+
+  /** 框选命中标记随元素重排（标记存了元素引用，滚动/布局变化时按实时 rect 重画） */
+  function repositionRegionMarks() {
+    if (regionMarks.classList.contains('hidden')) return;
+    let alive = 0;
+    for (const mark of regionMarks.children) {
+      const el = mark._el;
+      if (!el || !el.isConnected) { mark.style.display = 'none'; continue; }
+      const r = el.getBoundingClientRect();
+      mark.style.display = '';
+      Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+      alive++;
+    }
+    if (!alive) regionMarks.classList.add('hidden');
+  }
+
   function onScroll() {
     repositionPins();
-    // 编辑期间页面仍可滚动（滚轮不被拦截），聚光孔必须跟着元素走
+    // 编辑期间页面仍可滚动（滚轮不被拦截），聚光孔/编辑器/命中标记都必须跟着元素走
     updateFocusFx();
+    repositionEditor();
+    repositionRegionMarks();
   }
 
   function onResize() {
     repositionPins();
     hideSizeBadge();
     syncBarAnchored();
-    if (state.editingId || state.editingIsNew) {
-      const elDesc = (state.editingId ? findTask(state.editingId)?.element : state.pendingElement) || null;
-      placeEditor(elDesc, $('[data-el="editorInput"]'));
-    }
+    repositionEditor();
   }
 
   function onVisibilityChange() {
@@ -4287,10 +4310,10 @@ export function mountAnnotator(options = {}) {
     window.addEventListener('resize', onResize, true);
     bar.addEventListener('pointerdown', onBarPointerDown);
     // DOM 变化重排：SPA 内嵌视图切换/局部重渲染既不触发 scroll 也不触发
-    // resize，pin 会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
+    // resize，pin 与打开中的编辑器都会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
     const domObserver = new MutationObserver(() => {
       clearTimeout(domObserver._t);
-      domObserver._t = setTimeout(() => repositionPins(), 300);
+      domObserver._t = setTimeout(() => { repositionPins(); repositionEditor(); repositionRegionMarks(); }, 300);
     });
     domObserver.observe(document.body, { childList: true, subtree: true });
     document.addEventListener('visibilitychange', onVisibilityChange, true);
