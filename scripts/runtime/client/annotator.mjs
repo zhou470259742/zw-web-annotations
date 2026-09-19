@@ -1901,7 +1901,7 @@ export function mountAnnotator(options = {}) {
 
   function renderMessage() {
     const text = activeMessage() || (state.active
-      ? '点按选元素、按住拖拽框选区域。'
+      ? '点按选元素、拖拽框选、Shift+点击多选（Enter 收尾）。'
       : '点击“标注”后，在页面上点选元素或拖拽框选。');
     const msgEl = $('[data-el="msg"]');
     msgEl.textContent = text;
@@ -3711,7 +3711,7 @@ export function mountAnnotator(options = {}) {
       if (idx >= 0) state.multiPick.splice(idx, 1);
       else if (state.multiPick.length < 12) state.multiPick.push(d);
       renderPickmarks();
-      state.syncMessage = `已选 ${state.multiPick.length} 个元素；普通点击主元素后填写说明，多选集合随任务存入 meta.extraElements（Shift+点击增减，Esc 清空）。`;
+      state.syncMessage = `已选 ${state.multiPick.length} 个元素；普通点击主元素或按 Enter 以最后选中项为主元素填写说明，多选集合随任务存入 meta.extraElements（Shift+点击增减，Esc 清空）。`;
       renderMessage();
       return;
     }
@@ -3823,6 +3823,31 @@ export function mountAnnotator(options = {}) {
     }
 
     if (event.key !== 'Enter') return;
+    // 多选收尾的键盘路径：Enter 以最后选中元素为主元素直接弹输入框，
+    // 其余多选并入 meta.extraElements（与普通点击主元素同义，省一次手眼切换）
+    if (state.active && !isEditing() && state.multiPick.length) {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
+      const element = state.multiPick[state.multiPick.length - 1];
+      const extras = state.multiPick.slice(0, -1);
+      if (extras.length) state.pendingMeta = { extraElements: extras };
+      clearMultiPick();
+      state.pendingShot = new Promise(res =>
+        setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+      );
+      const existing = findTaskBySelector(element.selector);
+      if (existing) {
+        existing.element = element;
+        if (state.pendingMeta) existing.meta = { ...(existing.meta || {}), ...consumePendingMeta() };
+        persistLocal();
+        openEditorFor(existing.id);
+        return;
+      }
+      state.pendingElement = element;
+      openEditorForNew(element);
+      return;
+    }
     if (editor.classList.contains('hidden')) return;
     // Shadow DOM 外部的监听器拿到的 target 会被重定向为宿主元素，
     // 必须用 composedPath() 才能判断事件是否真的来自编辑框。
@@ -3857,7 +3882,7 @@ export function mountAnnotator(options = {}) {
     // 也覆盖 API 调用的 start/stop。
     if (next) pageSnapshot(config.endpoint); // 进入即预热页面快照：首次点选截图近 0 延迟
     state.syncMessage = next
-      ? '已进入标注模式：点按选元素、按住拖拽框选区域（Esc 退出）。'
+      ? '已进入标注模式：点按选元素、拖拽框选、Shift+点击多选（Enter 收尾，Esc 退出）。'
       : '已退出标注模式。';
     renderCapsule();
     renderPanelMeta();
