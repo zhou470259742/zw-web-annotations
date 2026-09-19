@@ -2489,6 +2489,18 @@ export function mountAnnotator(options = {}) {
       return;
     }
     box.innerHTML = renderDetailRows(element);
+    // 附带元素：框选/Shift 多选并入的 meta.extraElements（新任务读 pendingMeta，已有任务读 meta）
+    const extras = state.pendingMeta?.extraElements?.length
+      ? state.pendingMeta.extraElements
+      : (state.editingId ? findTask(state.editingId)?.meta?.extraElements : null) || [];
+    if (extras.length) {
+      const items = extras.map(e =>
+        `<div class="detail-row"><span class="detail-label">附带元素</span><span class="detail-value"><code class="wrap">${escapeHtml(
+          `${e.tagName || ''}${e.text ? `「${truncate(e.text, 24)}」` : ''} ${e.selector || ''}`.trim()
+        )}</code></span></div>`
+      ).join('');
+      box.innerHTML += `<div class="detail-row"><span class="detail-label">附带元素</span><span class="detail-value">共 ${extras.length} 个（随主元素存入 meta.extraElements）</span></div>` + items;
+    }
   }
 
   /** 切换详情区的展开与收缩。 */
@@ -2883,6 +2895,9 @@ export function mountAnnotator(options = {}) {
 
   function closeEditor() {
     editor.classList.add('hidden');
+    // 框选命中预览随编辑器关闭（确认/取消/Esc 统一走这里）
+    regionMarks.classList.add('hidden');
+    regionMarks.innerHTML = '';
     state.editingId = null;
     state.editingIsNew = false;
     state.manualMode = false;
@@ -3523,6 +3538,17 @@ export function mountAnnotator(options = {}) {
       width: Math.round(rect.width), height: Math.round(rect.height),
     };
     const { set: containedSet, topLevel } = collectContainedElements(rect);
+    // 松手瞬间按最终选区精确重渲命中高亮（拖拽期是 150ms 节流的近似值），
+    // 编辑器打开期间保留供用户确认标记是否正确——截图 filter 排除宿主不进图
+    regionMarks.innerHTML = '';
+    for (const el of topLevel.slice(0, 24)) {
+      const r = el.getBoundingClientRect();
+      const mark = document.createElement('div');
+      mark.className = 'regionmark';
+      Object.assign(mark.style, { left: `${r.left}px`, top: `${r.top}px`, width: `${r.width}px`, height: `${r.height}px` });
+      regionMarks.append(mark);
+    }
+    regionMarks.classList.toggle('hidden', topLevel.length === 0);
     let primaryEl = null;
     if (topLevel.length === 1) {
       primaryEl = topLevel[0];
@@ -3675,12 +3701,15 @@ export function mountAnnotator(options = {}) {
     const m = state.marquee;
     state.marquee = null;
     marqueeEl.classList.add('hidden');
-    regionMarks.classList.add('hidden');
-    regionMarks.innerHTML = '';
+    // regionMarks 不清：编辑器打开期间保留命中高亮供用户确认（截图 filter 排除宿主，不进图）
     const w = Math.abs(event.clientX - m.x0);
     const h = Math.abs(event.clientY - m.y0);
     // 未移动，或拖出又拖回导致选区过小 → 视为点选，放行 click 走正常点选流程
-    if (!m.moved || w < MIN_REGION || h < MIN_REGION) return;
+    if (!m.moved || w < MIN_REGION || h < MIN_REGION) {
+      regionMarks.classList.add('hidden');
+      regionMarks.innerHTML = '';
+      return;
+    }
     event.preventDefault();
     event.stopPropagation();
     if (typeof event.stopImmediatePropagation === 'function') event.stopImmediatePropagation();
@@ -4642,13 +4671,12 @@ const CSS_TEXT = `
   position: fixed; pointer-events: none;
   border: 1.5px dashed #f59e0b; background: rgba(245,158,11,.10); border-radius: 3px;
 }
-/* 框选拖拽预览：命中元素聚焦描边（实线蓝，区别于多选的琥珀虚线），松手即隐不进截图 */
+/* 框选命中预览：与 Shift 多选同款的琥珀虚线+浅填充，编辑器打开期间保留供确认（截图排除不进图） */
 .regionmarks { position: fixed; inset: 0; z-index: 2147483639; pointer-events: none; }
 .regionmarks.hidden { display: none; }
 .regionmark {
   position: fixed; pointer-events: none;
-  border: 1.5px solid #3b82f6; background: rgba(59,130,246,.12); border-radius: 3px;
-  box-shadow: 0 0 0 1px rgba(59,130,246,.25), inset 0 0 0 1px rgba(255,255,255,.35);
+  border: 1.5px dashed #f59e0b; background: rgba(245,158,11,.10); border-radius: 3px;
 }
 .dock-float-btn[data-on="on"] { background: #3b6ef0 !important; color: #fff !important; }
 
