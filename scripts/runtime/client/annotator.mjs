@@ -2774,9 +2774,30 @@ export function mountAnnotator(options = {}) {
       ? findTask(state.editingId)?.meta?.region
       : state.pendingMeta?.region;
     if (el || metaRegion) {
-      const rect = metaRegion
-        ? { left: metaRegion.x, top: metaRegion.y, width: metaRegion.width, height: metaRegion.height }
-        : el.getBoundingClientRect();
+      let rect;
+      if (metaRegion) {
+        // meta.region 是画框时的冻结视口坐标，布局/滚动变化后必然失真——
+        // 优先用主元素+附带元素的实时矩形并集罩住整组，解析不到才回退 region
+        const live = [];
+        if (el) live.push(el.getBoundingClientRect());
+        const extras = state.editingId
+          ? findTask(state.editingId)?.meta?.extraElements
+          : state.pendingMeta?.extraElements;
+        for (const e of extras || []) {
+          const n = e && e.selector ? resolveElement(e.selector) : null;
+          if (n) live.push(n.getBoundingClientRect());
+        }
+        rect = live.length
+          ? {
+              left: Math.min(...live.map(r => r.left)),
+              top: Math.min(...live.map(r => r.top)),
+              width: Math.max(...live.map(r => r.right)) - Math.min(...live.map(r => r.left)),
+              height: Math.max(...live.map(r => r.bottom)) - Math.min(...live.map(r => r.top)),
+            }
+          : { left: metaRegion.x, top: metaRegion.y, width: metaRegion.width, height: metaRegion.height };
+      } else {
+        rect = el.getBoundingClientRect();
+      }
       const pad = 5;
       // 0 尺寸（元素被隐藏/移除）没有可高亮的区域，退回纯遮罩
       if (rect.width > 0 && rect.height > 0) {
@@ -4286,6 +4307,7 @@ export function mountAnnotator(options = {}) {
     hideSizeBadge();
     syncBarAnchored();
     repositionEditor();
+    updateFocusFx();
   }
 
   function onVisibilityChange() {
@@ -4313,7 +4335,7 @@ export function mountAnnotator(options = {}) {
     // resize，pin 与打开中的编辑器都会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
     const domObserver = new MutationObserver(() => {
       clearTimeout(domObserver._t);
-      domObserver._t = setTimeout(() => { repositionPins(); repositionEditor(); repositionRegionMarks(); }, 300);
+      domObserver._t = setTimeout(() => { repositionPins(); repositionEditor(); repositionRegionMarks(); updateFocusFx(); }, 300);
     });
     domObserver.observe(document.body, { childList: true, subtree: true });
     document.addEventListener('visibilitychange', onVisibilityChange, true);
