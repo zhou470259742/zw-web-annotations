@@ -267,10 +267,15 @@ export function createAnnotationsMiddleware(options = {}) {
       if (req.method === 'GET' && route === '/send-payload') {
         return sendJson(res, 410, { error: 'send-payload is retired', tasksPath: store.taskDir, protocolPath: await protocolPathOrNull() });
       }
-      // 删除任务：按页面 URL 解析任务组，删除后同步清理 JSON 与无主附件
+      // 删除任务：按页面 URL 解析任务组，删除后同步清理 JSON 与无主附件；
+      // allGroups 表示跨页面全量清空（面板「清空」按钮的语义就是清所有标注）
       if (req.method === 'POST' && route === '/delete') {
         const raw = await readBody(req);
         const payload = raw ? JSON.parse(raw) : {};
+        if (payload.allGroups) {
+          const result = await store.removeAllTasks({ force: !!payload.force });
+          return sendJson(res, 200, { ok: true, ...result });
+        }
         const pageUrl = payload.pageUrl || (payload.page && payload.page.url);
         if (!pageUrl && !payload.groupId) return sendJson(res, 400, { error: 'pageUrl is required' });
         const result = pageUrl

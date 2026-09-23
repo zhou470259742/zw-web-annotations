@@ -1511,6 +1511,25 @@ export function createStore(workspace, options = {}) {
   };
 
   /**
+   * 清空**全部**页面分组的任务：逐组走 removeTasks 的同一套规则——
+   * 处理中任务默认保留（force 可强制）、空组连 JSON 一起删、无主附件清理、
+   * 轮次交付检查逐组执行。聚合回报供客户端如实告知实际清除量。
+   */
+  const removeAllTasks = async ({ force = false } = {}) => {
+    const groups = await listGroups();
+    let removed = 0, attachmentsRemoved = 0, groupsRemoved = 0;
+    const skipped = [];
+    for (const group of groups) {
+      const res = await removeTasks(group.id, { all: true, force });
+      removed += res.removed;
+      attachmentsRemoved += res.attachmentsRemoved || 0;
+      if (res.fileRemoved) groupsRemoved++;
+      skipped.push(...(res.skipped || []));
+    }
+    return { removed, skipped, groups: groups.length, groupsRemoved, attachmentsRemoved };
+  };
+
+  /**
    * 归档：把组内命中状态（默认 done/cancelled）的任务移入
    * archive/<groupId>.json。归档文件与任务组同 schema，可被同一套
    * 校验读回；同一组多次归档按任务 id 幂等合并——再次归档同一任务
@@ -1697,6 +1716,7 @@ export function createStore(workspace, options = {}) {
     updateTask: (groupId, patch) => queueWrite(() => updateTask(groupId, patch)),
     acceptTasks: options => queueWrite(() => acceptTasks(options)),
     removeTasks: (groupIdOrUrl, options) => queueWrite(() => removeTasks(groupIdOrUrl, options)),
+    removeAllTasks: options => queueWrite(() => removeAllTasks(options)),
     archiveTasks: (groupIdOrUrl, options) => queueWrite(() => archiveTasks(groupIdOrUrl, options)),
     completeRound: round => queueWrite(() => completeRound(round)),
     purgeArchive: (groupIdOrUrl, options) => queueWrite(() => purgeArchive(groupIdOrUrl, options)),

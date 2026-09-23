@@ -1735,16 +1735,18 @@ export function mountAnnotator(options = {}) {
    * 把删除同步到工作区：按页面归组，传要删的 id / 选择器，
    * 或 all=true 表示该页面任务已清空，直接删掉 JSON 与附件。
    */
-  async function deleteRemote({ ids = [], selectors = [], all = false } = {}) {
+  async function deleteRemote({ ids = [], selectors = [], all = false, allGroups = false } = {}) {
     if (!config.autoSync) return null;
     try {
-      const body = all
-        ? { groupId: null, page: pagePayload().page, ids: [], selectors: [], all: true }
-        : { groupId: null, page: pagePayload().page, ids, selectors };
+      const body = allGroups
+        ? { allGroups: true, all: true }
+        : all
+          ? { groupId: null, page: pagePayload().page, ids: [], selectors: [], all: true }
+          : { groupId: null, page: pagePayload().page, ids, selectors };
       const response = await fetch(`${config.endpoint}/delete`, {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-zwa-client': 'annotator' },
-        body: JSON.stringify({ ...body, pageUrl }),
+        body: JSON.stringify({ ...body, ...(allGroups ? {} : { pageUrl }) }),
       });
       const data = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
@@ -1755,9 +1757,11 @@ export function mountAnnotator(options = {}) {
       if (kept) {
         state.syncMessage = `工作区已删除 ${data.removed ?? 0} 项；${kept} 项正在处理中，已保留。`;
       } else {
-        state.syncMessage = all
-          ? '已清空工作区中该页面的任务数据。'
-          : `已同步删除 ${data.removed ?? ids.length} 项。`;
+        state.syncMessage = allGroups
+          ? '已清空工作区中全部页面的任务数据。'
+          : all
+            ? '已清空工作区中该页面的任务数据。'
+            : `已同步删除 ${data.removed ?? ids.length} 项。`;
       }
       if (!kept && state.outbox.length) {
         ackOutbox(Math.max(0, ...state.outbox.map(op => Number(op.seq) || 0)));
@@ -3483,27 +3487,35 @@ export function mountAnnotator(options = {}) {
   }
 
   /**
-   * 清空当前页面全部标注，并删除工作区中对应数据。
+   * 清空**全部页面**的标注，并删除工作区中对应数据。
+   *
+   * 面板展示的是跨页面队列，用户看到的「全部标注」就是全部分组——
+   * 只清当前页会让其他页面残留，且当前页为空时报「还没有标注」明显答非所问。
    *
    * 处理中的任务不在清空范围内：它们正被某个处理者改代码，清掉会让其回写的
-   * 结果无处可归。这里保留它们并如实告知，而不是假装已清空。
+   * 结果无处可归。当前页与其他页面分组同样按 doing 保留并如实告知。
    */
   function clearAll() {
     const locked = state.tasks.filter(t => t.status === 'doing');
     const ids = state.tasks.map(task => task.id);
     state.tasks = locked;
+    // 其它页面分组按同一规则本地收敛：只保留各组里处理中的任务，
+    // 全空分组整组移除——与服务端 removeAllTasks 的保护语义一致。
+    const remoteLocked = state.groups.reduce((n, g) => n + (g.tasks || []).filter(t => t.status === 'doing').length, 0);
+    state.groups = state.groups
+      .map(g => ({ ...g, tasks: (g.tasks || []).filter(t => t.status === 'doing') }))
+      .filter(g => g.tasks.length);
     queueOutbox('delete', { ids });
     persistLocal();
     closeEditor();
     renderPins();
     renderList();
-    // 一律发 all: true，由服务端按状态自行保留处理中的任务。
-    // 这里若改成传 ids，就必须传「要删的」id；曾把 locked 的 id 当成删除目标
-    // 发出去，等于请求删掉唯一该保留的任务，与意图完全相反。
-    deleteRemote({ all: true });
-    state.syncMessage = locked.length
-      ? `已清空其余标注；${locked.length} 项处理中的标注已保留，不能被清空。`
-      : '已清空当前页面的标注，并删除工作区数据。';
+    // 一律发 allGroups: true，由服务端逐组按状态自行保留处理中的任务。
+    deleteRemote({ all: true, allGroups: true });
+    const kept = locked.length + remoteLocked;
+    state.syncMessage = kept
+      ? `已清空其余标注；${kept} 项处理中的标注已保留，不能被清空。`
+      : '已清空全部页面的标注，并删除工作区数据。';
     renderMessage();
   }
 
@@ -5121,23 +5133,28 @@ export function mountAnnotator(options = {}) {
       else if (act === 'toggle') setActive(!state.active);
       else if (act === 'freeze') setFrozen(!state.frozen);
       else if (act === 'clear') {
-        if (!state.tasks.length) {
+        // 清空范围是全项目（面板队列本来就跨页面展示）——只数当前页
+        // 会让「本页无标注、别页有 4 条」时报「还没有标注」
+        const all = allProjectTasks();
+        if (!all.length) {
           state.syncMessage = '还没有标注。';
           renderMessage();
         } else {
-          const locked = state.tasks.filter(t => t.status === 'doing');
-          const removable = state.tasks.length - locked.length;
+          const locked = all.filter(t => t.status === 'doing').length;
+          const removable = all.length - locked;
           if (!removable) {
             // 全部都在处理中：没有可清空的内容，如实说明而不是弹一个清不掉确认框
-            state.syncMessage = `${locked.length} 项标注正在处理中，均不能清空。可等处理完成，或让处理者标记为阻塞/取消。`;
+            state.syncMessage = `${locked} 项标注正在处理中，均不能清空。可等处理完成，或让处理者标记为阻塞/取消。`;
             renderMessage();
           } else {
+            const otherPages = state.groups.filter(g => (g.tasks || []).length).length;
+            const scope = otherPages ? `（含其它 ${otherPages} 个页面）` : '';
             askConfirm({
               title: '清空全部标注？',
-              detail: locked.length
-                ? `将删除当前页面可清空的 ${removable} 项标注及其图片附件；另有 ${locked.length} 项正在处理中，会被保留。此操作不可撤销。`
-                : `将删除当前页面的 ${state.tasks.length} 项标注，同时移除工作区中对应的 JSON 数据与图片附件。此操作不可撤销。`,
-              confirmText: locked.length ? `清空 ${removable} 项` : '清空并删除',
+              detail: locked
+                ? `将删除全部页面可清空的 ${removable} 项标注${scope}及其图片附件；另有 ${locked} 项正在处理中，会被保留。此操作不可撤销。`
+                : `将删除全部页面的 ${all.length} 项标注${scope}，同时移除工作区中对应的 JSON 数据与图片附件。此操作不可撤销。`,
+              confirmText: `清空 ${removable} 项`,
               onConfirm: clearAll,
             });
           }
