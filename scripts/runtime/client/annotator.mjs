@@ -6569,7 +6569,10 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel {
   background: var(--zwa-surface); color: var(--zwa-text);
   border-color: var(--zwa-border-strong);
-  box-shadow: 0 16px 40px var(--zwa-shadow);
+  /* 双层投影把面板从浅色页面上托起来：大范围弥散层 + 贴近的定向层 */
+  box-shadow:
+    0 24px 64px rgba(30,40,70,.18),
+    0 6px 20px rgba(30,40,70,.12);
 }
 :host([data-zwa-theme="light"]) .panel-version { background: var(--zwa-surface-soft); color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel-collapse { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
