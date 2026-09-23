@@ -717,21 +717,50 @@ let _domWatchBound = false;
 function bindDomWatch() {
   if (_domWatchBound || typeof MutationObserver === 'undefined') return;
   _domWatchBound = true;
+  // childList 之外还必须盯 class/style 属性变更：侧栏收展、:class 绑定切换
+  // （如 .raised）、el-popup-parent--hidden 滚动锁定等都不增删节点，却改变布局；
+  // 否则旧快照在缓存窗口内被复用，红框按新 rect 画到旧版面上必然偏移。
+  // shadow DOM 不穿透，标注 UI 自身的 hover/描边变动不会误触发。
   new MutationObserver(recs => {
     for (const r of recs) {
-      if (r.addedNodes.length || r.removedNodes.length) { _domVer++; break; }
+      if (r.type === 'attributes' || r.addedNodes.length || r.removedNodes.length) { _domVer++; break; }
     }
-  }).observe(document.documentElement, { childList: true, subtree: true });
+  }).observe(document.documentElement, {
+    childList: true, subtree: true,
+    attributes: true, attributeFilter: ['class', 'style'],
+  });
   // resize/缩放会触发断点切换与重排但不增删 DOM，MutationObserver 捕不到；
   // 图片/字体等资源加载完成撑开布局同理（捕获阶段的资源 load 事件）。
   // 这两类都会让旧快照里的元素位置过期——一并使缓存失效
   window.addEventListener('resize', () => { _domVer++; });
   document.addEventListener('load', () => { _domVer++; }, true);
 }
+/** 等仍在跑的有限时长 CSS 动画/过渡收敛再序列化：
+ *  动画中途克隆会把 transform/位移的中间态冻结进图（如卡片 bottom 0.25s 过渡），
+ *  而红框按点击瞬间 rect 画——两者错位。无限循环动画（spinner 等）不等待。
+ *  只等主文档动画：本组件 UI 在 shadow DOM 里，不纳入。 */
+async function settleAnimations() {
+  try {
+    if (typeof document.getAnimations !== 'function') return;
+    const running = document.getAnimations({ subtree: false }).filter(a => {
+      if (a.playState !== 'running') return false;
+      const t = a.effect?.getTiming?.();
+      return t && t.iterations !== Infinity;
+    });
+    if (!running.length) return;
+    await Promise.race([
+      Promise.allSettled(running.map(a => a.finished)),
+      new Promise(r => setTimeout(r, 600)),
+    ]);
+  } catch {}
+}
+
 export function pageSnapshot(endpoint, hostId = HOST_ID) {
   const now = performance.now();
   if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS && _pageSnap.domVer === _domVer) return _pageSnap.promise;
-  const promise = loadDomshot(endpoint)
+  const promise = Promise.resolve()
+    .then(() => settleAnimations())
+    .then(() => loadDomshot(endpoint))
     .then(mod => (mod
       ? mod.domToCanvas(document.documentElement, {
         scale: 0.75,
@@ -760,13 +789,20 @@ function scheduleSnapshot(endpoint) {
   ric(() => { pageSnapshot(endpoint); }, { timeout: 3000 });
 }
 
-export async function captureContextShot(endpoint, rect, hostId = HOST_ID) {
+export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveEl = null) {
   try {
     if (!rect) return null;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
     const full = await pageSnapshot(endpoint, hostId);
     if (!full) return null;
+    // 快照 settle 完成后以元素当前位置复测 rect：若点击到出图之间
+    // 元素位移（过渡动画、侧栏收展撑开布局等），红框跟着成图里的实际位置走，
+    // 而不是点击瞬间的旧位置
+    if (liveEl && liveEl.isConnected && typeof liveEl.getBoundingClientRect === 'function') {
+      const r = liveEl.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+    }
     const sx = full.width / document.documentElement.scrollWidth || 1;
     const sy = full.height / document.documentElement.scrollHeight || 1;
     const out = document.createElement('canvas');
@@ -4117,9 +4153,10 @@ export function mountAnnotator(options = {}) {
       clearMultiPick();
     }
     const existing = findTaskBySelector(element.selector);
-    // 截图推迟一拍启动：让编辑器/弹窗先渲染，DOM 序列化不占 pick 帧
+    // 截图推迟一拍启动：让编辑器/弹窗先渲染，DOM 序列化不占 pick 帧；
+    // 传入活元素供成图前复测 rect（点击到出图之间元素位移时红框跟最终位置）
     state.pendingShot = new Promise(res =>
-      setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+      setTimeout(() => captureContextShot(config.endpoint, element.rect, HOST_ID, target).then(res), 0)
     );
     if (existing) {
       existing.element = element;
@@ -4210,10 +4247,11 @@ export function mountAnnotator(options = {}) {
       const element = state.multiPick[state.multiPick.length - 1];
       const extras = state.multiPick.slice(0, -1);
       if (extras.length) state.pendingMeta = { extraElements: extras };
-      state.pendingMarkEls = [state.multiPickEls[state.multiPickEls.length - 1], ...state.multiPickEls.slice(0, -1)].filter(Boolean);
+      const primaryEl = state.multiPickEls[state.multiPickEls.length - 1];
+      state.pendingMarkEls = [primaryEl, ...state.multiPickEls.slice(0, -1)].filter(Boolean);
       clearMultiPick();
       state.pendingShot = new Promise(res =>
-        setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+        setTimeout(() => captureContextShot(config.endpoint, element.rect, HOST_ID, primaryEl).then(res), 0)
       );
       const existing = findTaskBySelector(element.selector);
       if (existing) {
@@ -5402,7 +5440,7 @@ export function mountAnnotator(options = {}) {
       // 导致页面上只要有一条手动任务，api.add 就再也标不了元素。
       const existing = state.tasks.find(t => t.element?.selector === element.selector);
       state.pendingShot = new Promise(res =>
-        setTimeout(() => captureContextShot(config.endpoint, element.rect).then(res), 0)
+        setTimeout(() => captureContextShot(config.endpoint, element.rect, HOST_ID, el).then(res), 0)
       );
       if (existing) {
         openEditorFor(existing.id);
