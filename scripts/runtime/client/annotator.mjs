@@ -6103,13 +6103,13 @@ const CSS_TEXT = `
 .panel.retracted { display: none; }
 /* 固定模式钮：吸边才出现；on=已固定 */
 .panel-pin {
-  flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px;
+  flex: none; width: 24px; height: 24px; border: 0; border-radius: 6px;
   background: none; color: #9a9aa6; cursor: pointer;
   display: inline-flex; align-items: center; justify-content: center;
 }
 .panel-pin:hover { background: #333; color: #fff; }
 .panel-pin.on { color: #b7ade8; background: #2b2840; }
-.panel-pin svg { width: 14px; height: 14px; }
+.panel-pin svg { width: 16px; height: 16px; }
 /* 悬浮模式边耳：屏幕边缘细条，悬停滑出面板 */
 .panel-edge-tab {
   position: fixed; top: 50%; transform: translateY(-50%);
