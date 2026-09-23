@@ -4766,8 +4766,8 @@ export function mountAnnotator(options = {}) {
           ${thumbs ? `<span class="arch-thumbs item-thumbs">${thumbs}</span>` : ''}
           <span class="arch-task-name">${escapeHtml(name)}</span>
           <span class="arch-task-acts">
-            <button type="button" class="arch-reject" data-act="reject-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" data-url="${escapeHtml(group.page?.url || '')}" title="打回重做：任务回到待执行并跳转页面打开标注编辑">打回</button>
             <button type="button" data-act="archive-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" title="归档此任务">归档</button>
+            <button type="button" class="arch-reject" data-act="reject-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" data-url="${escapeHtml(group.page?.url || '')}" title="打回重做：任务回到待执行并跳转页面打开标注编辑">打回</button>
           </span>
         </div>`;
       }).join('');
@@ -6328,7 +6328,7 @@ const CSS_TEXT = `
   font-style: normal; font-size: 10px; font-weight: 700; color: #fff;
   background: rgba(10, 12, 20, .55); border-radius: 4px; pointer-events: none;
 }
-/* 操作钮纵向一列钉右端：打回上、归档下，整列垂直居中 */
+/* 操作钮纵向一列钉右端：归档上、打回下，整列垂直居中 */
 .arch-task-acts {
   flex: none; margin-left: auto; align-self: center;
   display: flex; flex-direction: column; gap: 4px;
