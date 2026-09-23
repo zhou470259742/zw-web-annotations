@@ -722,6 +722,11 @@ function bindDomWatch() {
       if (r.addedNodes.length || r.removedNodes.length) { _domVer++; break; }
     }
   }).observe(document.documentElement, { childList: true, subtree: true });
+  // resize/缩放会触发断点切换与重排但不增删 DOM，MutationObserver 捕不到；
+  // 图片/字体等资源加载完成撑开布局同理（捕获阶段的资源 load 事件）。
+  // 这两类都会让旧快照里的元素位置过期——一并使缓存失效
+  window.addEventListener('resize', () => { _domVer++; });
+  document.addEventListener('load', () => { _domVer++; }, true);
 }
 export function pageSnapshot(endpoint, hostId = HOST_ID) {
   const now = performance.now();
