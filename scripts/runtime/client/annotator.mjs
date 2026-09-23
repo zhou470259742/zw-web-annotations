@@ -6315,7 +6315,7 @@ const CSS_TEXT = `
 }
 .arch-thumbs { display: flex; gap: 4px; flex: none; padding-top: 1px; }
 .arch-thumb {
-  width: 34px; height: 24px; object-fit: cover; border-radius: 4px;
+  width: 64px; height: 44px; object-fit: cover; border-radius: 4px;
   border: 1px solid #3a3a46; cursor: zoom-in; display: block;
 }
 .arch-thumb:hover { border-color: #7a63c9; }
@@ -6427,7 +6427,7 @@ const CSS_TEXT = `
 .panel .item-body .item-instruction textarea { margin-top: 0; }
 .panel .item-thumbs { display: flex; gap: 4px; margin: 5px 0 0; flex-wrap: wrap; }
 .panel .item-thumbs img {
-  width: 36px; height: 36px; object-fit: cover;
+  width: 64px; height: 44px; object-fit: cover;
   border: 1px solid #3f3f3f; border-radius: 5px; display: block;
 }
 .panel .thumb-file {
