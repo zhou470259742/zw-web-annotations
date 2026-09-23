@@ -6535,9 +6535,12 @@ const CSS_TEXT = `
   --zwa-text-muted: #8a92a3;
   --zwa-shadow: rgba(15, 23, 42, .14);
 }
+/* 药丸/悬浮钮同面板语言：半透明白玻璃 + 柔光投影 */
 :host([data-zwa-theme="light"]) .dock {
-  background: var(--zwa-surface); border-color: var(--zwa-border-strong);
-  box-shadow: 0 8px 22px var(--zwa-shadow);
+  background: rgba(255,255,255,.78); border-color: rgba(213,216,226,.9);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+  box-shadow: 0 8px 24px rgba(30,40,70,.16), inset 0 1px 0 rgba(255,255,255,.9);
 }
 :host([data-zwa-theme="light"]) .dock-btn { color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .dock-btn:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
@@ -6547,13 +6550,17 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .dock-sep { background: var(--zwa-border); }
 /* 悬浮快捷按钮/进度条/边缘耳片此前只有暗色硬编码，明亮主题下显突兀黑块 */
 :host([data-zwa-theme="light"]) .dock-float-btn {
-  background: var(--zwa-surface); color: var(--zwa-text-secondary);
-  border-color: var(--zwa-border-strong);
-  box-shadow: 0 6px 18px var(--zwa-shadow, rgba(31,36,48,.14));
+  background: rgba(255,255,255,.78); color: var(--zwa-text-secondary);
+  border-color: rgba(213,216,226,.9);
+  backdrop-filter: blur(10px) saturate(1.4);
+  -webkit-backdrop-filter: blur(10px) saturate(1.4);
+  box-shadow: 0 6px 18px rgba(30,40,70,.14), inset 0 1px 0 rgba(255,255,255,.9);
 }
-:host([data-zwa-theme="light"]) .dock-float-btn:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); border-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .dock-float-btn:hover {
+  background: rgba(236,234,255,.9); color: #4a3fc0; border-color: rgba(190,184,240,.9);
+}
 :host([data-zwa-theme="light"]) .dock-progress { background: var(--zwa-border); }
-:host([data-zwa-theme="light"]) .dock-edge-tab { background: var(--zwa-surface); color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .dock-edge-tab { background: rgba(255,255,255,.78); color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .toast {
   background: var(--zwa-surface); color: var(--zwa-text);
   border-color: var(--zwa-border-strong);
