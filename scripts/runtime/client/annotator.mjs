@@ -6581,6 +6581,16 @@ const CSS_TEXT = `
 }
 :host([data-zwa-theme="light"]) .dock-progress { background: var(--zwa-border); }
 :host([data-zwa-theme="light"]) .dock-edge-tab { background: rgba(255,255,255,.78); color: var(--zwa-text-muted); }
+/* 悬耳进度条浅色版：暗色轨道在白底上发灰看不清，换浅蓝灰轨道+亮紫填充 */
+:host([data-zwa-theme="light"]) .panel-edge-tab .pet-progress {
+  width: 5px;
+  background: #dde1ee;
+  box-shadow: inset 0 0 0 1px rgba(150,160,195,.25);
+}
+:host([data-zwa-theme="light"]) .panel-edge-tab .pet-progress-fill {
+  background: linear-gradient(180deg, #8b7ae8, #6a5bd6);
+}
+:host([data-zwa-theme="light"]) .panel-edge-tab .pet-progress-fill[data-done="on"] { background: linear-gradient(180deg, #43c07f, #2f9e63); }
 :host([data-zwa-theme="light"]) .toast {
   background: var(--zwa-surface); color: var(--zwa-text);
   border-color: var(--zwa-border-strong);
