@@ -756,10 +756,27 @@ async function settleAnimations() {
   } catch {}
 }
 
-export function pageSnapshot(endpoint, hostId = HOST_ID) {
-  const now = performance.now();
-  if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS && _pageSnap.domVer === _domVer) return _pageSnap.promise;
-  const promise = Promise.resolve()
+/**
+ * foreignObject 内嵌文档继承宿主 devicePixelRatio：非整数 dpr（浏览器缩放
+ * 125%/150% 等）下 Chrome 对 flex item 的子像素收缩与活页不一致——恰满的
+ * flex 行会被多压出 1~2px，表现为顶栏文字折行、定宽卡片被收窄容器裁短等
+ * 「页面被挤压」。序列化窗口内全局禁止 flex 收缩（活页本就装得下，视觉无感），
+ * 克隆体按原始尺寸排版宁可溢出也不收缩。实测 dpr=1.8 复现挤压并消除。
+ */
+const SHOT_ANTIDRIFT_CSS = '*{flex-shrink:0 !important}';
+/**
+ * 目标打标色：页面内容不可能出现的品红。序列化前给活元素挂 outline 标记
+ * （computed outline 经内联白名单进克隆体），光栅化后从位图扫回标记环——
+ * 元素在成图里的真实绘制位置，红框随之精确贴合（防克隆体布局漂移导致偏移）。
+ */
+const SHOT_MARK_COLOR = '#FF00FF';
+const SHOT_MARK_CSS = `[data-zwa-shot-target]{outline:4px solid ${SHOT_MARK_COLOR} !important}`;
+
+function serializePage(endpoint, hostId = HOST_ID) {
+  const antiDrift = document.createElement('style');
+  antiDrift.textContent = SHOT_ANTIDRIFT_CSS;
+  document.head.appendChild(antiDrift);
+  return Promise.resolve()
     .then(() => settleAnimations())
     .then(() => loadDomshot(endpoint))
     .then(mod => (mod
@@ -784,9 +801,40 @@ export function pageSnapshot(endpoint, hostId = HOST_ID) {
         },
       })
       : null))
-    .catch(() => null);
+    .catch(() => null)
+    .finally(() => antiDrift.remove());
+}
+
+export function pageSnapshot(endpoint, hostId = HOST_ID) {
+  const now = performance.now();
+  if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS && _pageSnap.domVer === _domVer) return _pageSnap.promise;
+  const promise = serializePage(endpoint, hostId);
   _pageSnap = { t: now, promise, domVer: _domVer };
   return promise;
+}
+
+/** 在快照位图里扫描打标色像素，返回标记环外缘包围盒（位图坐标），无标记返回 null */
+function scanMarkBounds(canvas) {
+  try {
+    const ctx2 = canvas.getContext('2d');
+    if (!ctx2) return null;
+    const { width, height } = canvas;
+    const data = ctx2.getImageData(0, 0, width, height).data;
+    let minX = width, minY = height, maxX = -1, maxY = -1;
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const i = (y * width + x) * 4;
+        // #FF00FF 容差匹配（抗锯齿边缘允许分量偏差）
+        if (data[i + 3] > 160 && data[i] > 190 && data[i + 1] < 110 && data[i + 2] > 190) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    return maxX < 0 ? null : { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+  } catch { return null; }
 }
 
 /** 空闲期预热快照：rIC 调度到浏览器空闲帧执行，避免点击「标注」瞬间同步阻塞；
@@ -801,15 +849,22 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     if (!rect) return null;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    const full = await pageSnapshot(endpoint, hostId);
-    if (!full) return null;
-    // 快照 settle 完成后以元素当前位置复测 rect：若点击到出图之间
-    // 元素位移（过渡动画、侧栏收展撑开布局等），红框跟着成图里的实际位置走，
-    // 而不是点击瞬间的旧位置
+    // 点选元素：序列化前给活元素挂品红 outline 标记并走新鲜快照（标记随元素
+    // 而变不进缓存）。克隆体在分数 dpr 下有亚像素布局漂移，红框按 live rect
+    // 画必然偏——标记环随元素在克隆体里一起排版，位图扫回即得真实绘制位置。
+    let unmark = null;
     if (liveEl && liveEl.isConnected && typeof liveEl.getBoundingClientRect === 'function') {
       const r = liveEl.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) rect = { x: r.x, y: r.y, width: r.width, height: r.height };
+      liveEl.setAttribute('data-zwa-shot-target', '1');
+      const markStyle = document.createElement('style');
+      markStyle.textContent = SHOT_MARK_CSS;
+      document.head.appendChild(markStyle);
+      unmark = () => { markStyle.remove(); liveEl.removeAttribute('data-zwa-shot-target'); };
     }
+    const full = await (unmark ? serializePage(endpoint, hostId) : pageSnapshot(endpoint, hostId));
+    if (unmark) unmark();
+    if (!full) return null;
     // 采样比按布局坐标算：scrollX/scrollY/innerWidth 是布局坐标系，
     // 而 rect/getBoundingClientRect 是视觉坐标（transform:scale 容器内被缩放）——
     // 但克隆体继承同样的 transform，元素在图里就画在视觉位置，
@@ -818,6 +873,20 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     const layoutH = Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight) || vh;
     const sx = full.width / layoutW || 1;
     const sy = full.height / layoutH || 1;
+    // 红框基准（视口 CSS 坐标）：优先位图扫回的标记环（outline 外缘 = 元素盒外 4px，
+    // 环内缘即 border-box）；扫不到回退 live rect
+    let mark = null;
+    let bx = rect.x, by = rect.y, bw = rect.width, bh = rect.height;
+    if (unmark) {
+      mark = scanMarkBounds(full);
+      if (mark) {
+        // 位图坐标 → 布局坐标（÷sx）→ 视口坐标（−scrollX）；outline 环厚 4 CSS px
+        bx = mark.x / sx - window.scrollX + 4;
+        by = mark.y / sy - window.scrollY + 4;
+        bw = mark.w / sx - 8;
+        bh = mark.h / sy - 8;
+      }
+    }
     const out = document.createElement('canvas');
     out.width = vw;
     out.height = vh;
@@ -829,9 +898,8 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     const srcY = Math.round(window.scrollY * sy);
     const srcW = Math.min(Math.round(vw * sx), full.width - srcX);
     const srcH = Math.min(Math.round(vh * sy), full.height - srcY);
-    const drawView = () => ctx.drawImage(full, srcX, srcY, srcW, srcH, 0, 0, vw, vh);
-    drawView();
-    const rx = Math.round(rect.x), ry = Math.round(rect.y), rw = Math.round(rect.width), rh = Math.round(rect.height);
+    ctx.drawImage(full, srcX, srcY, srcW, srcH, 0, 0, vw, vh);
+    const rx = Math.round(bx), ry = Math.round(by), rw = Math.round(bw), rh = Math.round(bh);
     // 遮罩压暗四周、亮区只重绘红框那一小条（不整幅二次绘制）
     ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
     ctx.fillRect(0, 0, vw, vh);
@@ -841,9 +909,11 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
       (rw + 8) * sx, (rh + 8) * sy,
       rx - 4, ry - 4, rw + 8, rh + 8,
     );
+    // 红框压在标记环中心（元素盒外 2px）：5px 线宽完全盖住 4px 品红标记环，
+    // 无标记时沿用旧样式（元素盒外 4px、3px 线宽）
     ctx.strokeStyle = '#FF584D';
-    ctx.lineWidth = 3;
-    ctx.strokeRect(rx - 4, ry - 4, rw + 8, rh + 8);
+    ctx.lineWidth = mark ? 5 : 3;
+    ctx.strokeRect(rx - (mark ? 2 : 4), ry - (mark ? 2 : 4), rw + (mark ? 4 : 8), rh + (mark ? 4 : 8));
     // 双图策略（读图才耗 token）：
     //   ctx  = 目标 + 周边 ~480px 语境的裁剪图，挂 images[] 做默认证据
     //          （~300 token/次，全视口 ~1300 的零头）；
@@ -873,6 +943,7 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
         htmlZoom: dcs.zoom, htmlTransform: String(dcs.transform).slice(0, 60),
         bodyZoom: bcs.zoom, bodyTransform: String(bcs.transform).slice(0, 60),
         fullW: full.width, fullH: full.height,
+        markHit: !!mark,   // 位图是否扫回目标标记环（false=回退 live rect）
       };
     } catch {}
     return { ctx: crop.toDataURL('image/png'), full: out.toDataURL('image/png'), diag };
