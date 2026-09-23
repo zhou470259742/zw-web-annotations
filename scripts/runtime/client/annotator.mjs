@@ -2247,7 +2247,7 @@ export function mountAnnotator(options = {}) {
   }
 
   /** 一个页面分组的可折叠区块。 */
-  function renderGroupSection({ id, current, title, path, tasks }) {
+  function renderGroupSection({ id, current, title, path, url, tasks }) {
     const open = isGroupOpen(id, current);
     const doing = tasks.filter(t => t.status === 'doing').length;
     // 待验收单独标出：它是「子 agent 交活了、等人看」的状态，
@@ -2265,6 +2265,7 @@ export function mountAnnotator(options = {}) {
           ${review ? `<span class="group-badge review" title="${review} 项待验收">待验${review}</span>` : ''}
           <span class="group-sub">${escapeHtml(truncate(path, 24))}</span>
           <span class="group-count">${tasks.length}${doing ? ` · 🔒${doing}` : ''}</span>
+          ${!current ? `<button type="button" class="group-goto" data-act="group-goto" data-url="${escapeHtml(url || '')}" title="跳转到 ${escapeHtml(title || path)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7M9 7h8v8"/></svg></button>` : ''}
         </header>
         <div class="group-body${open ? '' : ' hidden'}">${body}</div>
       </section>`;
@@ -2311,6 +2312,7 @@ export function mountAnnotator(options = {}) {
           current: false,
           title: group.page?.title || group.page?.url || '其它页面',
           path: safePathname(group.page?.url || ''),
+          url: group.page?.url || '',
           tasks,
         }),
       );
@@ -2328,7 +2330,11 @@ export function mountAnnotator(options = {}) {
       el.addEventListener('mouseleave', () => flashPin(el.dataset.item, false));
     });
     list.querySelectorAll('[data-group-toggle]').forEach(el => {
-      el.onclick = () => toggleGroup(el.dataset.groupToggle, el.dataset.current === 'on');
+      el.onclick = e => {
+        // 组头内的动作钮（如跳页）不触发折叠
+        if (e.target.closest('[data-act]')) return;
+        toggleGroup(el.dataset.groupToggle, el.dataset.current === 'on');
+      };
     });
     list.querySelectorAll('[data-edit]').forEach(el => {
       el.oninput = () => {
@@ -5111,7 +5117,7 @@ export function mountAnnotator(options = {}) {
         renderArchiveDrawer();
         persistArchDrawer();
       }
-      else if (act === 'arch-goto') {
+      else if (act === 'arch-goto' || act === 'group-goto') {
         const url = actBtn.getAttribute('data-url');
         if (url && url !== pageUrl) {
           // 跳转前落盘抽屉状态：新页面加载后自动还原抽屉与展开态
@@ -6511,6 +6517,13 @@ const CSS_TEXT = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .group-count { flex: none; color: #8f8f8f; font-size: 10px; }
+/* 组内跳页钮：只挂在非当前页组头（当前页跳自己无意义） */
+.group-goto {
+  flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px; cursor: pointer;
+  background: none; color: #8b8b96; display: inline-flex; align-items: center; justify-content: center;
+}
+.group-goto:hover { background: #333; color: #dedaff; }
+.group-goto svg { width: 12px; height: 12px; }
 .panel footer { padding: 8px 11px 10px; border-top: 1px solid #333; }
 /* 提示行单行显示：长回执（如模式切换）超出即省略号截断，不再折行把面板撑高。
    min-width:0 允许 flex/grid 环境下收缩；完整文案通过 title 悬停可见。 */
@@ -6713,12 +6726,15 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .item.locked .item-title { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel .item.locked textarea { background: #f6f7fa; color: var(--zwa-text-muted); cursor: not-allowed; }
 :host([data-zwa-theme="light"]) .panel .lock-note { color: #b07d1c; border-color: #e2d3ac; }
-:host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: rgba(190,184,240,.8); background: rgba(240,238,255,.62); }
-/* 页面分组头：玻璃质感——半透明白 + 背景模糊 + 顶部内高光 */
+:host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: rgba(190,184,240,.8); }
+:host([data-zwa-theme="light"]) .group-goto { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .group-goto:hover { background: var(--zwa-surface-hover); color: #4f5bd5; }
+/* 页面分组头：玻璃质感——半透明白 + 背景模糊 + 顶部内高光。
+   当前页只靠紫边+徽标区分，底色与非当前页统一。 */
 :host([data-zwa-theme="light"]) .group-head {
   border-color: rgba(215,220,235,.8); border-radius: 9px;
   padding: 7px 10px;
-  background: rgba(255,255,255,.62);
+  background: rgba(255,255,255,.72);
   backdrop-filter: blur(10px) saturate(1.4);
   -webkit-backdrop-filter: blur(10px) saturate(1.4);
   box-shadow: 0 1px 2px rgba(30,40,70,.05), inset 0 1px 0 rgba(255,255,255,.85);
