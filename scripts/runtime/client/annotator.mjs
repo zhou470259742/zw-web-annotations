@@ -4752,8 +4752,8 @@ export function mountAnnotator(options = {}) {
           ? `<span class="arch-thumb-wrap" data-srcs="${escapeHtml(JSON.stringify(srcs))}"><img class="arch-thumb" loading="lazy" src="${escapeHtml(srcs[0])}" alt="">${srcs.length > 1 ? `<i class="arch-thumb-n">${srcs.length}</i>` : ''}</span>`
           : '';
         return `<div class="arch-task">
-          <span class="arch-task-name">${escapeHtml(name)}</span>
           ${thumbs ? `<span class="arch-thumbs item-thumbs">${thumbs}</span>` : ''}
+          <span class="arch-task-name">${escapeHtml(name)}</span>
           <span class="arch-task-acts">
             <button type="button" class="arch-reject" data-act="reject-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" data-url="${escapeHtml(group.page?.url || '')}" title="打回重做：任务回到待执行并跳转页面打开标注编辑">打回</button>
             <button type="button" data-act="archive-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" title="归档此任务">归档</button>
