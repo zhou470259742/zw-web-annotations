@@ -6488,7 +6488,7 @@ const CSS_TEXT = `
   display: flex; align-items: center; gap: 6px;
   padding: 5px 7px; margin: 0 1px 2px;
   border: 1px solid #2e2e2e; border-radius: 7px;
-  background: #191919; cursor: pointer; user-select: none;
+  background: #191919; cursor: default; user-select: none;
 }
 .group-head:hover { background: #232323; }
 .group-chevron {
