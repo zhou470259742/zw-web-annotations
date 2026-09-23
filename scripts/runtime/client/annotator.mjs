@@ -5147,13 +5147,21 @@ export function mountAnnotator(options = {}) {
             state.syncMessage = `${locked} 项标注正在处理中，均不能清空。可等处理完成，或让处理者标记为阻塞/取消。`;
             renderMessage();
           } else {
+            // 状态分解：archived/done 等不出现在待执行列表，只说总数会让人以为
+            // 数字对不上——把每一类都点名
+            const LABELS = { todo: '待执行', done: '待验收', archived: '待文件归档', cancelled: '已取消', blocked: '阻塞' };
+            const parts = Object.entries(LABELS)
+              .map(([k, label]) => {
+                const n = all.filter(t => t.status === k).length;
+                return n ? `${label} ${n}` : null;
+              })
+              .filter(Boolean);
+            const breakdown = parts.length > 1 ? `（${parts.join(' · ')}）` : '';
             const otherPages = state.groups.filter(g => (g.tasks || []).length).length;
-            const scope = otherPages ? `（含其它 ${otherPages} 个页面）` : '';
+            const scope = otherPages ? `，跨 ${otherPages + 1} 个页面分组` : '';
             askConfirm({
               title: '清空全部标注？',
-              detail: locked
-                ? `将删除全部页面可清空的 ${removable} 项标注${scope}及其图片附件；另有 ${locked} 项正在处理中，会被保留。此操作不可撤销。`
-                : `将删除全部页面的 ${all.length} 项标注${scope}，同时移除工作区中对应的 JSON 数据与图片附件。此操作不可撤销。`,
+              detail: `将删除共 ${removable} 项标注${breakdown}${scope}及其图片附件${locked ? `；另有 ${locked} 项正在处理中，会被保留` : ''}。此操作不可撤销。`,
               confirmText: `清空 ${removable} 项`,
               onConfirm: clearAll,
             });
