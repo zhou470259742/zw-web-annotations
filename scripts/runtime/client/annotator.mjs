@@ -6096,7 +6096,7 @@ const CSS_TEXT = `
   display: flex; flex-direction: column;
   /* 固定 500px：双折叠区布局需要确定高度才能等分；小屏兜底不溢出 */
   width: 340px; height: 500px; max-height: calc(100vh - 24px);
-  background: #1b1b1b; color: #eee;
+  background: #17181d; color: #eee;
   border: 1px solid #3f3f3f; border-radius: 12px;
   box-shadow: 0 16px 40px rgba(0,0,0,.5); overflow: hidden;
 }
@@ -6410,14 +6410,14 @@ const CSS_TEXT = `
 }
 .panel .empty { padding: 16px 5px; margin: 0; color: #8a8a8a; font-size: 12px; }
 .panel .item {
-  border: 1px solid #343434; border-radius: 9px; background: #212121;
-  padding: 8px 9px; margin: 7px 1px;
+  border: 1px solid #343434; border-radius: 12px; background: #232326;
+  padding: 10px 11px; margin: 8px 1px;
 }
 .panel .item.editing { border-color: #7c6cff; }
 .panel .item-head { display: flex; align-items: center; gap: 7px; }
 .panel .item-seq {
-  flex: none; width: 18px; height: 18px; border-radius: 50%;
-  background: #7c6cff; color: #fff; font-family: inherit; font-weight: 700; font-size: 10px; line-height: 18px; text-align: center;
+  flex: none; width: 22px; height: 22px; border-radius: 50%;
+  background: #7c6cff; color: #fff; font-family: inherit; font-weight: 700; font-size: 11px; line-height: 22px; text-align: center;
 }
 .panel .item-seq.manual { background: #d8a45a; color: #2b1e08; }
 /* 任务卡主体行：缩略图左 + 输入框右，与待归档检验行同款横排 */
@@ -6493,8 +6493,8 @@ const CSS_TEXT = `
 .group-head {
   display: flex; align-items: center; gap: 6px;
   padding: 5px 7px; margin: 0 1px 2px;
-  border: 1px solid #2e2e2e; border-radius: 7px;
-  background: #191919; cursor: default; user-select: none;
+  border: 1px solid #2e2e2e; border-radius: 10px;
+  background: #1e1e22; cursor: default; user-select: none;
   /* 行高钉死：徽标/跳页钮高度不同不得撑出行差 */
   min-height: 36px; box-sizing: border-box;
 }
