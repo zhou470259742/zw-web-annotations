@@ -6509,6 +6509,8 @@ const CSS_TEXT = `
 .group-badge {
   flex: none; padding: 0 5px; border-radius: 999px;
   background: #dedaff; color: #29215e; font-size: 9px; font-weight: 700;
+  /* 行高钉死在文字行高内：徽标不得把分组头撑得比无徽标行高 */
+  line-height: 14px;
 }
 /* 「当前」用靛蓝、待验收用琥珀，避免两个徽标同色分不清含义 */
 .group-badge.review { background: #4a3a1c; color: #e8c176; }
@@ -6734,12 +6736,12 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .group-head {
   border-color: rgba(200,208,238,.7); border-radius: 9px;
   padding: 7px 10px;
-  background: rgba(230,235,252,.45);
+  background: rgba(236,240,254,.36);
   backdrop-filter: blur(10px) saturate(1.4);
   -webkit-backdrop-filter: blur(10px) saturate(1.4);
   box-shadow: 0 1px 2px rgba(30,40,70,.05), inset 0 1px 0 rgba(255,255,255,.7);
 }
-:host([data-zwa-theme="light"]) .group-head:hover { background: rgba(230,235,252,.62); border-color: rgba(190,198,235,.85); }
+:host([data-zwa-theme="light"]) .group-head:hover { background: rgba(236,240,254,.55); border-color: rgba(190,198,235,.8); }
 :host([data-zwa-theme="light"]) .group-chevron { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .group-name { color: #333a46; }
 :host([data-zwa-theme="light"]) .group-badge { background: #dedaff; color: #29215e; }
