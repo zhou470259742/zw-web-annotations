@@ -6729,17 +6729,17 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: rgba(190,184,240,.8); }
 :host([data-zwa-theme="light"]) .group-goto { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .group-goto:hover { background: var(--zwa-surface-hover); color: #4f5bd5; }
-/* 页面分组头：玻璃质感——半透明白 + 背景模糊 + 顶部内高光。
+/* 页面分组头：淡蓝玻璃——浅蓝半透明 + 背景模糊 + 顶部内高光。
    当前页只靠紫边+徽标区分，底色与非当前页统一。 */
 :host([data-zwa-theme="light"]) .group-head {
-  border-color: rgba(215,220,235,.8); border-radius: 9px;
+  border-color: rgba(200,208,238,.7); border-radius: 9px;
   padding: 7px 10px;
-  background: rgba(255,255,255,.72);
+  background: rgba(230,235,252,.45);
   backdrop-filter: blur(10px) saturate(1.4);
   -webkit-backdrop-filter: blur(10px) saturate(1.4);
-  box-shadow: 0 1px 2px rgba(30,40,70,.05), inset 0 1px 0 rgba(255,255,255,.85);
+  box-shadow: 0 1px 2px rgba(30,40,70,.05), inset 0 1px 0 rgba(255,255,255,.7);
 }
-:host([data-zwa-theme="light"]) .group-head:hover { background: rgba(255,255,255,.82); border-color: rgba(200,206,228,.9); }
+:host([data-zwa-theme="light"]) .group-head:hover { background: rgba(230,235,252,.62); border-color: rgba(190,198,235,.85); }
 :host([data-zwa-theme="light"]) .group-chevron { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .group-name { color: #333a46; }
 :host([data-zwa-theme="light"]) .group-badge { background: #dedaff; color: #29215e; }
