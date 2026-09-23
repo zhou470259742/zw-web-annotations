@@ -6476,6 +6476,7 @@ const CSS_TEXT = `
 .progress-head .accept-btn:hover { background: #3a3120; }
 .panel .tag.warn { color: #d8a45a; }
 .panel button.link { border: 0; background: none; cursor: pointer; padding: 0; color: #c9c9c9; font: inherit; }
+.panel button.link[data-details] { font-size: 10px; }
 .panel button.link.danger { color: #e07a7a; font-size: 12px; }
 /* 待验收任务的「✓ 验收」：与删除同为行内链接，但用验收色区分语义 */
 .panel button.link.accept { color: #e0b968; font-size: 12px; }
