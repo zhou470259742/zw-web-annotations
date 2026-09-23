@@ -1313,10 +1313,21 @@ export function createStore(workspace, options = {}) {
     // 声明 activeRound 必须在任务落盘之后：先声明后写盘的窗口里，并发
     // roundSummary 会看到「activeRound 有值但本轮无活跃任务」而误自愈清空。
     const execution = await readExecution();
-    if (execution.activeRound !== task.round && task.round != null) {
+    // 孤儿归档判定必须先于 activeRound 跟随赋值：已交付轮次的任务被标
+    // archived（验收抽屉点「归档」）时若先复活该轮次为 activeRound，
+    // 清扫判定就永远逃过——且复活本身也是错的（归档旧任务≠新一轮启动）。
+    // 只扫 archived：它已离开所有可见列表（待执行/待归档检验都不显示），
+    // 留在组文件里纯属无头残留；cancelled 在面板仍可见且可重开，不动它。
+    const orphanArchived = task.status === 'archived' && task.round !== execution.activeRound;
+    if (execution.activeRound !== task.round && task.round != null && !orphanArchived) {
       execution.activeRound = task.round;
       execution.runner = { status: 'running', updatedAt: at };
       await saveExecution(execution);
+    }
+    // 孤儿 archived 立即搬进归档文件（顺带清掉同组历史孤儿）；在途轮次的
+    // 终态任务仍留给 completeRound 统一交付。
+    if (orphanArchived) {
+      await archiveTasks(groupId, { excludeRound: execution.activeRound });
     }
     notifyChange();
     return { group, task };
@@ -1544,6 +1555,11 @@ export function createStore(workspace, options = {}) {
       if (!FILE_ARCHIVE_STATUS_SET.has(status)) throw new Error(`invalid archive status: ${status}`);
     }
     const targetRound = options.round == null ? null : Number(options.round);
+    // 反向过滤：逐条归档（验收抽屉点「归档」）发生在轮次交付之后时，
+    // 任务的 round 仍是已交付的旧轮次——按 round===activeRound 收不到它们，
+    // 会永久卡在组文件里（任何界面都不显示）。excludeRound 让「轮次不在途
+    // 的终态任务」即时搬进归档文件，在途轮次的仍留给 completeRound。
+    const excludeRound = options.excludeRound == null ? null : Number(options.excludeRound);
 
     let group;
     try {
@@ -1555,7 +1571,9 @@ export function createStore(workspace, options = {}) {
       throw new Error(`corrupt annotation group: ${groupId}`);
     }
 
-    const hits = group.tasks.filter(t => statuses.has(t.status) && (targetRound == null || t.round === targetRound));
+    const hits = group.tasks.filter(t => statuses.has(t.status)
+      && (targetRound == null || t.round === targetRound)
+      && (excludeRound == null || t.round !== excludeRound));
     if (!hits.length) {
       // 没有命中就不改写任何文件，避免无意义的 updatedAt 翻动
       return { groupId, archived: 0, remaining: group.tasks.length, fileRemoved: false, archiveFile: null };
