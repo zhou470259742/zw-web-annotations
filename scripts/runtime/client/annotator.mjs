@@ -6580,8 +6580,12 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel-tools button { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .panel-tools button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
 :host([data-zwa-theme="light"]) .panel-tools button[data-active="on"] { background: #dedaff; color: #29215e; }
-:host([data-zwa-theme="light"]) .panel-tools button.primary { background: #4f5bd5; color: #fff; }
-:host([data-zwa-theme="light"]) .panel-tools button.primary:hover { background: #5f6ae0; color: #fff; }
+:host([data-zwa-theme="light"]) .panel-tools button { border-radius: 8px; }
+:host([data-zwa-theme="light"]) .panel-tools button.primary {
+  background: linear-gradient(135deg, #6a5bd6, #8a6fe0); color: #fff;
+  box-shadow: 0 2px 8px rgba(106,91,214,.3);
+}
+:host([data-zwa-theme="light"]) .panel-tools button.primary:hover { background: linear-gradient(135deg, #5c4ed0, #7c5fd8); color: #fff; }
 :host([data-zwa-theme="light"]) .panel-tools button.ghost-danger { color: #c25656; }
 :host([data-zwa-theme="light"]) .panel-tools button.ghost-danger:hover { background: #fdeaea; color: #a83b3b; }
 :host([data-zwa-theme="light"]) .progress-clear { color: #c25656; }
@@ -6647,12 +6651,28 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .editor-pill textarea,
 :host([data-zwa-theme="light"]) .panel .item textarea { scrollbar-color: #c9cdd8 transparent; }
 :host([data-zwa-theme="light"]) .panel .empty { color: var(--zwa-text-muted); }
-:host([data-zwa-theme="light"]) .panel .item { border-color: var(--zwa-border); background: #f9fafc; }
+/* 任务卡：纯白卡片浮在浅灰紫面板上，大圆角+轻投影——与效果图同语言 */
+:host([data-zwa-theme="light"]) .panel {
+  background: #f5f6fb;
+}
+:host([data-zwa-theme="light"]) .panel .item {
+  border-color: #e7e9f2; background: #ffffff; border-radius: 14px;
+  padding: 10px 12px; margin: 8px 1px;
+  box-shadow: 0 1px 3px rgba(30,40,70,.06);
+}
+:host([data-zwa-theme="light"]) .panel .item-seq {
+  width: 22px; height: 22px; line-height: 22px; font-size: 11px;
+  background: #6a5bd6;
+}
+:host([data-zwa-theme="light"]) .panel .item-seq.manual { background: #d8a45a; }
 :host([data-zwa-theme="light"]) .panel .item.editing { border-color: #7c6cff; }
 :host([data-zwa-theme="light"]) .panel .item-thumbs img { border-color: var(--zwa-border); }
 :host([data-zwa-theme="light"]) .panel .thumb-file { border-color: var(--zwa-border); background: var(--zwa-surface-soft); color: var(--zwa-text-muted); }
-:host([data-zwa-theme="light"]) .panel .item textarea { border-color: var(--zwa-border); background: #fff; color: var(--zwa-text); }
-:host([data-zwa-theme="light"]) .panel .item textarea:focus { border-color: #7c6cff; }
+:host([data-zwa-theme="light"]) .panel .item textarea {
+  border-color: #e2e5ef; background: #fff; color: var(--zwa-text);
+  border-radius: 8px;
+}
+:host([data-zwa-theme="light"]) .panel .item textarea:focus { border-color: #7c6cff; box-shadow: 0 0 0 3px rgba(106,91,214,.12); }
 :host([data-zwa-theme="light"]) .panel .item-foot code { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel .tag { color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .panel .tag.status-todo { color: #3b6ef0; }
@@ -6672,8 +6692,11 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .item.locked textarea { background: #f6f7fa; color: var(--zwa-text-muted); cursor: not-allowed; }
 :host([data-zwa-theme="light"]) .panel .lock-note { color: #b07d1c; border-color: #e2d3ac; }
 :host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: #c9c4f0; }
-:host([data-zwa-theme="light"]) .group-head { border-color: var(--zwa-border); background: var(--zwa-surface-soft); }
-:host([data-zwa-theme="light"]) .group-head:hover { background: var(--zwa-surface-hover); }
+:host([data-zwa-theme="light"]) .group-head {
+  border-color: #e7e9f2; background: #ffffff; border-radius: 12px;
+  padding: 7px 10px; box-shadow: 0 1px 2px rgba(30,40,70,.05);
+}
+:host([data-zwa-theme="light"]) .group-head:hover { background: #fafbfe; border-color: #d5d9e8; }
 :host([data-zwa-theme="light"]) .group-chevron { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .group-name { color: #333a46; }
 :host([data-zwa-theme="light"]) .group-badge { background: #dedaff; color: #29215e; }
