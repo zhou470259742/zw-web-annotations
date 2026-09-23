@@ -6675,7 +6675,7 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .empty { color: var(--zwa-text-muted); }
 /* 任务卡：纯白卡片浮在浅灰紫面板上，大圆角+轻投影——与效果图同语言 */
 :host([data-zwa-theme="light"]) .panel {
-  background: #f5f6fb;
+  background: #f8f9fd;
 }
 :host([data-zwa-theme="light"]) .panel .item {
   border-color: #e7e9f2; background: #ffffff; border-radius: 14px;
