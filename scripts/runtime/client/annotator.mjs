@@ -6495,7 +6495,11 @@ const CSS_TEXT = `
   padding: 5px 7px; margin: 0 1px 2px;
   border: 1px solid #2e2e2e; border-radius: 7px;
   background: #191919; cursor: default; user-select: none;
+  /* 行高钉死：徽标/跳页钮高度不同不得撑出行差 */
+  min-height: 32px; box-sizing: border-box;
 }
+/* .panel header 的拖拽 grab 特异性更高会压掉上面这条，必须点名为分组头恢复 */
+.panel .group-head, .panel .group-head:active { cursor: default; }
 .group-head:hover { background: #232323; }
 .group-chevron {
   flex: none; color: #8a8a8a; font-size: 9px; line-height: 1;
@@ -6521,7 +6525,7 @@ const CSS_TEXT = `
 .group-count { flex: none; color: #8f8f8f; font-size: 10px; }
 /* 组内跳页钮：只挂在非当前页组头（当前页跳自己无意义） */
 .group-goto {
-  flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px; cursor: pointer;
+  flex: none; width: 18px; height: 18px; border: 0; border-radius: 5px; cursor: pointer;
   background: none; color: #8b8b96; display: inline-flex; align-items: center; justify-content: center;
 }
 .group-goto:hover { background: #333; color: #dedaff; }
