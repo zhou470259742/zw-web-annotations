@@ -708,6 +708,7 @@ const SHOT_STYLE_PROPS = ('display,position,inset,top,right,bottom,left,z-index,
   'grid-template-columns,grid-template-rows,grid-column,grid-row,' +
   'gap,row-gap,column-gap,align-items,align-content,align-self,justify-content,justify-items,justify-self,order,' +
   'box-shadow,outline,filter,clip-path,object-fit,object-position,aspect-ratio,' +
+  'zoom,scale,rotate,translate,' +
   'cursor,pointer-events,user-select,list-style,content,fill,stroke,stroke-width').split(',');
 let _pageSnap = null; // { t, promise, domVer }
 // DOM 变更版本：弹窗挂载/表格渲染等任何子树增删都会使旧快照失效，
@@ -764,6 +765,12 @@ export function pageSnapshot(endpoint, hostId = HOST_ID) {
     .then(mod => (mod
       ? mod.domToCanvas(document.documentElement, {
         scale: 0.75,
+        // 布局尺寸必须显式给：domToCanvas 默认取 html.getBoundingClientRect()——
+        // 页面位于 transform:scale 容器（如 IDE 内嵌预览缩放）时拿到的是缩放后
+        // 的视觉宽度，克隆体会按更窄宽度重排（顶栏换行、内容挤压）。
+        // clientWidth/scrollHeight 是布局坐标，与元素排版口径一致。
+        width: document.documentElement.clientWidth,
+        height: Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight),
         includeStyleProperties: SHOT_STYLE_PROPS,
         // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）。
         // display:none/visibility:hidden 子树必然不可见——整棵剪枝（filter 返回 false
@@ -803,8 +810,14 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
       const r = liveEl.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) rect = { x: r.x, y: r.y, width: r.width, height: r.height };
     }
-    const sx = full.width / document.documentElement.scrollWidth || 1;
-    const sy = full.height / document.documentElement.scrollHeight || 1;
+    // 采样比按布局坐标算：scrollX/scrollY/innerWidth 是布局坐标系，
+    // 而 rect/getBoundingClientRect 是视觉坐标（transform:scale 容器内被缩放）——
+    // 但克隆体继承同样的 transform，元素在图里就画在视觉位置，
+    // 因此 rect 直接用视觉坐标，只有 scroll/视口切片走布局→图像换算
+    const layoutW = document.documentElement.clientWidth || vw;
+    const layoutH = Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight) || vh;
+    const sx = full.width / layoutW || 1;
+    const sy = full.height / layoutH || 1;
     const out = document.createElement('canvas');
     out.width = vw;
     out.height = vh;
@@ -843,7 +856,26 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     crop.width = cw;
     crop.height = ch;
     crop.getContext('2d').drawImage(out, cx, cy, cw, ch, 0, 0, cw, ch);
-    return { ctx: crop.toDataURL('image/png'), full: out.toDataURL('image/png') };
+    // 环境诊断随任务落盘：页面处于 transform:scale/zoom 容器（如 IDE 内嵌预览）
+    // 时坐标系分裂，截图偏移类问题凭这几项指标可直接定位是哪种缩放机制
+    let diag = null;
+    try {
+      const de = document.documentElement;
+      const hr = de.getBoundingClientRect();
+      const dcs = getComputedStyle(de), bcs = getComputedStyle(document.body);
+      diag = {
+        iw: window.innerWidth, ih: window.innerHeight,
+        clientW: de.clientWidth, clientH: de.clientHeight,
+        scrollW: de.scrollWidth, scrollH: de.scrollHeight,
+        htmlRectW: +hr.width.toFixed(2), htmlRectH: +hr.height.toFixed(2),
+        dpr: window.devicePixelRatio,
+        vsScale: window.visualViewport ? +window.visualViewport.scale.toFixed(3) : 1,
+        htmlZoom: dcs.zoom, htmlTransform: String(dcs.transform).slice(0, 60),
+        bodyZoom: bcs.zoom, bodyTransform: String(bcs.transform).slice(0, 60),
+        fullW: full.width, fullH: full.height,
+      };
+    } catch {}
+    return { ctx: crop.toDataURL('image/png'), full: out.toDataURL('image/png'), diag };
   } catch {
     return null;
   }
@@ -3329,7 +3361,11 @@ export function mountAnnotator(options = {}) {
           { id: `ctx_${Date.now().toString(36)}`, name: 'context.png', source: 'auto-context', mimeType: 'image/png', dataUrl: pair.ctx },
           ...(task.images || []),
         ].slice(0, 8); // 与服务端 MAX_IMAGES_PER_TASK 对齐，自动图不挤掉用户贴图
-        if (pair.full) task.meta = { ...(task.meta || {}), fullShot: { dataUrl: pair.full } };
+        if (pair.full || pair.diag) task.meta = {
+          ...(task.meta || {}),
+          ...(pair.full ? { fullShot: { dataUrl: pair.full } } : {}),
+          ...(pair.diag ? { snapDiag: pair.diag } : {}),
+        };
         persistLocal();
         scheduleSync();
       });
