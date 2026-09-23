@@ -134,10 +134,11 @@
             "doing",
             "review",
             "done",
+            "archived",
             "blocked",
             "cancelled"
           ],
-          "description": "review=开发完成待验收（子 agent 回写）；done=主线程浏览器验收通过。"
+          "description": "review=开发完成待验收（子 agent 回写）；done=主线程浏览器验收通过；archived=已完成后经看板人工归档。"
         },
         "createdAt": {
           "type": "string",

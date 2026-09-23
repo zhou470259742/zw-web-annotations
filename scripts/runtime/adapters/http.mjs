@@ -158,7 +158,8 @@ export function createAnnotationsMiddleware(options = {}) {
         const buf = await fs.readFile(file);
         res.statusCode = 200;
         res.setHeader('content-type', { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif' }[path.extname(name).slice(1).toLowerCase()] || 'application/octet-stream');
-        res.setHeader('cache-control', 'no-cache');
+        // 附件文件名带随机串、内容不可变——强缓存让缩略图二次渲染零回源
+        res.setHeader('cache-control', 'public, max-age=86400, immutable');
         return res.end(buf);
       } catch {
         return sendJson(res, 404, { error: 'attachment not found' });

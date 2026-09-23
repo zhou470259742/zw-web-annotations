@@ -30,16 +30,18 @@ const STATUS_ORDER = [
   ['doing', '进行中'],
   ['review', '待验收'],
   ['done', '已完成'],
+  ['archived', '已归档'],
   ['blocked', '已阻塞'],
   ['cancelled', '已取消'],
 ];
 
-/** 看板列布局：单状态一列；多状态同列上下各半（各半独立计数与滚动）。已完成放最后一列。 */
+/** 看板列布局：单状态一列；多状态同列纵向分段（各段独立计数与滚动）。
+ *  进行中/待验收/已阻塞/已取消合一列，已完成/已归档放最后两列。 */
 const BOARD_COLUMNS = [
   ['todo'],
-  ['doing', 'review'],
-  ['blocked', 'cancelled'],
+  ['doing', 'review', 'blocked', 'cancelled'],
   ['done'],
+  ['archived'],
 ];
 
 const VIEW_ORDER = [  ['board', '看板', '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>'],
@@ -93,6 +95,7 @@ export function renderBoardHtml({ version = '' } = {}) {
     --st-doing: #e8935a;
     --st-review: #e0b464;
     --st-done: #7fce8f;
+    --st-archived: #9a8fd0;
     --st-blocked: #e07a7a;
     --st-cancelled: #85858f;
   }
@@ -127,6 +130,7 @@ export function renderBoardHtml({ version = '' } = {}) {
     --st-doing: #d97a3d;
     --st-review: #b08a35;
     --st-done: #3f9e54;
+    --st-archived: #7a63c9;
     --st-blocked: #cc5252;
     --st-cancelled: #6f7078;
   }
@@ -235,6 +239,11 @@ export function renderBoardHtml({ version = '' } = {}) {
   .col-half { flex: 1 1 0; min-height: 0; display: flex; flex-direction: column; }
   .col-half + .col-half { border-top: 1px dashed var(--border-2); margin-top: 6px; padding-top: 9px; }
   .col-half .cards { min-height: 56px; }
+  /* 三段以上的合并列：各段按内容自然高度（封顶 260px 内滚），整列外层滚动，
+     空段只占标题一行不再均分四分之一高度。 */
+  .col.col-multi { overflow-y: auto; }
+  .col.col-multi .col-half { flex: none; }
+  .col.col-multi .col-half .cards { flex: none; max-height: 260px; }
   .col-head { flex: none; display: flex; align-items: center; gap: 8px; padding: 2px 4px 11px; }
   .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; background: var(--c);
          box-shadow: 0 0 0 3px color-mix(in srgb, var(--c) 20%, transparent); }
@@ -258,6 +267,38 @@ export function renderBoardHtml({ version = '' } = {}) {
                 max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .instruction { font-size: 12px; color: var(--text); white-space: pre-wrap; word-break: break-word;
                  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+  .card-thumbs { display: flex; gap: 6px; margin-top: 7px; flex-wrap: wrap; }
+  .card-thumb { display: block; position: relative; width: 64px; height: 44px; border-radius: 6px;
+                overflow: hidden; cursor: zoom-in; border: 1px solid var(--border-2); flex: none; }
+  .card-thumb .thumb-n {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-style: normal; font-size: 11px; font-weight: 700; color: #fff;
+    background: rgba(10, 12, 20, .5); pointer-events: none;
+  }
+  .card-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; transition: transform .15s; }
+  .card-thumb:hover img { transform: scale(1.06); }
+  /* 灯箱：复用检验归档抽屉的交互（左右切/序号/文案/滚轮缩放） */
+  .viewer { position: fixed; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center;
+            background: rgba(10, 12, 20, .82); cursor: zoom-out; overflow: hidden; }
+  .viewer.hidden { display: none; }
+  .viewer img { max-width: 82vw; max-height: 92vh; border-radius: 8px; box-shadow: 0 12px 48px rgba(0,0,0,.5);
+                background: #fff; transition: transform .12s ease-out; cursor: default; }
+  .viewer-nav { position: fixed; top: 50%; transform: translateY(-50%); width: 40px; height: 56px;
+                border: 0; border-radius: 10px; background: rgba(255,255,255,.12); color: #fff;
+                display: flex; align-items: center; justify-content: center; cursor: pointer; }
+  .viewer-nav:hover { background: rgba(255,255,255,.22); }
+  .viewer-nav.prev { left: 14px; } .viewer-nav.next { right: 14px; }
+  .viewer-nav svg { width: 20px; height: 20px; }
+  .viewer-nav.hidden { display: none; }
+  .viewer-count { position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+                  padding: 3px 12px; border-radius: 12px; background: rgba(30,30,40,.8);
+                  color: #e8e8ee; font-size: 12px; font-variant-numeric: tabular-nums; }
+  .viewer-count:empty { display: none; }
+  .viewer-caption { position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%);
+                    max-width: 76vw; padding: 9px 20px; border-radius: 10px;
+                    background: rgba(20,20,28,.88); color: #f2f2f8; font-size: 17px; line-height: 1.6;
+                    white-space: pre-wrap; word-break: break-word; box-shadow: 0 4px 20px rgba(0,0,0,.4); }
+  .viewer-caption:empty { display: none; }
   .card-foot { display: flex; align-items: center; gap: 5px; margin-top: 7px; flex-wrap: wrap; }
   .sel { font-size: 10px; color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
   .tag { flex: none; font-size: 10px; border-radius: 5px; padding: 1px 6px; font-weight: 500; }
@@ -278,6 +319,19 @@ export function renderBoardHtml({ version = '' } = {}) {
   .card-act.armed { opacity: 1; color: #fff; font-weight: 600; background: var(--st-blocked); border-color: var(--st-blocked); }
   .card-act.reopen.armed { background: var(--st-todo); border-color: var(--st-todo); }
   .card-act.accept.armed { background: var(--st-review); border-color: var(--st-review); }
+  .card-act.arch:hover { color: var(--st-archived); border-color: var(--st-archived); }
+  .card-act.arch.armed { background: var(--st-archived); border-color: var(--st-archived); }
+  /* 列内按页面分组：组头常驻（不随卡片悬停），页面级归档按钮在组头右侧 */
+  .pg-group { margin-bottom: 4px; }
+  .pg-head { display: flex; align-items: center; gap: 6px; padding: 4px 2px 3px;
+             position: sticky; top: 0; z-index: 1; background: var(--panel);
+             border-bottom: 1px solid var(--border); }
+  .pg-name { flex: 1; min-width: 0; font-size: 10px; font-weight: 600; color: var(--text-dim);
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: .03em; }
+  .pg-count { flex: none; font-size: 10px; color: var(--text-faint); font-variant-numeric: tabular-nums; }
+  .pg-arch, .col-arch { opacity: .75; }
+  .pg-head:hover .pg-arch { opacity: 1; }
+  .col-arch { margin-left: auto; }
   .empty { font-size: 11px; color: var(--text-empty); padding: 8px 4px; text-align: center; }
   .empty-note { flex: none; font-size: 12px; color: var(--text-dim); padding: 0 2px 10px; }
   .error { max-width: 420px; text-align: center; color: var(--st-blocked); }
@@ -336,6 +390,13 @@ export function renderBoardHtml({ version = '' } = {}) {
   </div>
 </div>
 <div class="board" id="board"><p class="empty">加载中…</p></div>
+<div class="viewer hidden" id="viewer">
+  <img alt="">
+  <button type="button" class="viewer-nav prev hidden" aria-label="上一张"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 6 9 12 15 18"/></svg></button>
+  <button type="button" class="viewer-nav next hidden" aria-label="下一张"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg></button>
+  <div class="viewer-caption"></div>
+  <span class="viewer-count"></span>
+</div>
 <script>
 (function () {
   'use strict';
@@ -351,6 +412,8 @@ export function renderBoardHtml({ version = '' } = {}) {
     if (saved && VIEWS.some(function (v) { return v[0] === saved; })) view = saved;
   } catch (e) { /* localStorage 不可用时保持默认 */ }
   var latest = null;
+  /** 最近一次渲染的任务记录（批量归档按页面/全量取目标用） */
+  var lastRecords = [];
   // 常用过滤条件：关键词 / 页面 / 归档开关 / 状态（不持久化，进页面即重置）
   var filters = { q: '', page: 'all', archived: true, status: 'all' };
 
@@ -426,7 +489,7 @@ export function renderBoardHtml({ version = '' } = {}) {
     var q = filters.q.trim().toLowerCase();
     return records.filter(function (r) {
       if (!filters.archived && r.archived) return false;
-      if (filters.status !== 'all' && r.t.status !== filters.status) return false;
+      if (filters.status !== 'all' && (r.archived ? 'archived' : r.t.status) !== filters.status) return false;
       if (filters.page !== 'all' && r.url !== filters.page) return false;
       if (q) {
         var el = r.t.element || {};
@@ -453,6 +516,22 @@ export function renderBoardHtml({ version = '' } = {}) {
       + '<span class="page-badge" title="' + esc(r.page) + '">' + esc(r.page) + '</span>'
       + '</div>'
       + '<div class="instruction" title="' + esc(instruction) + '">' + esc(instruction) + '</div>'
+      + (function () {
+        if (!Array.isArray(t.images) || !t.images.length) return '';
+        var srcs = t.images.map(function (img) {
+          var f = img && img.file ? String(img.file).split(/[\\/]/).pop() : '';
+          return f ? './files/' + encodeURIComponent(f) : '';
+        }).filter(Boolean);
+        if (!srcs.length) return '';
+        // 单图 + 张数角标，点击进灯箱左右切换（与检验归档抽屉同款交互）；
+        // 全量清单挂 data-srcs，不渲隐藏 img——折叠卡片不发无谓请求。
+        // data 属性内不能放裸双引号（esc 不转义引号会截断属性值），改用 URI 编码
+        return '<div class="card-thumbs"><span class="card-thumb" data-srcs="'
+          + encodeURIComponent(JSON.stringify(srcs)) + '" data-cap="' + encodeURIComponent(instruction) + '">'
+          + '<img src="' + srcs[0] + '" loading="lazy" alt="">'
+          + (srcs.length > 1 ? '<i class="thumb-n">' + srcs.length + '</i>' : '')
+          + '</span></div>';
+      })()
       + '<div class="card-foot">'
       + (el.selector ? '<span class="sel" title="' + esc(el.selector) + '">' + esc(el.selector) + '</span>' : '<span class="sel">手动任务</span>')
       + (r.archived
@@ -464,32 +543,76 @@ export function renderBoardHtml({ version = '' } = {}) {
           // 待验收卡的正式人工出口：done 只能由主线程验收后回写，
           // 看板上给不出这个按钮，用户就只能被指去点一个不存在的东西。
           + (t.status === 'review' ? '<button type="button" class="card-act accept" data-action="accept" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="验收通过：确认这处改动符合要求，标记为已完成">验收</button>' : '')
+          // 已完成卡的人工归档出口：归档后进入「已归档」列（任务级，非文件级）。
+          + (t.status === 'done' ? '<button type="button" class="card-act arch" data-action="archive" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="归档此任务：移入「已归档」列">归档</button>' : '')
           + (t.status === 'blocked' ? '<button type="button" class="card-act reopen" data-action="reopen" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="重新入列：回到待处理，等下一轮处理">重新加入</button>' : '')))
       + '</div>'
       + '</div>';
     return html;
   }
 
-  /** 看板视图：按 BOARD_COLUMNS 分栏，多状态列上下各半；列内卡片区独立滚动，归档任务按终态落入对应列。 */
+  /** 任务时间字段：已完成/已归档按完成/归档时刻排序，其余按创建时刻。 */
+  function recTime(r) {
+    var t = r.t;
+    return t.archivedAt || t.completedAt || t.reviewAt || t.startedAt || t.createdAt || '';
+  }
+
+  /** 看板视图：按 BOARD_COLUMNS 分栏，多状态列上下各半；列内按页面分组，
+   * 已完成/已归档按任务时间倒序，其余状态升序；列内卡片区独立滚动。 */
   function renderBoardColumns(records, hasData) {
     if (!hasData) {
       return '<p class="empty">还没有标注任务。在页面右下角打开标注面板即可开始。</p>';
     }
-    var sorted = records.slice().sort(function (x, y) {
-      return (x.page < y.page ? -1 : x.page > y.page ? 1 : (x.t.seq || 0) - (y.t.seq || 0));
-    });
     var note = records.length ? '' : '<p class="empty-note">没有匹配的任务，试试调整搜索或过滤条件。</p>';
+    /** 有效状态：文件级归档记录一律按「已归档」归列（归档文件里的 done 不再是未归档）。 */
+    function effStatus(r) {
+      return r.archived ? 'archived' : r.t.status;
+    }
     function countOf(key) {
-      return sorted.filter(function (x) { return x.t.status === key; }).length;
+      return records.filter(function (x) { return effStatus(x) === key; }).length;
     }
     function headHtml(key) {
+      var batchBtn = key === 'done' && countOf(key)
+        ? '<button type="button" class="card-act arch col-arch" data-action="archive-all-done" title="把已完成列全部任务移入「已归档」">全部归档</button>'
+        : '';
       return '<div class="col-head"><span class="dot" style="--c:' + stVar(key) + '"></span>'
-        + '<h2>' + esc(STATUS_LABELS[key]) + '</h2><span class="count">' + countOf(key) + '</span></div>';
+        + '<h2>' + esc(STATUS_LABELS[key]) + '</h2><span class="count">' + countOf(key) + '</span>' + batchBtn + '</div>';
     }
+    /** 列内按页面分组：组内已完成/已归档时间倒序，其余序号升序。 */
     function cardsHtml(key) {
-      return '<div class="cards">'
-        + (countOf(key) ? sorted.filter(function (x) { return x.t.status === key; }).map(cardHtml).join('') : '<p class="empty">—</p>')
-        + '</div>';
+      var list = records.filter(function (x) { return effStatus(x) === key; });
+      if (!list.length) return '<div class="cards"><p class="empty">—</p></div>';
+      var desc = key === 'done' || key === 'archived';
+      // 按 URL 分组：同标题页面（reports/driving?rpt=xxx 系列）必须独立成组；
+      // 显示名 = 标题，有 query 时追加区分符（rpt=401/402… 全靠它分辨）。
+      var pages = {};
+      var order = [];
+      list.forEach(function (r) {
+        var k = r.url || r.page || '未命名页面';
+        if (!pages[k]) { pages[k] = []; order.push(k); }
+        pages[k].push(r);
+      });
+      order.sort(function (a, b) { return a < b ? -1 : a > b ? 1 : 0; });
+      var html = order.map(function (k) {
+        var recs = pages[k];
+        var name = recs[0].page || k;
+        var qi = k.indexOf('?');
+        if (qi > 0) name += ' ' + k.slice(qi);
+        var items = recs.slice().sort(function (x, y) {
+          if (desc) {
+            var a = recTime(x), b = recTime(y);
+            if (a !== b) return a > b ? -1 : 1;
+            return (y.t.seq || 0) - (x.t.seq || 0);
+          }
+          return (x.t.seq || 0) - (y.t.seq || 0);
+        }).map(cardHtml).join('');
+        var pbtn = key === 'done'
+          ? '<button type="button" class="card-act arch pg-arch" data-action="archive-page" data-page="' + esc(k) + '" title="归档此页面的全部已完成任务">归档本页</button>'
+          : '';
+        return '<div class="pg-group"><div class="pg-head"><span class="pg-name" title="' + esc(k) + '">' + esc(name) + '</span>'
+          + '<span class="pg-count">' + recs.length + '</span>' + pbtn + '</div>' + items + '</div>';
+      }).join('');
+      return '<div class="cards">' + html + '</div>';
     }
     var cols = BOARD_COLUMNS.map(function (group) {
       if (group.length === 1) {
@@ -498,7 +621,7 @@ export function renderBoardHtml({ version = '' } = {}) {
       var halves = group.map(function (key) {
         return '<div class="col-half">' + headHtml(key) + cardsHtml(key) + '</div>';
       }).join('');
-      return '<div class="col" data-stack="' + group.join('+') + '">' + halves + '</div>';
+      return '<div class="col' + (group.length > 2 ? ' col-multi' : '') + '" data-stack="' + group.join('+') + '">' + halves + '</div>';
     }).join('');
     return note + '<div class="cols">' + cols + '</div>';
   }
@@ -559,6 +682,7 @@ export function renderBoardHtml({ version = '' } = {}) {
       + (archivedTotal ? chip('归档', archivedTotal) : '');
 
     var records = applyFilters(collectRecords(data, false).concat(collectRecords(data, true)));
+    lastRecords = records;
     var hasData = total > 0 || round.queued > 0 || archivedTotal > 0;
     syncPageOptions(collectRecords(data, false).concat(collectRecords(data, true)));
 
@@ -721,7 +845,10 @@ export function renderBoardHtml({ version = '' } = {}) {
   var boardRoot = document.getElementById('board');
   var armedBtn = null;
   var armedTimer = null;
-  var CONFIRM_LABELS = { 'purge-archived': '确认删除', 'reopen': '确认入列', 'accept': '确认验收' };
+  var CONFIRM_LABELS = {
+    'purge-archived': '确认删除', 'reopen': '确认入列', 'accept': '确认验收',
+    'archive': '确认归档', 'archive-page': '确认归档本页', 'archive-all-done': '确认全部归档',
+  };
   function disarmAction() {
     if (armedBtn) {
       armedBtn.textContent = armedBtn.dataset.label;
@@ -730,6 +857,63 @@ export function renderBoardHtml({ version = '' } = {}) {
     }
     if (armedTimer) { clearTimeout(armedTimer); armedTimer = null; }
   }
+  /* ---- 图片灯箱：与检验归档抽屉同款——左右切换、序号徽标、任务文案、滚轮缩放 ---- */
+  var viewer = document.getElementById('viewer');
+  var vImg = viewer.querySelector('img');
+  var vCap = viewer.querySelector('.viewer-caption');
+  var vCnt = viewer.querySelector('.viewer-count');
+  var vPrev = viewer.querySelector('.viewer-nav.prev');
+  var vNext = viewer.querySelector('.viewer-nav.next');
+  var vList = [], vIdx = 0, vZoom = 1;
+  function vRender() {
+    if (!vList.length) return;
+    vZoom = 1;
+    vImg.style.transform = '';
+    vImg.style.transformOrigin = '';
+    vImg.src = vList[vIdx];
+    vCnt.textContent = vList.length > 1 ? (vIdx + 1) + '/' + vList.length : '';
+    vPrev.classList.toggle('hidden', vList.length < 2);
+    vNext.classList.toggle('hidden', vList.length < 2);
+  }
+  function vOpen(list, idx, cap) {
+    vList = list.filter(Boolean);
+    if (!vList.length) return;
+    vIdx = Math.min(Math.max(idx, 0), vList.length - 1);
+    vCap.textContent = cap || '';
+    vRender();
+    viewer.classList.remove('hidden');
+  }
+  function vStep(d) { vIdx = (vIdx + d + vList.length) % vList.length; vRender(); }
+  boardRoot.addEventListener('click', function (e) {
+    var thumb = e.target && e.target.closest ? e.target.closest('.card-thumb') : null;
+    if (!thumb || !boardRoot.contains(thumb)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    var srcs = [];
+    try { srcs = JSON.parse(decodeURIComponent(thumb.dataset.srcs || '[]')); } catch (err) { srcs = [thumb.querySelector('img').src]; }
+    vOpen(srcs, 0, decodeURIComponent(thumb.dataset.cap || ''));
+  }, true);
+  viewer.addEventListener('click', function (e) {
+    if (e.target === viewer) { viewer.classList.add('hidden'); return; }
+    if (e.target.closest('.prev')) vStep(-1);
+    else if (e.target.closest('.next')) vStep(1);
+  });
+  document.addEventListener('keydown', function (e) {
+    if (viewer.classList.contains('hidden')) return;
+    if (e.key === 'Escape') viewer.classList.add('hidden');
+    else if (e.key === 'ArrowLeft') vStep(-1);
+    else if (e.key === 'ArrowRight') vStep(1);
+  });
+  viewer.addEventListener('wheel', function (e) {
+    e.preventDefault();
+    var rect = vImg.getBoundingClientRect();
+    var ox = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1) * 100;
+    var oy = Math.min(Math.max((e.clientY - rect.top) / rect.height, 0), 1) * 100;
+    vZoom = Math.min(Math.max(vZoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15), 1), 6);
+    vImg.style.transformOrigin = ox + '% ' + oy + '%';
+    vImg.style.transform = 'scale(' + vZoom + ')';
+  }, { passive: false });
+
   boardRoot.addEventListener('click', function (e) {
     var btn = e.target && e.target.closest ? e.target.closest('button[data-action]') : null;
     if (!btn || !boardRoot.contains(btn)) return;
@@ -767,6 +951,26 @@ export function renderBoardHtml({ version = '' } = {}) {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ ids: [taskId] }),
       });
+    } else if (action === 'archive' || action === 'archive-page' || action === 'archive-all-done') {
+      // 归档 = 任务级 status:archived（主线程人工路径）。单任务 / 按页面 / 全列三种粒度。
+      var targets = [];
+      if (action === 'archive') {
+        targets = [{ group: groupId, task: taskId }];
+      } else {
+        var page = btn.getAttribute('data-page');
+        targets = lastRecords.filter(function (r) {
+          return r.t.status === 'done' && !r.archived
+            && (action === 'archive-all-done' || (r.url || r.page) === page);
+        }).map(function (r) { return { group: r.group, task: r.t.id }; });
+      }
+      if (!targets.length) { refresh(); return; }
+      call = Promise.all(targets.map(function (x) {
+        return fetch('./' + encodeURIComponent(x.group) + '/tasks/' + encodeURIComponent(x.task), {
+          method: 'PATCH',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ status: 'archived' }),
+        }).then(function (r) { if (!r.ok) throw new Error('HTTP ' + r.status); });
+      }));
     }
     if (call) {
       call.then(function (r) {

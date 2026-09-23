@@ -41,6 +41,7 @@ const STATUS_LABELS = {
   // 主线程验收通过后再回写 done，进度条的最后一段才会推进。
   review: '待验收',
   done: '已完成',
+  archived: '已归档',
   blocked: '已阻塞',
   cancelled: '已取消',
 };
@@ -174,8 +175,9 @@ export function computeProgress(tasks = []) {
   for (const t of active) counts[t.status] = (counts[t.status] || 0) + 1;
   if (!total) return { percent: 0, total: 0, counts, started: 0, devDone: 0, verified: 0 };
   const started = total - (counts.todo || 0);
-  const devDone = (counts.review || 0) + (counts.done || 0);
-  const verified = counts.done || 0;
+  // archived 是 done 的人工归档终态，进度权重与 done 同档计入
+  const devDone = (counts.review || 0) + (counts.done || 0) + (counts.archived || 0);
+  const verified = (counts.done || 0) + (counts.archived || 0);
   const percent = Math.round(
     (started > 0 ? PROGRESS_WEIGHTS.dispatch : 0)
       + PROGRESS_WEIGHTS.dev * (devDone / total)
@@ -707,22 +709,50 @@ const SHOT_STYLE_PROPS = ('display,position,inset,top,right,bottom,left,z-index,
   'gap,row-gap,column-gap,align-items,align-content,align-self,justify-content,justify-items,justify-self,order,' +
   'box-shadow,outline,filter,clip-path,object-fit,object-position,aspect-ratio,' +
   'cursor,pointer-events,user-select,list-style,content,fill,stroke,stroke-width').split(',');
-let _pageSnap = null; // { t, promise }
+let _pageSnap = null; // { t, promise, domVer }
+// DOM 变更版本：弹窗挂载/表格渲染等任何子树增删都会使旧快照失效，
+// 否则 5s 缓存窗口内标注新开的 el-dialog 会截到弹窗底下的旧页面。
+let _domVer = 0;
+let _domWatchBound = false;
+function bindDomWatch() {
+  if (_domWatchBound || typeof MutationObserver === 'undefined') return;
+  _domWatchBound = true;
+  new MutationObserver(recs => {
+    for (const r of recs) {
+      if (r.addedNodes.length || r.removedNodes.length) { _domVer++; break; }
+    }
+  }).observe(document.documentElement, { childList: true, subtree: true });
+}
 export function pageSnapshot(endpoint, hostId = HOST_ID) {
   const now = performance.now();
-  if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS) return _pageSnap.promise;
+  if (_pageSnap && now - _pageSnap.t < SHOT_CACHE_MS && _pageSnap.domVer === _domVer) return _pageSnap.promise;
   const promise = loadDomshot(endpoint)
     .then(mod => (mod
       ? mod.domToCanvas(document.documentElement, {
         scale: 0.75,
         includeStyleProperties: SHOT_STYLE_PROPS,
-        // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）
-        filter: node => !(node && node.id === hostId),
+        // 标注组件本体不进截图（shadow DOM 本就不序列化，这里兜底外层 host）。
+        // display:none/visibility:hidden 子树必然不可见——整棵剪枝（filter 返回 false
+        // 的节点连同后代都不被遍历）。重 DOM 页（轨迹回放弹窗 ~20K 节点，大头是隐藏
+        // Tab 面板的数千行明细表）实测序列化 28s→~2s，消除「点标注整页卡死」。
+        filter: node => {
+          if (node && node.id === hostId) return false;
+          if (node && node.nodeType === 1 && typeof node.checkVisibility === 'function'
+              && !node.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
+          return true;
+        },
       })
       : null))
     .catch(() => null);
-  _pageSnap = { t: now, promise };
+  _pageSnap = { t: now, promise, domVer: _domVer };
   return promise;
+}
+
+/** 空闲期预热快照：rIC 调度到浏览器空闲帧执行，避免点击「标注」瞬间同步阻塞；
+ *  超时 3s 兜底保证首次点选前快照已就绪（配合 SHOT_CACHE_MS 复用）。 */
+function scheduleSnapshot(endpoint) {
+  const ric = window.requestIdleCallback || (fn => window.setTimeout(fn, 0));
+  ric(() => { pageSnapshot(endpoint); }, { timeout: 3000 });
 }
 
 export async function captureContextShot(endpoint, rect, hostId = HOST_ID) {
@@ -824,6 +854,8 @@ export function mountAnnotator(options = {}) {
   // 注意：此 const 必须在 state 初始化（loadDockLayout() 调用）之前声明，
   // 放后面会触发 TDZ ReferenceError 被 try/catch 静默吞掉 → 布局永远恢复不出来
   const DOCK_LAYOUT_KEY = 'zwa-dock-layout';
+  // 同上 TDZ 约束：state 初始化即调 loadPanelLayout()，键名必须先声明
+  const PANEL_LAYOUT_KEY = 'zwa-panel-layout';
   const state = {
     /** @type {Array<any>} 按添加时间排序，元素顺序即编号顺序 */
     tasks: [],
@@ -836,9 +868,22 @@ export function mountAnnotator(options = {}) {
     groups: [],
     /** 用户显式切换过的分组展开状态；未设置时默认当前页展开、其它页折叠 */
     groupOpenState: {},
+    /** 当前页所属任务组 id（归档抽屉 PATCH 要用 groupId） */
+    currentGroupId: null,
+    /** 手风琴互斥：两区始终只有一个展开。默认任务区展开（主功能），
+        归档区收起态头部仍实时显示计数；点开归档区自动收起任务区。 */
+    archiveDrawerOpen: false,
+    /** 待执行任务区展开态 */
+    tasksRegionOpen: true,
+    /** 归档视图内页面组的展开态（默认仅当前页展开，其余折叠） */
+    archOpenState: {},
     active: false,
     hovered: null,
     collapsed: config.collapsed,
+    /** 面板自定义布局：null=跟随胶囊锚定；{x,y}=自由悬浮；{side,y,pinned}=左右吸边 */
+    panelLayout: loadPanelLayout(),
+    /** 悬浮模式（吸边未固定）下当前已收成边耳——随布局持久化，跳页/刷新保持 */
+    panelRetracted: !!(loadPanelLayout() && loadPanelLayout().retracted),
     /** 当前就地编辑的任务 id；null 表示无弹窗 */
     editingId: null,
     /** 是否为尚未确认的新建任务 */
@@ -1025,14 +1070,72 @@ export function mountAnnotator(options = {}) {
   const regionMarks = document.createElement('div');
   regionMarks.className = 'regionmarks hidden';
 
-  // 图片预览灯箱：列表/编辑器里的缩略图点击后整屏查看
+  // 图片预览灯箱：列表/编辑器/归档抽屉里的缩略图点击后整屏查看。
+  // 多图任务支持左右切换（箭头按钮 + ←/→ 键），底部显示「当前/总数」。
   const viewer = document.createElement('div');
   viewer.className = 'viewer hidden';
-  viewer.innerHTML = '<img alt="预览">';
-  viewer.addEventListener('click', () => viewer.classList.add('hidden'));
-  const showViewer = src => {
-    if (!src) return;
-    viewer.querySelector('img').src = src;
+  viewer.innerHTML = `
+    <button type="button" class="viewer-nav prev" data-vnav="-1" title="上一张 (←)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 5 8 12 15 19"/></svg>
+    </button>
+    <img alt="预览">
+    <button type="button" class="viewer-nav next" data-vnav="1" title="下一张 (→)">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 5 16 12 9 19"/></svg>
+    </button>
+    <div class="viewer-caption"></div>
+    <span class="viewer-count"></span>`;
+  let viewerList = [];
+  let viewerIdx = 0;
+  let viewerCaption = '';
+  let viewerZoom = 1;
+  /** 滚轮缩放：以光标为变换原点，1x~6x；换图/关闭复位。 */
+  const viewerImg = () => viewer.querySelector('img');
+  viewer.addEventListener('wheel', event => {
+    event.preventDefault();
+    const img = viewerImg();
+    if (!img || !viewerList.length) return;
+    const rect = img.getBoundingClientRect();
+    // 光标相对图中心的偏移比例 → 缩放的 transform-origin，缩放时画面不跑偏
+    const ox = Math.min(Math.max((event.clientX - rect.left) / rect.width, 0), 1) * 100;
+    const oy = Math.min(Math.max((event.clientY - rect.top) / rect.height, 0), 1) * 100;
+    viewerZoom = Math.min(Math.max(viewerZoom * (event.deltaY < 0 ? 1.15 : 1 / 1.15), 1), 6);
+    img.style.transformOrigin = `${ox}% ${oy}%`;
+    img.style.transform = `scale(${viewerZoom})`;
+    img.style.cursor = viewerZoom > 1 ? 'grab' : 'zoom-in';
+  }, { passive: false });
+  const renderViewer = () => {
+    if (!viewerList.length) return;
+    const img = viewerImg();
+    viewerZoom = 1;
+    img.style.transform = '';
+    img.style.transformOrigin = '';
+    img.src = viewerList[viewerIdx];
+    viewer.querySelector('.viewer-caption').textContent = viewerCaption;
+    const multi = viewerList.length > 1;
+    viewer.querySelector('.viewer-count').textContent = multi ? `${viewerIdx + 1}/${viewerList.length}` : '';
+    viewer.querySelectorAll('.viewer-nav').forEach(b => { b.style.display = multi ? '' : 'none'; });
+  };
+  const stepViewer = dir => {
+    if (viewerList.length < 2) return;
+    viewerIdx = (viewerIdx + dir + viewerList.length) % viewerList.length;
+    renderViewer();
+  };
+  viewer.addEventListener('click', event => {
+    const nav = event.target.closest && event.target.closest('.viewer-nav');
+    if (nav) {
+      event.stopPropagation();
+      stepViewer(Number(nav.getAttribute('data-vnav')) || 0);
+      return;
+    }
+    viewer.classList.add('hidden');
+  });
+  const showViewer = (srcs, index = 0, caption = '') => {
+    const list = Array.isArray(srcs) ? srcs.filter(Boolean) : [srcs].filter(Boolean);
+    if (!list.length) return;
+    viewerList = list;
+    viewerIdx = Math.min(Math.max(index, 0), list.length - 1);
+    viewerCaption = caption;
+    renderViewer();
     viewer.classList.remove('hidden');
   };
 
@@ -1104,15 +1207,26 @@ export function mountAnnotator(options = {}) {
       </div>
     </div>
     <section class="panel hidden" data-el="panel">
-      <header>
+      <header data-el="panelHead" title="拖拽移动面板；拖到屏幕左右边缘松手即吸边（双击复位跟随胶囊）">
         <div class="panel-title">
-          <strong>标注列表</strong>
-          <span class="panel-meta" data-el="panelMeta"></span>
+          <div class="panel-title-row">
+            <strong>标注列表</strong>
+            <button type="button" class="panel-board" data-act="board" title="在新标签打开任务看板（按状态总览全部任务）">看板</button>
+          </div>
+
         </div>
-        <button type="button" class="panel-board" data-act="board" title="在新标签打开任务看板（按状态总览全部任务）">看板</button>
-        <button type="button" class="panel-theme" data-el="themeBtn" data-act="theme" title="切换明亮/暗色主题">🌙</button>
-        <span class="panel-version" data-el="panelVersion" title="标注组件运行时版本"></span>
-        <button type="button" class="panel-collapse" data-act="collapse" title="收起">
+        <button type="button" class="panel-theme" data-el="themeBtn" data-act="theme" title="切换明亮/暗色主题">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+        </button>
+        <button type="button" class="panel-pin" data-el="panelPinBtn" data-act="panel-pin" title="固定模式：吸边后保持展开；关为悬浮模式（指针移开收成边耳，悬停滑出）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3v4l3 3v2h-6v7l-1 1-1-1v-7H5v-2l3-3V3z"/></svg>
+        </button>
+        <button type="button" class="panel-collapse" data-el="panelEarBtn" data-act="panel-ear" title="收成边耳（贴右缘细条，悬停滑出悬浮列表）">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="9 6 15 12 9 18"></polyline>
+          </svg>
+        </button>
+        <button type="button" class="panel-collapse" data-act="collapse" title="收起为悬浮药丸">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
             <polyline points="6 9 12 15 18 9"></polyline>
           </svg>
@@ -1123,7 +1237,6 @@ export function mountAnnotator(options = {}) {
         <button type="button" data-act="manual" title="手动添加任务">手动</button>
         <button type="button" data-act="freeze" title="冻结页面动画与视频（捕捉动画/闪烁瞬态），再点恢复">冻结</button>
         <button type="button" class="primary" data-act="copy" title="复制处理提示词">复制提示词</button>
-        <button type="button" class="ghost-danger push-right" data-act="clear" title="清空全部标注">清空</button>
       </div>
       <!-- 总体进度：分派 10% + 开发 70% + 验收 20%，跨越所有页面统计。
            放在操作区下方、列表上方——用户点开面板第一眼就想知道"改到哪了"。
@@ -1138,6 +1251,7 @@ export function mountAnnotator(options = {}) {
           <button type="button" class="accept-btn hidden" data-act="accept-round" data-el="acceptBtn" title="把本轮待验收的改动一次确认通过（已完成的不受影响）">验收本轮</button>
           <button type="button" class="archive-btn hidden" data-act="archive-round" data-el="archiveBtn" title="把本轮已完成的任务移入归档（交付）">归档本轮</button>
           <span class="progress-pct" data-el="progressPct"></span>
+          <button type="button" class="ghost-danger progress-clear" data-act="clear" title="清空全部标注">清空</button>
         </div>
         <div class="progress-track" title="">
           <div class="progress-fill" data-el="progressFill"></div>
@@ -1147,9 +1261,47 @@ export function mountAnnotator(options = {}) {
              看到的信息（进度停在某个百分比时的原因）。 -->
         <div class="progress-note" data-el="progressNote"></div>
       </div>
-      <div class="panel-list" data-el="list"></div>
-      <footer><span class="panel-msg" data-el="msg"></span></footer>
+      <!-- 双折叠区布局：上「待执行任务」下「待归档检验」，各占一半可独立折叠 -->
+      <div class="region region-tasks open" data-el="tasksRegion">
+        <div class="arch-drawer-head region-head">
+          <button type="button" class="arch-region-toggle open" data-act="tasks-region-toggle" data-el="tasksRegionToggle" title="展开/收起待执行任务区">
+            <svg class="arch-region-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            <strong>待执行任务</strong><span class="region-count" data-el="tasksRegionCount"></span>
+          </button>
+        </div>
+        <div class="panel-list region-body" data-el="list"></div>
+      </div>
+      <!-- 检验归档区：常驻第二块折叠区（无任务时为空态），
+           按页面分组列出全部已完成待归档任务，支持单任务/按页/全部三级归档。
+           数据随任务刷新实时推送，不是点开才加载。 -->
+      <div class="region panel-arch open" data-el="archInline">
+        <div class="arch-drawer-head region-head" data-el="archDrawerHead">
+          <button type="button" class="arch-region-toggle" data-act="archive-view-toggle" data-el="archRegionToggle" title="展开/收起待归档检验区">
+            <svg class="arch-region-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
+            <strong>待归档检验</strong><span class="region-count" data-el="archDrawerCount"></span>
+          </button>
+          <button type="button" class="arch-all" data-act="archive-all-done" title="把全部已完成任务一次性归档">全部归档</button>
+        </div>
+        <div class="arch-drawer-body region-body" data-el="archDrawerBody"></div>
+        <div class="arch-pop hidden" data-el="archPop">
+          <p data-el="archPopText"></p>
+          <div class="arch-pop-actions">
+            <button type="button" data-el="archPopCancel">取消</button>
+            <button type="button" class="primary" data-el="archPopOk">确认归档</button>
+          </div>
+        </div>
+      </div>
+      <footer><span class="panel-msg" data-el="msg"></span><span class="panel-version" data-el="panelVersion" title="标注组件运行时版本"></span></footer>
     </section>
+    <!-- 悬耳态：面板收成屏幕边缘细条，悬停滑出悬浮面板预览，
+         点击固定展开。数字=全站未归档任务数；竖条=本轮进度。 -->
+    <button type="button" class="panel-edge-tab hidden" data-el="panelEdgeTab" data-act="panel-tab-expand" title="展开标注面板（悬停=预览悬浮列表，点击=固定展开）">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 6 9 12 15 18"/></svg>
+      <span class="pet-count" data-el="panelEdgeCount"></span>
+      <span class="pet-progress" data-el="petProgress" title="">
+        <span class="pet-progress-fill" data-el="petProgressFill"></span>
+      </span>
+    </button>
   `;
 
   // 收起状态下面板底栏不可见，操作反馈（复制成功/失败等）改由这个浮条兜底，
@@ -1280,7 +1432,9 @@ export function mountAnnotator(options = {}) {
 
   /** 任务组 + 执行模式一次取回：模式与分母必须同源，避免两处请求读到不同时刻的状态。 */
   async function fetchTasksData() {
-    const response = await fetch(`${config.endpoint}/tasks`, { cache: 'no-store' });
+    // 8s 超时：挂起的请求会把 refreshPending 永久卡死（后续刷新全被跳过），
+    // 超时抛错走 catch 释放锁，下轮轮询自愈。
+    const response = await fetch(`${config.endpoint}/tasks`, { cache: 'no-store', signal: AbortSignal.timeout(8000) });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
     return {
@@ -1314,11 +1468,13 @@ export function mountAnnotator(options = {}) {
       state.tasks = remoteTasks;
     }
     state.remoteRevision = group?.updatedAt || '';
+    state.currentGroupId = group?.id || null;
     state.groups = groups.filter(g => g && g.page?.url !== pageUrl);
     state.hasLoadedRemote = true;
     persistLocal();
     renderPins();
     renderList();
+    renderVerifyArchive();
     return group;
   }
 
@@ -1330,7 +1486,13 @@ export function mountAnnotator(options = {}) {
    * 才保留本地草稿，避免网络短暂中断造成页面上的内容突然消失。
    */
   async function loadRemoteTasks({ quiet = false } = {}) {
-    if (!config.autoSync || state.refreshPending) return null;
+    if (!config.autoSync) return null;
+    if (state.refreshPending) {
+      // 在途拉取可能取到「本次 PATCH 之前」的旧快照：排队补一轮，
+      // 否则归档/打回后 UI 停留旧状态直到下个 10s 轮询。
+      state.refreshQueued = true;
+      return null;
+    }
     state.refreshPending = true;
     try {
       const data = await fetchTasksData();
@@ -1361,6 +1523,10 @@ export function mountAnnotator(options = {}) {
       return null;
     } finally {
       state.refreshPending = false;
+      if (state.refreshQueued) {
+        state.refreshQueued = false;
+        loadRemoteTasks({ quiet: true });
+      }
     }
   }
 
@@ -1666,8 +1832,12 @@ export function mountAnnotator(options = {}) {
   function renderCapsule() {
     // 收起胶囊显示「本页/总数」：跨页面标注时用户同时关心
     // 当前页进度与整个项目的标注总量（如首页上是 0/3）。
-    const otherTotal = state.groups.reduce((sum, g) => sum + ((g.tasks || []).length), 0);
-    $('[data-el="capsuleCount"]').textContent = `${state.tasks.length}/${state.tasks.length + otherTotal}`;
+    // 收起胶囊显示「本页未归档/全部未归档」：已归档任务是交付完的沉没态，
+    // 用户关心的是还没走完闭环的活——archived 不计入分子分母。
+    const live = t => t && t.status !== 'archived';
+    const curLive = state.tasks.filter(live).length;
+    const otherLive = state.groups.reduce((sum, g) => sum + ((g.tasks || []).filter(live).length), 0);
+    $('[data-el="capsuleCount"]').textContent = `${curLive}/${curLive + otherLive}`;
     const dock = $('[data-el="dock"]');
     const toggle = $('[data-el="dockToggle"]');
     dock.dataset.active = state.active ? 'on' : 'off';
@@ -1718,7 +1888,10 @@ export function mountAnnotator(options = {}) {
     if (host) host.setAttribute('data-zwa-theme', value);
     const btn = $('[data-el="themeBtn"]');
     if (btn) {
-      btn.textContent = value === 'light' ? '☀️' : '🌙';
+      // SVG 图标替代 Emoji：部分平台 Emoji 字形自带色块底，且违反「封杀原生 Emoji」规范
+      btn.innerHTML = value === 'light'
+        ? '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="2" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="22"/><line x1="4.9" y1="4.9" x2="6.3" y2="6.3"/><line x1="17.7" y1="17.7" x2="19.1" y2="19.1"/><line x1="2" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="22" y2="12"/><line x1="4.9" y1="19.1" x2="6.3" y2="17.7"/><line x1="17.7" y1="6.3" x2="19.1" y2="4.9"/></svg>'
+        : '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>';
       btn.title = value === 'light' ? '当前明亮主题，点击切换为暗色' : '当前暗色主题，点击切换为明亮';
     }
   }
@@ -1774,7 +1947,8 @@ export function mountAnnotator(options = {}) {
     // 分母两种模式同口径（本轮定稿集合），前缀只标明当前模式便于对账
     const scopeName = scope.mode === 'queue' ? '队列·本轮' : '本轮';
     $('[data-el="progressLabel"]').textContent = p.total
-      ? `${scopeName} 待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0} / 共 ${p.total}`
+      ? `${scopeName} 待验收 ${p.counts.review || 0} · 已完成 ${p.counts.done || 0}`
+        + `${p.counts.archived ? ` · 已归档 ${p.counts.archived}` : ''} / 共 ${p.total}`
       : (scope.queued ? `下一轮 ${scope.queued} 条 · 复制提示词开始` : '还没有任务');
     // 排队数与状态提示走独立一行：两者都可能很长，放在首行会被 ellipsis
     // 截掉，而「为什么停在某个百分比」正是这条进度最重要的补充信息。
@@ -1792,7 +1966,7 @@ export function mountAnnotator(options = {}) {
     }
     fill.parentElement.title = p.total
       ? `分派 ${p.started}/${p.total} · 开发完成 ${p.devDone}/${p.total} · 验收通过 ${p.verified}/${p.total}\n`
-        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入）\n`
+        + `权重：分派 10% / 开发 70% / 验收 20%（cancelled 不计入，archived 按已完成计）\n`
         + `统计范围：第 ${scope.currentRound} 轮定稿集合（含执行中并入，归档轮次不计）`
       : '';
     // 全部完成时换成绿色并常驻，直到归档（交付）——这是「本轮收工」的信号
@@ -1837,23 +2011,28 @@ export function mountAnnotator(options = {}) {
     const stat = p || computeProgress((scope || roundScope()).dispatched);
     const show = stat.total > 0 && state.collapsed;
     box.classList.toggle('hidden', !show);
-    if (!show) return;
-    fill.style.width = `${stat.percent}%`;
-    fill.dataset.done = stat.percent >= 100 ? 'on' : 'off';
-    box.title = `进度 ${stat.percent}%（待验收 ${stat.counts.review || 0} · 已完成 ${stat.counts.done || 0} / 共 ${stat.total}）`;
+    if (show) {
+      fill.style.width = `${stat.percent}%`;
+      fill.dataset.done = stat.percent >= 100 ? 'on' : 'off';
+      box.title = `进度 ${stat.percent}%（待验收 ${stat.counts.review || 0} · 已完成 ${stat.counts.done || 0} / 共 ${stat.total}）`;
+    }
+    // 悬耳态的竖向进度条：与药丸同口径，自下而上生长；本轮无任务时隐藏
+    const petBox = $('[data-el="petProgress"]');
+    const petFill = $('[data-el="petProgressFill"]');
+    if (petBox && petFill) {
+      const petShow = stat.total > 0;
+      petBox.classList.toggle('hidden', !petShow);
+      if (petShow) {
+        petFill.style.height = `${stat.percent}%`;
+        petFill.dataset.done = stat.percent >= 100 ? 'on' : 'off';
+        petBox.title = `进度 ${stat.percent}%（待验收 ${stat.counts.review || 0} · 已完成 ${stat.counts.done || 0} / 共 ${stat.total}）`;
+      }
+    }
   }
 
   function renderPanelMeta() {
-    const filled = state.tasks.filter(t => String(t.instruction || '').trim()).length;
-    const otherTotal = state.groups.reduce((sum, g) => sum + ((g.tasks || []).length), 0);
-    // 有跨页面任务时按用户的心智模型给出两个数字：项目总量与当前页数量；
-    // 只有一页时退回原来的简洁显示，避免“共 3 项 · 当前页 3”的废话。
-    const parts = otherTotal > 0 ? [`共 ${state.tasks.length + otherTotal} 项`, `当前页 ${state.tasks.length}`] : [`${state.tasks.length} 项`];
-    parts.push(`已填 ${filled}`);
-    if (state.syncState === 'saving') parts.push('同步中…');
-    else if (state.dirty) parts.push('待同步');
-    else if (state.syncState === 'saved') parts.push('已同步');
-    $('[data-el="panelMeta"]').textContent = parts.join(' · ');
+    // 「N 项·已填 N」元信息行已移除：两个折叠区头部各自带实时计数，
+    // 顶栏再摆一份是重复信息；这里只保留标注模式钮与进度的联动刷新。
     const toggle = $('[data-el="toggleBtn"]');
     toggle.textContent = state.active ? '结束' : '标注';
     toggle.dataset.active = state.active ? 'on' : 'off';
@@ -2019,10 +2198,12 @@ export function mountAnnotator(options = {}) {
     // 处理开始后新增的批注没有轮次号 → 排队下一轮（有轮次在身时才显示徽标）
     const queued = state.roundQueued && task.round == null;
     const pending = typeof task.pendingInstruction === 'string' && task.pendingInstruction.trim();
-    const thumbs = (task.images || []).length
-      ? `<div class="item-thumbs">${task.images
-          .map(img => { const src = imageSrc(img, config.endpoint); return src ? `<img src="${escapeHtml(src)}" alt="">` : `<span class="thumb-file" title="${escapeHtml(img.file || '')}">图</span>`; })
-          .join('')}</div>`
+    // 与待归档检验行同款横排：只露首图 + 张数角标，多图存 data-srcs 供灯箱切换
+    const srcs = (Array.isArray(task.images) ? task.images : [])
+      .map(img => imageSrc(img, config.endpoint))
+      .filter(Boolean);
+    const thumbs = srcs.length
+      ? `<span class="item-thumbs"><span class="arch-thumb-wrap" data-srcs="${escapeHtml(JSON.stringify(srcs))}"><img class="arch-thumb" loading="lazy" src="${escapeHtml(srcs[0])}" alt="">${srcs.length > 1 ? `<i class="arch-thumb-n">${srcs.length}</i>` : ''}</span></span>`
       : '';
     const readonlyAttr = readonly ? ' readonly' : '';
     const readonlyHint = readonly
@@ -2047,10 +2228,12 @@ export function mountAnnotator(options = {}) {
           ? ''
           : `<button type="button" class="link danger" data-del="${escapeHtml(task.id)}" title="删除">✕</button>`}
       </div>
-      ${thumbs}
-      <label class="item-instruction">
-        <textarea data-edit="${escapeHtml(task.id)}" rows="2" placeholder="输入调整要求"${readonlyAttr}${readonlyHint}>${escapeHtml(task.instruction)}</textarea>
-      </label>
+      <div class="item-body">
+        ${thumbs}
+        <label class="item-instruction">
+          <textarea data-edit="${escapeHtml(task.id)}" rows="2" placeholder="输入调整要求"${readonlyAttr}${readonlyHint}>${escapeHtml(task.instruction)}</textarea>
+        </label>
+      </div>
       <div class="item-foot">
         <code>${escapeHtml(sub)}</code>
         <span class="tag${empty ? ' warn' : ` status-${task.status}`}" title="状态：${STATUS_LABELS[task.status] || task.status}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${pending ? `<span class="tag pending" title="已提交新要求（下一轮处理）：${escapeHtml(task.pendingInstruction)}">新要求</span>` : ''}${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
@@ -2087,12 +2270,21 @@ export function mountAnnotator(options = {}) {
    * 按服务端返回的最近活动排序。组内顺序仍是添加顺序，编号不重排。
    * 跨页面标注不会因切换页面而丢失：每个页面的任务都常驻列表，可折叠。
    */
+  /** 列表可见任务：已完成待归档（done）与已归档任务只出现在「检验归档」抽屉，
+      标注列表不再展示——否则验收完的任务永远占着列表挤掉真正待办的。 */
+  function isPanelTask(t) {
+    return t && t.status !== 'done' && t.status !== 'archived';
+  }
+
   function renderList() {
     const list = $('[data-el="list"]');
     // 卡片上的「下一轮」徽标需要知道当前是否有轮次在身（含排队数）
     state.roundQueued = roundScope().queued;
-    const otherGroups = state.groups.filter(g => g && Array.isArray(g.tasks) && g.tasks.length);
-    if (!state.tasks.length && !otherGroups.length) {
+    const curTasks = state.tasks.filter(isPanelTask);
+    const otherGroups = state.groups
+      .map(g => ({ group: g, tasks: (g && Array.isArray(g.tasks) ? g.tasks : []).filter(isPanelTask) }))
+      .filter(x => x.tasks.length);
+    if (!curTasks.length && !otherGroups.length) {
       list.innerHTML = '<p class="empty">还没有标注。点击“标注”后点选元素，或用“手动”添加任务。</p>';
       renderCapsule();
       renderPanelMeta();
@@ -2104,17 +2296,17 @@ export function mountAnnotator(options = {}) {
         current: true,
         title: document.title || '当前页面',
         path: safePathname(location.href),
-        tasks: state.tasks,
+        tasks: curTasks,
       }),
     ];
-    for (const group of otherGroups) {
+    for (const { group, tasks } of otherGroups) {
       sections.push(
         renderGroupSection({
           id: group.id,
           current: false,
           title: group.page?.title || group.page?.url || '其它页面',
           path: safePathname(group.page?.url || ''),
-          tasks: group.tasks,
+          tasks,
         }),
       );
     }
@@ -2239,7 +2431,8 @@ export function mountAnnotator(options = {}) {
 
   function renderPins() {
     pins.innerHTML = '';
-    state.tasks.forEach((task, index) => {
+    // archived 是终态：图钉不应再渲染（done 仍显示，待归档检验要对页面核对）
+    state.tasks.filter(t => t && t.status !== 'archived').forEach((task, index) => {
       const seq = task.seq || index + 1;
       const empty = !String(task.instruction || '').trim();
       const pin = document.createElement('button');
@@ -2693,12 +2886,30 @@ export function mountAnnotator(options = {}) {
     placeEditor(task.element, input);
     // 选中元素虚线高亮：优先用确认时存下的真实元素引用（与当时选中完全一致），
     // 没有才按 selector 解析——解析可能回退到大容器把标记画成整卡
-    const markEls = state.taskEls.get(task.id)?.length
-      ? state.taskEls.get(task.id)
-      : [
-          task.element?.selector ? resolveElement(task.element.selector) : null,
-          ...(task.meta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null)),
-        ];
+    const markEls = (() => {
+      const cached = state.taskEls.get(task.id);
+      if (cached?.length) return cached;
+      const main = task.element?.selector ? resolveElement(task.element.selector) : null;
+      const region = task.meta?.region;
+      return [
+        main,
+        // 过滤：①祖先容器（把虚线框画成整卡）②主元素的子孙零件（input 壳/
+        // 后缀图标等，主元素框已覆盖，重画会成嵌套小框）③蹭到选区边缘的大
+        // 元素（如顶栏），要求矩形过半落在所画选区内才保留
+        ...(task.meta?.extraElements || []).map(e => (e && e.selector ? resolveElement(e.selector) : null))
+          .filter(n => {
+            if (!n) return true;
+            if (main && (n.contains(main) || main.contains(n))) return false;
+            if (region) {
+              const r = n.getBoundingClientRect();
+              const iw = Math.min(region.x + region.width, r.right) - Math.max(region.x, r.left);
+              const ih = Math.min(region.y + region.height, r.bottom) - Math.max(region.y, r.top);
+              if (iw <= 0 || ih <= 0 || (iw * ih) < r.width * r.height * 0.5) return false;
+            }
+            return true;
+          }),
+      ];
+    })();
     showSelectionMarks(markEls);
     renderList();
   }
@@ -2810,6 +3021,17 @@ export function mountAnnotator(options = {}) {
           : state.pendingMeta?.extraElements;
         for (const e of extras || []) {
           const n = e && e.selector ? resolveElement(e.selector) : null;
+          // 祖先容器/子孙零件不参与聚光并集（存量任务的 extras 里可能混入
+          // 容器链与控件内零件，前者把高亮孔撑成整卡，后者纯冗余）
+          if (n && el && (n.contains(el) || el.contains(n))) continue;
+          // 相交候选兜底可能收进「只蹭到选区边缘的大元素」（如顶栏/整卡容器），
+          // 有 region 时要求元素矩形过半落在选区内，否则不参与并集
+          if (n && metaRegion) {
+            const r = n.getBoundingClientRect();
+            const iw = Math.min(metaRegion.x + metaRegion.width, r.right) - Math.max(metaRegion.x, r.left);
+            const ih = Math.min(metaRegion.y + metaRegion.height, r.bottom) - Math.max(metaRegion.y, r.top);
+            if (iw <= 0 || ih <= 0 || (iw * ih) < r.width * r.height * 0.5) continue;
+          }
           if (n) live.push(n.getBoundingClientRect());
         }
       }
@@ -3070,8 +3292,8 @@ export function mountAnnotator(options = {}) {
     renderPins();
     renderList();
     renderMessage();
-    // 暖下一张快照：连续标注时 2s 内复用，二次截图近 0 延迟
-    pageSnapshot(config.endpoint);
+    // 暖下一张快照：连续标注时 2s 内复用，二次截图近 0 延迟（空闲调度防阻塞）
+    scheduleSnapshot(config.endpoint);
     // 关闭弹窗但保持标注模式，方便连续点选
     editor.classList.add('hidden');
     state.editingId = null;
@@ -3635,9 +3857,18 @@ export function mountAnnotator(options = {}) {
     if (element) element.rect = { ...region };
     const seenSel = new Set(element ? [element.selector] : []);
     const extras = [];
-    // extras 同为包容语义：其余最高层元素优先，不足时由相交候选补齐上下文
+    // extras 同为包容语义：其余最高层元素优先，不足时由相交候选补齐上下文；
+    // 过滤两类污染源：①主元素的祖先容器 ②只蹭到选区边缘的大元素
+    // （元素矩形过半须在选区内）——二者重解析后会把聚光并集撑成整卡
     for (const el of [...topLevel, ...candidates.map(c => c.el)]) {
       if (el === primaryEl) continue;
+      // 主元素的祖先容器与子孙零件都不进 extras（input 壳/后缀图标这类
+      // 内零件重解析后会画出嵌套小框；容器链则把高亮撑成整卡）
+      if (primaryEl && (el.contains(primaryEl) || primaryEl.contains(el))) continue;
+      const er = el.getBoundingClientRect();
+      const iw = Math.min(rect.x + rect.width, er.right) - Math.max(rect.x, er.left);
+      const ih = Math.min(rect.y + rect.height, er.bottom) - Math.max(rect.y, er.top);
+      if (iw <= 0 || ih <= 0 || (iw * ih) < er.width * er.height * 0.5) continue;
       const d = describeElement(el);
       if (seenSel.has(d.selector)) continue;
       seenSel.add(d.selector);
@@ -3673,7 +3904,13 @@ export function mountAnnotator(options = {}) {
     if (m) {
       const dx = event.clientX - m.x0;
       const dy = event.clientY - m.y0;
-      if (!m.moved && Math.max(Math.abs(dx), Math.abs(dy)) > DRAG_THRESHOLD) m.moved = true;
+      if (!m.moved && Math.max(Math.abs(dx), Math.abs(dy)) > DRAG_THRESHOLD) {
+        m.moved = true;
+        // 升格为框选的瞬间隐掉悬停描边——否则拖拽前最后悬停的大容器
+        // （moved 分支提前 return，outline 不再更新）会一直框着外层大框
+        outline.style.display = 'none';
+        hideSizeBadge();
+      }
       if (m.moved) {
         const x = Math.min(m.x0, event.clientX);
         const y = Math.min(m.y0, event.clientY);
@@ -3746,6 +3983,11 @@ export function mountAnnotator(options = {}) {
     // mousedown，与点选时的透传行为一致。
     if (state.active && !isOwnUi(target)) {
       state.marquee = { x0: event.clientX, y0: event.clientY, moved: false };
+      // 快照在 mousedown 就启动：菜单类点击会在 click 阶段触发导航/重渲染，
+      // 若等 click 后才序列化 DOM，截到的是跳转后的版面，红框按旧 rect 画上去
+      // 必然错位（历史 bug：截图像素与 element 元数据不一致）。预热进缓存后
+      // captureContextShot 命中同一份 mousedown 时刻的 DOM。
+      pageSnapshot(config.endpoint);
     }
   }
 
@@ -3883,9 +4125,15 @@ export function mountAnnotator(options = {}) {
    * Esc 分级释放：
    * 1) 确认框打开时，Esc 关闭确认框；
    * 2) 编辑器打开时，Esc 关闭编辑器；
-   * 3) 编辑器已关闭时，Esc 依次退出标注模式、收起侧栏面板。
+   * 3) 编辑器已关闭时，Esc 只退出标注模式——不再收起面板（收起仅走面板头部收起钮）。
    */
   function onKeydown(event) {
+    if (!viewer.classList.contains('hidden') && (event.key === 'ArrowLeft' || event.key === 'ArrowRight')) {
+      event.preventDefault();
+      event.stopPropagation();
+      stepViewer(event.key === 'ArrowLeft' ? -1 : 1);
+      return;
+    }
     if (event.key === 'Escape') {
       if (!viewer.classList.contains('hidden')) {
         event.preventDefault();
@@ -3937,11 +4185,7 @@ export function mountAnnotator(options = {}) {
         setActive(false);
         return;
       }
-      if (!state.collapsed) {
-        event.preventDefault();
-        event.stopPropagation();
-        setCollapsed(true);
-      }
+      // Esc 只取消标注拾取，不再兜底收面板（收起只能走面板头部的收起钮）
       return;
     }
 
@@ -4021,7 +4265,7 @@ export function mountAnnotator(options = {}) {
     // 点「标注」进入时消息不变，于是上一条（比如上一轮的「已退出…」）
     // 会一直挂着，看起来像操作没生效。放在这里可保证两条路径一致，
     // 也覆盖 API 调用的 start/stop。
-    if (next) pageSnapshot(config.endpoint); // 进入即预热页面快照：首次点选截图近 0 延迟
+    if (next) { bindDomWatch(); scheduleSnapshot(config.endpoint); } // 进入即空闲预热页面快照：首次点选截图近 0 延迟（rIC 防进入瞬间主线程阻塞）；DOM 监听保证弹窗等动态内容不命中陈旧缓存
     state.syncMessage = next
       ? '已进入标注模式：点按选元素、拖拽框选、Shift+点击多选（Enter 收尾，Esc 退出）。'
       : '已退出标注模式。';
@@ -4089,6 +4333,10 @@ export function mountAnnotator(options = {}) {
     const vw = window.innerWidth, vh = window.innerHeight;
     const panel = $('[data-el="panel"]');
     bar.classList.toggle('flip-top', r.top < 80 && !(state.dockLayout && state.dockLayout.side));
+    // 面板有自定义布局（拖拽自由悬浮/左右吸边）时不再跟随胶囊锚定
+    if (state.panelLayout) { applyPanelLayout(); return; }
+    // 无布局=固定态：补一次显隐同步（固定钮/右箭头互斥在这里也要生效）
+    applyPanelLayout();
     const alignLeft = r.left + r.width / 2 < vw / 2;
     if (alignLeft) {
       panel.style.left = `${Math.max(8, r.left)}px`; panel.style.right = 'auto';
@@ -4110,6 +4358,7 @@ export function mountAnnotator(options = {}) {
    */
   function onBarPointerDown(event) {
     if (event.button !== 0) return;
+    // 归档抽屉有自己的拖拽/交互，不能连带拖走整条 bar（药丸会一起动）
     if (event.target.closest('.panel')) return;
     const rect = bar.getBoundingClientRect();
     const startX = event.clientX, startY = event.clientY;
@@ -4170,6 +4419,167 @@ export function mountAnnotator(options = {}) {
     window.addEventListener('mouseup', up, { once: true });
   }
 
+  /** 面板布局持久化：拖拽/吸边/固定模式跨刷新保留。 */
+  function loadPanelLayout() {
+    try {
+      const v = JSON.parse(localStorage.getItem(PANEL_LAYOUT_KEY) || 'null');
+      return v && typeof v === 'object' ? v : null;
+    } catch { return null; }
+  }
+  function savePanelLayout() {
+    try {
+      const l = state.panelLayout;
+      // retracted 并入布局持久化：悬浮收成边耳跨页/刷新后仍是边耳
+      localStorage.setItem(PANEL_LAYOUT_KEY, JSON.stringify(l ? { ...l, retracted: !!state.panelRetracted } : null));
+    } catch { /* 忽略 */ }
+  }
+
+  /** 把面板布局落到 DOM：null 时交还 syncBarAnchored 跟随胶囊；
+      吸边态顺带处理悬浮模式的边耳显隐与固定钮可见性。 */
+  function applyPanelLayout() {
+    const panel = $('[data-el="panel"]');
+    const tab = $('[data-el="panelEdgeTab"]');
+    if (!panel || !tab) return;
+    const l = state.panelLayout;
+    panel.classList.remove('edge-left', 'edge-right');
+    if (!l) {
+      panel.classList.remove('retracted');
+      tab.classList.add('hidden');
+      $('[data-el="panelPinBtn"]')?.classList.add('hidden');
+      $('[data-el="panelPinBtn"]')?.classList.remove('on');
+      $('[data-el="panelEarBtn"]')?.classList.remove('hidden');
+      return;
+    }
+    const vh = window.innerHeight;
+    if (l.side === 'left' || l.side === 'right') {
+      panel.classList.add(`edge-${l.side}`);
+      // 吸边留 5px 缝：面板与屏幕边缘不死贴（药丸吸边仍贴死，两态不同口径）
+      panel.style.left = l.side === 'left' ? '5px' : 'auto';
+      panel.style.right = l.side === 'right' ? '5px' : 'auto';
+      // 底边距屏幕下缘 ≥5px：面板不许沉出可视区
+      panel.style.top = `${clampNum(l.y ?? 80, 0, Math.max(0, vh - panel.offsetHeight - 5))}px`;
+      panel.style.bottom = 'auto';
+    } else if (Number.isFinite(l.x) && Number.isFinite(l.y)) {
+      panel.style.left = `${clampNum(l.x, 0, window.innerWidth - 120)}px`;
+      panel.style.right = 'auto';
+      panel.style.top = `${clampNum(l.y, 0, Math.max(0, vh - panel.offsetHeight - 5))}px`;
+      panel.style.bottom = 'auto';
+    }
+    // 悬浮模式（吸边且未固定）：收成边耳只露一条，悬停边耳滑出；
+    // 面板收起为胶囊时胶囊本身就是收起态，边耳不再出现（双收起态打架）
+    const retracted = !!(l.side && !l.pinned && state.panelRetracted && !state.collapsed);
+    panel.classList.toggle('retracted', retracted);
+    tab.classList.toggle('hidden', !retracted);
+    if (retracted) {
+      tab.classList.toggle('edge-left', l.side === 'left');
+      tab.classList.toggle('edge-right', l.side === 'right');
+      tab.style.top = `${clampNum(l.y ?? 80, 40, vh - 80)}px`;
+      tab.style.transform = 'none'; // 盖掉默认 translateY(-50%)，顶边=面板顶边
+      // 边耳数字=全站未归档任务总数（本页+其它页），与药丸口径一致；0 也显示
+      const live = state.tasks.filter(t => t && t.status !== 'archived').length
+        + state.groups.reduce((sum, g) => sum + ((g.tasks || []).filter(t => t && t.status !== 'archived').length), 0);
+      const cnt = $('[data-el="panelEdgeCount"]');
+      if (cnt) cnt.textContent = String(live);
+    }
+    // 固定钮与右箭头互斥：悬浮态（吸边未固定）只显示固定钮，固定态只显示右箭头
+    const floating = !!(l.side && !l.pinned);
+    const pin = $('[data-el="panelPinBtn"]');
+    pin?.classList.toggle('on', !!(l.side && l.pinned));
+    pin?.classList.toggle('hidden', !floating);
+    $('[data-el="panelEarBtn"]')?.classList.toggle('hidden', floating);
+    pin?.setAttribute('title', l.pinned
+      ? '固定模式：吸边保持展开（点击切悬浮模式，移开收成边耳）'
+      : '固定：点击锁定为固定面板');
+  }
+
+  /**
+   * 面板头拖拽：位移 >5px 进入拖动（直写 left/top），松手按落点判定——
+   * 距左/右缘 <20px 吸边（与胶囊同一阈值口径），否则自由悬浮。
+   * 吸边默认固定模式（pinned），点头上的钉钮切悬浮模式。
+   */
+  function onPanelHeadPointerDown(event) {
+    if (event.button !== 0) return;
+    if (event.target.closest('button')) return; // 头部按钮不吃拖拽
+    const panel = $('[data-el="panel"]');
+    if (!panel) return;
+    const rect = panel.getBoundingClientRect();
+    const startX = event.clientX, startY = event.clientY;
+    const offX = startX - rect.left, offY = startY - rect.top;
+    let dragging = false;
+    const move = ev => {
+      if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) > 5) {
+        dragging = true;
+        panel.classList.add('dragging');
+        // 从吸边态拖出：先摘 edge 类，面板在指针下完整展开再跟手
+        panel.classList.remove('edge-left', 'edge-right', 'retracted');
+      }
+      if (!dragging) return;
+      const nx = clampNum(ev.clientX - offX, 0, window.innerWidth - 120);
+      // 底边夹紧：面板下缘不许拖出屏幕，至少留 5px
+      const ny = clampNum(ev.clientY - offY, 0, Math.max(0, window.innerHeight - rect.height - 5));
+      panel.style.left = `${nx}px`;
+      panel.style.top = `${ny}px`;
+      panel.style.right = 'auto';
+      panel.style.bottom = 'auto';
+      ev.preventDefault();
+    };
+    const up = () => {
+      window.removeEventListener('pointermove', move, true);
+      window.removeEventListener('pointerup', up);
+      window.removeEventListener('mouseup', up);
+      panel.classList.remove('dragging');
+      if (!dragging) return;
+      dragging = false;
+      armClickSuppress('suppressUiClick');
+      const r2 = panel.getBoundingClientRect();
+      // 松手必吸边：不允许面板停在页面中间——按面板中线距左右缘的
+      // 远近决定吸左还是吸右，纵向保留松手位置。
+      const side = r2.left <= window.innerWidth - r2.right ? 'left' : 'right';
+      // 吸边默认固定模式；保留同侧已存 pinned 选择
+      const keepPinned = state.panelLayout && state.panelLayout.side === side ? !!state.panelLayout.pinned : true;
+      state.panelLayout = { side, y: r2.top, pinned: keepPinned };
+      state.panelRetracted = false;
+      savePanelLayout();
+      applyPanelLayout();
+    };
+    window.addEventListener('pointermove', move, true);
+    window.addEventListener('pointerup', up, { once: true });
+    window.addEventListener('mouseup', up, { once: true });
+  }
+
+  /** 悬浮模式：指针移出面板收成边耳；边耳悬停滑出（点击=固定展开）。 */
+  function bindPanelDocking() {
+    const panel = $('[data-el="panel"]');
+    const head = $('[data-el="panelHead"]');
+    const tab = $('[data-el="panelEdgeTab"]');
+    head?.addEventListener('pointerdown', onPanelHeadPointerDown);
+    // 双击面板头复位：清除自定义布局，回到跟随胶囊的默认锚定
+    head?.addEventListener('dblclick', event => {
+      if (event.target.closest('button')) return;
+      state.panelLayout = null;
+      state.panelRetracted = false;
+      savePanelLayout();
+      syncBarAnchored();
+    });
+    panel?.addEventListener('mouseleave', () => {
+      const l = state.panelLayout;
+      if (l && l.side && !l.pinned && !state.panelRetracted
+          && viewer.classList.contains('hidden') && !archPopOpen()) {
+        state.panelRetracted = true;
+        savePanelLayout(); // 收成边耳跨页保持
+        applyPanelLayout();
+      }
+    });
+    tab?.addEventListener('mouseenter', () => {
+      // 悬停只是预览：内存态滑出，不写持久化——否则悬停一下跳页，
+      // 新页面会莫名弹开面板。真正定住靠点击边耳（pinned=true）。
+      if (state.panelRetracted) {
+        state.panelRetracted = false;
+        applyPanelLayout();
+      }
+    });
+  }
+
   /** 武装「吞下一次 click」标志，350ms 后自愈。
       松手点在胶囊/页面外时残余 click 到不了对应监听器，布尔标志不设过期
       会挂住误吞下一次真实点击（悬浮展开后首次点按钮无效就是它）。 */
@@ -4178,7 +4588,24 @@ export function mountAnnotator(options = {}) {
     setTimeout(() => { state[key] = false; }, 350);
   }
 
+  /** 三态边缘守恒：面板下边 = 收起药丸下边。
+      吸边面板收起时把胶囊搬到「同侧边、底缘=面板底缘」的位置，
+      再展开面板回到 panelLayout 原位——收缩前后视觉锚点不动。 */
+  function syncCollapseAnchor() {
+    const panel = $('[data-el="panel"]');
+    const l = state.panelLayout;
+    if (!panel || !l || !panel.offsetHeight) return;
+    const r = panel.getBoundingClientRect();
+    const dockH = (state.lastDockRect && state.lastDockRect.bottom - state.lastDockRect.top) || 40;
+    state.dockLayout = l.side
+      ? { side: l.side, y: r.bottom - dockH }
+      : { x: r.left, y: r.bottom - dockH, side: null };
+    saveDockLayout();
+    applyDockLayout();
+  }
+
   function setCollapsed(next) {
+    if (next) syncCollapseAnchor();
     state.collapsed = next;
     persistCollapsed();
     // 收起是「面板自己消失」这种自明的动作，不该再复用上一条消息。
@@ -4205,6 +4632,308 @@ export function mountAnnotator(options = {}) {
 
   function expandBar() {
     setCollapsed(false);
+    // 药丸展开默认进「固定面板」：若曾吸边悬浮，强制锁定，不回落成悬耳
+    if (state.panelLayout && state.panelLayout.side) {
+      state.panelLayout.pinned = true;
+      state.panelRetracted = false;
+      savePanelLayout();
+      applyPanelLayout();
+    }
+  }
+
+  /* ---------------- 检验归档（已完成 → 已归档 人工核对入口） ---------------- */
+
+  /** 归档视图状态跨页面持久化：点页面跳转后新页面要能回到同样的核对现场。 */
+  const archDrawerKey = `${SOURCE}:arch-drawer`;
+  function persistArchDrawer() {
+    try {
+      localStorage.setItem(archDrawerKey, JSON.stringify({
+        open: state.archiveDrawerOpen,
+        tasksOpen: state.tasksRegionOpen,
+        openState: state.archOpenState,
+      }));
+    } catch { /* 存储不可用时归档视图仅在当前页有效 */ }
+  }
+
+  /** 跳转后恢复：归档区展开态与页组开合跨页保留（含用户已折叠的 false 态）。 */
+  function restoreArchDrawer() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(archDrawerKey) || 'null'); } catch { /* ignore */ }
+    if (saved && typeof saved === 'object') {
+      state.archiveDrawerOpen = saved.open !== false;
+      // 手风琴互斥不变量：归档区开则任务区关，反之亦然
+      state.tasksRegionOpen = !state.archiveDrawerOpen;
+      state.archOpenState = saved.openState && typeof saved.openState === 'object' ? saved.openState : {};
+    }
+    if (!doneCount()) {
+      applyArchDrawerLayout();
+      return;
+    }
+    // 不强开面板：用户收起成胶囊是显式选择，展开后归档区状态仍在
+    // 跳页核对语义：恢复后强制展开当前页组（手风琴互斥，其余收起），
+    // 否则当前页组恰处于已存收起态时跳转后看不到内容。
+    if (state.currentGroupId && doneGroups().some(d => d.group.id === state.currentGroupId)) {
+      state.archOpenState = {};
+      for (const d of doneGroups()) state.archOpenState[d.group.id] = d.group.id === state.currentGroupId;
+    }
+    renderArchiveDrawer();
+    applyArchDrawerLayout();
+  }
+
+  /** 全量任务组：当前页组 + 其它页组（currentGroupId 由 applyRemoteGroups 维护）。 */
+  function allGroupsWithCurrent() {
+    const list = [];
+    if (state.currentGroupId) {
+      list.push({ id: state.currentGroupId, page: { url: pageUrl, title: document.title || pageUrl }, tasks: state.tasks });
+    }
+    return list.concat(state.groups);
+  }
+
+  /** 已完成待归档 = status:'done' 且尚未归档的任务（archived 与文件级归档不在 /tasks 里）。 */
+  function doneGroups() {
+    return allGroupsWithCurrent()
+      .map(g => ({ group: g, tasks: (g.tasks || []).filter(t => t && t.status === 'done') }))
+      .filter(x => x.tasks.length);
+  }
+
+  function doneCount() {
+    return doneGroups().reduce((n, x) => n + x.tasks.length, 0);
+  }
+
+  /** 页面组短名：路径末段+查询串（区分同标题的 rpt=xxx 报表页）。 */
+  function archPageLabel(group) {
+    try {
+      const u = new URL(group.page?.url || '', window.location.origin);
+      return (u.pathname.split('/').filter(Boolean).pop() || '/') + u.search;
+    } catch { return group.page?.title || group.page?.url || '未命名页面'; }
+  }
+
+  /** 归档区随任务数据实时刷新：SSE/轮询每次重拉任务后走到这里，
+      开着的区域重渲列表，折叠态头部计数也要同步——不是点开才加载。 */
+  function renderVerifyArchive() {
+    if (state.archiveDrawerOpen) renderArchiveDrawer();
+    applyArchDrawerLayout(); // done 数变化可能令区域出现/消失 + 头部计数刷新
+  }
+
+  /** 归档区主体：一级页面（点击跳转核对），二级任务（单击归档）。 */
+  function renderArchiveDrawer() {
+    const body = $('[data-el="archDrawerBody"]');
+    if (!body) return;
+    closeArchPop(); // 数据刷新后旧确认 popover 已失效
+    const groups = doneGroups();
+    if (!groups.length) {
+      body.innerHTML = '<p class="arch-empty">没有已完成待归档任务</p>';
+      return;
+    }
+    body.innerHTML = groups.map(({ group, tasks }, gi) => {
+      // 页面名要能区分同标题页面（如 reports/driving?rpt=xxx 系列报表），
+      // 显示路径末段+查询串，完整标题与 URL 放悬浮提示。
+      const fullName = group.page?.title || group.page?.url || '未命名页面';
+      const pageName = archPageLabel(group);
+      const isCurrent = group.id === state.currentGroupId;
+      const open = state.archOpenState[group.id] != null
+        ? state.archOpenState[group.id]
+        : (isCurrent || gi === 0);
+      const taskRows = tasks.map(t => {
+        const el = t.element || {};
+        // 核对归档看的是「我输入的要求」：指令全文优先；el.text 是元素抓取的
+        // 整段文本（表格会带几百字），只能作为无指令时的兜底。
+        const tip = (t.instruction || '').trim();
+        const name = tip || el.accessibleName || el.text || '手动任务';
+        // 懒加载：只有展开组的任务才渲 <img>（折叠组的行连标签都不进 DOM）；
+        // 单行只露一张首图 + 张数角标，多图列表存 data-srcs 供灯箱切换，
+        // 不再渲 display:none 的隐藏 img（有 src 浏览器照样会发请求）。
+        const srcs = open
+          ? (Array.isArray(t.images) ? t.images : [])
+              .map(img => imageSrc(img, config.endpoint))
+              .filter(Boolean)
+          : [];
+        const thumbs = srcs.length
+          ? `<span class="arch-thumb-wrap" data-srcs="${escapeHtml(JSON.stringify(srcs))}"><img class="arch-thumb" loading="lazy" src="${escapeHtml(srcs[0])}" alt="">${srcs.length > 1 ? `<i class="arch-thumb-n">${srcs.length}</i>` : ''}</span>`
+          : '';
+        return `<div class="arch-task">
+          <span class="arch-task-name">${escapeHtml(name)}</span>
+          ${thumbs ? `<span class="arch-thumbs item-thumbs">${thumbs}</span>` : ''}
+          <span class="arch-task-acts">
+            <button type="button" class="arch-reject" data-act="reject-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" data-url="${escapeHtml(group.page?.url || '')}" title="打回重做：任务回到待执行并跳转页面打开标注编辑">打回</button>
+            <button type="button" data-act="archive-task" data-group="${escapeHtml(group.id)}" data-task="${escapeHtml(t.id)}" title="归档此任务">归档</button>
+          </span>
+        </div>`;
+      }).join('');
+      return `<div class="arch-page${open ? ' open' : ''}${isCurrent ? ' current' : ''}">
+        <div class="arch-page-row">
+          <button type="button" class="arch-page-head" data-act="arch-toggle" data-group="${escapeHtml(group.id)}" title="${open ? '收起任务列表' : '展开任务列表'}">
+            <svg class="arch-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>
+            <span class="arch-page-name">${escapeHtml(pageName)}</span>
+            ${isCurrent ? '<span class="arch-cur">当前</span>' : ''}
+            <span class="arch-page-count">${tasks.length}</span>
+          </button>
+          <button type="button" class="arch-goto" data-act="arch-goto" data-url="${escapeHtml(group.page?.url || '')}" title="跳转到 ${escapeHtml(fullName)} 核对">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 4h6v6"/><path d="M20 4L11 13"/><path d="M19 14v5a1.5 1.5 0 0 1-1.5 1.5h-12A1.5 1.5 0 0 1 4 19V6.5A1.5 1.5 0 0 1 5.5 5H11"/></svg>
+          </button>
+          <button type="button" class="arch-page-arch" data-act="archive-page" data-group="${escapeHtml(group.id)}" title="归档此页面全部 ${tasks.length} 项已完成任务">归档本页</button>
+        </div>
+        <div class="arch-tasks${open ? '' : ' hidden'}">${taskRows}</div>
+      </div>`;
+    }).join('');
+  }
+
+  /** 两个折叠区统一应用显隐：区域常驻（无任务为空态），open 控制主体展开；
+      计数在此更新——折叠态下头部数字也随推送实时刷新。 */
+  function applyArchDrawerLayout() {
+    const inline = $('[data-el="archInline"]');
+    const tasksRegion = $('[data-el="tasksRegion"]');
+    // 兜底归一化：无论状态怎么进来，双开/双关都不允许出现
+    if (state.archiveDrawerOpen && state.tasksRegionOpen) state.tasksRegionOpen = false;
+    if (!state.archiveDrawerOpen && !state.tasksRegionOpen) state.tasksRegionOpen = true;
+    if (inline) {
+      inline.classList.toggle('open', state.archiveDrawerOpen);
+      $('[data-el="archRegionToggle"]')?.classList.toggle('open', state.archiveDrawerOpen);
+      const n = doneCount();
+      const countEl = $('[data-el="archDrawerCount"]');
+      if (countEl) countEl.textContent = `（${n}）`;
+    }
+    if (tasksRegion) {
+      tasksRegion.classList.toggle('open', state.tasksRegionOpen);
+      $('[data-el="tasksRegionToggle"]')?.classList.toggle('open', state.tasksRegionOpen);
+      // 与列表口径一致：isPanelTask 排除 done/archived（done 归待归档区，
+      // 两边都计会重复），且含跨页任务——区域体渲染的就是全站待执行
+      const live = state.tasks.filter(isPanelTask).length
+        + state.groups.reduce((sum, g) => sum + ((g.tasks || []).filter(isPanelTask).length), 0);
+      const tc = $('[data-el="tasksRegionCount"]');
+      if (tc) tc.textContent = `（${live}）`;
+    }
+  }
+
+  /** 待执行任务区折叠切换。手风琴互斥：展开这个就收起另一个，
+      收起这个就展开另一个——两个区始终只有一个展开。 */
+  function toggleTasksRegion() {
+    state.tasksRegionOpen = !state.tasksRegionOpen;
+    state.archiveDrawerOpen = !state.tasksRegionOpen;
+    applyArchDrawerLayout();
+    persistArchDrawer();
+  }
+
+  /** 区域头折叠切换：与待执行任务区互斥（同上）。 */
+  function toggleArchiveRegion() {
+    state.archiveDrawerOpen = !state.archiveDrawerOpen;
+    state.tasksRegionOpen = !state.archiveDrawerOpen;
+    if (state.archiveDrawerOpen && state.collapsed) setCollapsed(false);
+    closeArchPop();
+    // 展开即渲：body 不是常驻渲染（折叠态跳过），展开时若等下一次
+    // SSE/轮询才补内容，用户会看到长时间空白
+    if (state.archiveDrawerOpen) renderArchiveDrawer();
+    applyArchDrawerLayout();
+    persistArchDrawer();
+  }
+
+  /** 区域内贴按钮的小型确认 popover（批量归档用，非模态不打断布局）。 */
+  let archPopPending = null;
+  function closeArchPop() {
+    archPopPending = null;
+    $('[data-el="archPop"]')?.classList.add('hidden');
+  }
+  function archPopOpen() {
+    return !$('[data-el="archPop"]')?.classList.contains('hidden');
+  }
+  function askArchPop(anchorBtn, text, onConfirm) {
+    const box = $('[data-el="archInline"]');
+    const pop = $('[data-el="archPop"]');
+    if (!box || !pop) { onConfirm(); return; }
+    archPopPending = onConfirm;
+    $('[data-el="archPopText"]').textContent = text;
+    pop.classList.remove('hidden');
+    const dr = box.getBoundingClientRect();
+    const br = anchorBtn.getBoundingClientRect();
+    pop.style.right = `${Math.max(8, dr.right - br.right)}px`;
+    pop.style.left = 'auto';
+    const ph = pop.offsetHeight || 92;
+    // 固定弹在按钮上方；钳在归档区内部（贴顶时覆盖头部，保证文字完整可见）。
+    const top = Math.max(br.top - dr.top - ph - 6, 4);
+    pop.style.top = `${top}px`;
+  }
+
+  /** popover 确认/取消 + 点归档区其他位置收起 popover。 */
+  function bindArchivePop() {
+    $('[data-el="archPopOk"]')?.addEventListener('click', () => {
+      const fn = archPopPending;
+      closeArchPop();
+      if (fn) fn();
+    });
+    $('[data-el="archPopCancel"]')?.addEventListener('click', closeArchPop);
+    $('[data-el="archInline"]')?.addEventListener('pointerdown', event => {
+      if (archPopOpen() && !event.target.closest('.arch-pop')) closeArchPop();
+    });
+  }
+
+  /** 打回重做：done → todo（reopen 清验收结论），并跳回任务所在页打开
+      标注编辑器——改的要求不对不用重新标注，直接在原批注上改。 */
+  const PENDING_EDIT_KEY = `${SOURCE}:pending-edit`;
+  async function rejectTask(groupId, taskId, url) {
+    try {
+      await fetch(`${config.endpoint}/${encodeURIComponent(groupId)}/tasks/${encodeURIComponent(taskId)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'todo', reopen: true }),
+        signal: AbortSignal.timeout(8000),
+      }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); });
+    } catch (error) {
+      state.syncMessage = `打回失败：${error.message}`;
+      renderMessage();
+      return;
+    }
+    if (url && url !== pageUrl) {
+      // 跨页：存下待编辑任务，目标页加载完成后恢复编辑器现场
+      try { localStorage.setItem(PENDING_EDIT_KEY, JSON.stringify({ groupId, taskId })); } catch { /* ignore */ }
+      window.location.href = url;
+      return;
+    }
+    // 同页：重拉任务（done→todo 已回到待执行区）后直接开编辑器
+    await loadRemoteTasks({ quiet: true });
+    if (state.collapsed) setCollapsed(false);
+    if (findTask(taskId)) openEditorFor(taskId);
+  }
+
+  /** 跨页打回落地：新页任务加载完成后自动弹出该任务的标注编辑器。 */
+  function restorePendingEdit() {
+    let p = null;
+    try { p = JSON.parse(localStorage.getItem(PENDING_EDIT_KEY) || 'null'); } catch { /* ignore */ }
+    if (!p || !p.taskId) return;
+    try { localStorage.removeItem(PENDING_EDIT_KEY); } catch { /* ignore */ }
+    if (findTask(p.taskId)) {
+      if (state.collapsed) setCollapsed(false);
+      openEditorFor(p.taskId);
+    }
+  }
+
+  /** 归档写回：PATCH status:archived，成功后静默重拉任务刷新列表与角标。 */
+  async function archiveTasksRemote(pairs) {
+    if (!pairs.length) return;
+    const results = await Promise.allSettled(pairs.map(({ groupId, taskId }) =>
+      fetch(`${config.endpoint}/${encodeURIComponent(groupId)}/tasks/${encodeURIComponent(taskId)}`, {
+        method: 'PATCH',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ status: 'archived' }),
+        signal: AbortSignal.timeout(8000),
+      }).then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); }),
+    ));
+    const failed = results.filter(r => r.status === 'rejected').length;
+    const ok = pairs.length - failed;
+    // 乐观下屏：成功的对先在本地标 archived 并立即重渲，
+    // 不等服务端回拉——用户点确认后界面即刻响应。
+    const okIds = new Set(pairs.filter((_, i) => results[i].status === 'fulfilled').map(p => p.taskId));
+    const markArchived = list => list.forEach(t => { if (t && okIds.has(t.id)) t.status = 'archived'; });
+    markArchived(state.tasks);
+    state.groups.forEach(g => markArchived(g.tasks || []));
+    renderList();
+    renderPins(); // 归档任务的页面图钉同步摘除
+    renderVerifyArchive();
+    state.syncMessage = failed
+      ? `已归档 ${ok} 项，${failed} 项失败（可能已被处理）。`
+      : `已归档 ${ok} 项任务。`;
+    renderMessage();
+    await loadRemoteTasks({ quiet: true });
+    renderVerifyArchive();
   }
 
   /* ---------------- 二次确认 ---------------- */
@@ -4266,7 +4995,23 @@ export function mountAnnotator(options = {}) {
       const thumbImg = target.closest && target.closest('.item-thumbs img, .thumb img');
       if (thumbImg && thumbImg.src) {
         event.preventDefault();
-        showViewer(thumbImg.src);
+        // 同任务多图：把缩略图容器里的整组 src 交给灯箱，支持左右切换
+        const box = thumbImg.closest('.item-thumbs, .thumb, .arch-thumbs');
+        // 归档抽屉的多图清单存在 wrap 的 data-srcs 上（不渲隐藏 img 省请求）；
+        // 列表/看板卡片仍从同级 img 收集。
+        let srcs = null;
+        const wrap = thumbImg.closest('.arch-thumb-wrap');
+        if (wrap?.dataset.srcs) {
+          try { srcs = JSON.parse(wrap.dataset.srcs); } catch { srcs = null; }
+        }
+        if (!srcs) srcs = box ? Array.from(box.querySelectorAll('img')).map(i => i.src) : [thumbImg.src];
+        // 预览时带上任务文案：归档抽屉行取指令名，列条目取指令输入框内容
+        const taskEl = thumbImg.closest('.arch-task, .item');
+        const caption = taskEl
+          ? (taskEl.querySelector('.arch-task-name')?.textContent
+             || taskEl.querySelector('.item-instruction textarea')?.value || '').trim()
+          : '';
+        showViewer(srcs, Math.max(0, srcs.indexOf(thumbImg.src)), caption);
         return;
       }
       // 按钮内部还有文字与 svg 图标，真实点击常落在子元素上，
@@ -4315,6 +5060,89 @@ export function mountAnnotator(options = {}) {
       } else if (act === 'copy') copyPrompt();
       else if (act === 'accept-round') acceptRound();
       else if (act === 'archive-round') archiveRound();
+      else if (act === 'archive-view-toggle') toggleArchiveRegion();
+      else if (act === 'tasks-region-toggle') toggleTasksRegion();
+      else if (act === 'panel-pin') {
+        if (state.panelLayout && state.panelLayout.side) {
+          state.panelLayout.pinned = !state.panelLayout.pinned;
+          if (state.panelLayout.pinned) state.panelRetracted = false;
+          savePanelLayout();
+          applyPanelLayout();
+        }
+      }
+      else if (act === 'panel-ear') {
+        // 右箭头 = 收成边耳：面板贴当前（或默认右）侧缘收成细条，可再固定/收药丸
+        const panel = $('[data-el="panel"]');
+        const r = panel?.getBoundingClientRect();
+        const cur = state.panelLayout;
+        const side = cur?.side === 'left' || cur?.side === 'right' ? cur.side : 'right';
+        const y = cur && Number.isFinite(cur.y) ? cur.y : (r ? r.top : 80);
+        state.panelLayout = { side, y, pinned: false };
+        state.panelRetracted = true;
+        savePanelLayout();
+        applyPanelLayout();
+      }
+      else if (act === 'panel-tab-expand') {
+        // 边耳固定钮 = 展开为固定面板（锁定态）
+        if (state.panelLayout && state.panelLayout.side) state.panelLayout.pinned = true;
+        state.panelRetracted = false;
+        savePanelLayout();
+        applyPanelLayout();
+      }
+      else if (act === 'arch-toggle') {
+        const gid = actBtn.getAttribute('data-group');
+        // 与 renderArchiveDrawer 默认态保持一致：当前页组或首组默认展开
+        const isFirst = doneGroups()[0]?.group.id === gid;
+        const cur = state.archOpenState[gid] != null
+          ? state.archOpenState[gid]
+          : (gid === state.currentGroupId || isFirst);
+        // 手风琴：同一时刻只展开一个页面组，展开这组就收起其它全部
+        if (cur) {
+          state.archOpenState[gid] = false;
+        } else {
+          state.archOpenState = {};
+          for (const d of doneGroups()) state.archOpenState[d.group.id] = d.group.id === gid;
+        }
+        renderArchiveDrawer();
+        persistArchDrawer();
+      }
+      else if (act === 'arch-goto') {
+        const url = actBtn.getAttribute('data-url');
+        if (url && url !== pageUrl) {
+          // 跳转前落盘抽屉状态：新页面加载后自动还原抽屉与展开态
+          persistArchDrawer();
+          window.location.href = url;
+        }
+      } else if (act === 'reject-task') {
+        const gid = actBtn.getAttribute('data-group');
+        const tid = actBtn.getAttribute('data-task');
+        const url = actBtn.getAttribute('data-url');
+        // 打回会撤销已验收结论并回到待执行——显式二次确认防误触
+        askConfirm({
+          title: '打回此任务？',
+          detail: '任务将回到「待执行任务」重新处理，已验收结论作废。',
+          confirmText: '打回',
+          onConfirm: () => rejectTask(gid, tid, url),
+        });
+      } else if (act === 'archive-task') {
+        archiveTasksRemote([{ groupId: actBtn.getAttribute('data-group'), taskId: actBtn.getAttribute('data-task') }]);
+      } else if (act === 'archive-page' || act === 'archive-all-done') {
+        const gid = act === 'archive-page' ? actBtn.getAttribute('data-group') : null;
+        const pairs = [];
+        let pageLabel = '';
+        doneGroups().forEach(({ group, tasks }) => {
+          if (gid && group.id !== gid) return;
+          if (gid) pageLabel = archPageLabel(group);
+          tasks.forEach(t => pairs.push({ groupId: group.id, taskId: t.id }));
+        });
+        if (!pairs.length) return;
+        // 批量归档用贴按钮的 popover 确认（非模态），抽屉布局不被打断
+        askArchPop(
+          actBtn,
+          gid ? `归档「${pageLabel}」的 ${pairs.length} 项任务？` : `归档全部 ${pairs.length} 项已完成任务？`,
+          () => archiveTasksRemote(pairs),
+        );
+      }
       else if (act === 'mode') setExecutionMode(event.target?.dataset?.mode);
       else if (act === 'manual') {
         openEditorForManual();
@@ -4433,7 +5261,9 @@ export function mountAnnotator(options = {}) {
   // 定时器会继续处理模型在其它终端的状态回写、删除与归档。
   startRemoteRefresh();
   startEventStream();
-  loadRemoteTasks({ quiet: true });
+  bindArchivePop();
+  bindPanelDocking();
+  loadRemoteTasks({ quiet: true }).then(() => { restoreArchDrawer(); restorePendingEdit(); });
 
   const api = {
     // 版本由宿主（Vite 插件 / http 适配器）随 bootstrap 注入，与技能版本同源。
@@ -4813,10 +5643,39 @@ const CSS_TEXT = `
   display: flex; align-items: center; justify-content: center;
   background: rgba(10, 14, 28, .82); cursor: zoom-out;
 }
+.viewer { overflow: hidden; }
 .viewer img {
-  max-width: 92vw; max-height: 92vh; border-radius: 8px;
+  max-width: 82vw; max-height: 92vh; border-radius: 8px;
   box-shadow: 0 12px 48px rgba(0,0,0,.5); background: #fff;
+  transition: transform .12s ease-out;
 }
+/* 多图切换：左右箭头悬浮于视口两侧，底部居中计数徽标 */
+.viewer-nav {
+  position: fixed; top: 50%; transform: translateY(-50%);
+  width: 44px; height: 64px; border: 0; border-radius: 10px; cursor: pointer;
+  background: rgba(30,30,40,.7); color: #d5d5dc;
+  display: flex; align-items: center; justify-content: center;
+}
+.viewer-nav:hover { background: rgba(60,60,80,.9); color: #fff; }
+.viewer-nav svg { width: 22px; height: 22px; }
+.viewer-nav.prev { left: 18px; }
+.viewer-nav.next { right: 18px; }
+.viewer-count {
+  position: fixed; bottom: 26px; left: 50%; transform: translateX(-50%);
+  padding: 3px 12px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  background: rgba(30,30,40,.8); color: #d5d5dc;
+}
+.viewer-count:empty { display: none; }
+/* 预览时底部展示任务文案（我输入的指令），核对不用退回列表看 */
+.viewer-caption {
+  position: fixed; left: 50%; bottom: 64px; transform: translateX(-50%);
+  max-width: 76vw; padding: 9px 20px; border-radius: 10px;
+  background: rgba(20,20,28,.88); color: #f2f2f8; font-size: 17px; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word;
+  box-shadow: 0 4px 20px rgba(0,0,0,.4);
+}
+.viewer-caption:empty { display: none; }
 .item-thumbs img, .thumb img { cursor: zoom-in; }
 
 /* ---- 悬停尺寸标签 ---- */
@@ -5100,6 +5959,8 @@ const CSS_TEXT = `
 }
 /* 面板在 .bar 内：继承 none 会不可点，展开面板时单独恢复 */
 .bar.edge-right .panel, .bar.edge-left .panel { pointer-events: auto; }
+/* 面板悬浮模式的边耳同理：胶囊吸边态下也要可点 */
+.bar.edge-right .panel-edge-tab, .bar.edge-left .panel-edge-tab { pointer-events: auto; }
 .bar.edge-right .dock { transform: translateX(calc(100% - 34px)); border-radius: 999px 0 0 999px; }
 .bar.edge-left .dock { transform: translateX(calc(-100% + 34px)); border-radius: 0 999px 999px 0; }
 .bar.edge-right:hover .dock, .bar.edge-left:hover .dock,
@@ -5222,24 +6083,78 @@ const CSS_TEXT = `
 .panel {
   position: fixed; right: 18px; bottom: 18px;
   display: flex; flex-direction: column;
-  width: 340px; max-height: 72vh;
+  /* 固定 500px：双折叠区布局需要确定高度才能等分；小屏兜底不溢出 */
+  width: 340px; height: 500px; max-height: calc(100vh - 24px);
   background: #1b1b1b; color: #eee;
   border: 1px solid #3f3f3f; border-radius: 12px;
   box-shadow: 0 16px 40px rgba(0,0,0,.5); overflow: hidden;
 }
+/* 面板头可拖拽（按钮区除外）；吸边后贴缘侧去圆角 */
+.panel header { cursor: grab; }
+.panel header:active { cursor: grabbing; }
+.panel header button { cursor: pointer; }
+/* 吸边留 5px 缝后不再贴缘，保留完整圆角 */
+/* 悬浮模式收成边耳：面板整体隐藏 */
+.panel.retracted { display: none; }
+/* 固定模式钮：吸边才出现；on=已固定 */
+.panel-pin {
+  flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px;
+  background: none; color: #9a9aa6; cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.panel-pin:hover { background: #333; color: #fff; }
+.panel-pin.on { color: #b7ade8; background: #2b2840; }
+.panel-pin svg { width: 12px; height: 12px; }
+/* 悬浮模式边耳：屏幕边缘细条，悬停滑出面板 */
+.panel-edge-tab {
+  position: fixed; top: 50%; transform: translateY(-50%);
+  right: 0; width: 26px; height: 200px; padding: 8px 0;
+  border: 1px solid #3a3a46; border-right: 0; border-radius: 8px 0 0 8px;
+  background: #1e1e24; color: #9a9aa5; cursor: pointer;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  box-shadow: -4px 0 18px rgba(0,0,0,.35); pointer-events: auto; z-index: 41;
+}
+.panel-edge-tab.edge-left {
+  left: 0; right: auto; border-right: 1px solid #3a3a46; border-left: 0;
+  border-radius: 0 8px 8px 0; box-shadow: 4px 0 18px rgba(0,0,0,.35);
+}
+.panel-edge-tab.edge-left svg { transform: rotate(180deg); }
+.panel-edge-tab:hover { color: #fff; background: #2a2a33; }
+.panel-edge-tab svg { width: 14px; height: 14px; }
+.panel-edge-tab .pet-count {
+  font-size: 9px; font-weight: 700; color: #9a8fd0;
+  writing-mode: vertical-rl; letter-spacing: 1px;
+}
+/* 悬耳竖向进度条：细轨道贴边，填充自下而上，100% 转绿 */
+.panel-edge-tab .pet-progress {
+  flex: 1; width: 4px; min-height: 30px; border-radius: 2px;
+  background: #33333d; overflow: hidden;
+  display: flex; flex-direction: column; justify-content: flex-end;
+}
+.panel-edge-tab .pet-progress.hidden { display: none; }
+.panel-edge-tab .pet-progress-fill {
+  width: 100%; background: linear-gradient(180deg, #7a63c9, #5b4aa8);
+  transition: height .3s ease;
+}
+.panel-edge-tab .pet-progress-fill[data-done="on"] { background: #2f9e63; }
+.panel-edge-tab .pet-count:empty { display: none; }
 .panel header {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
   padding: 10px 11px 8px;
 }
-.panel-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.panel-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.panel-title-row { display: flex; align-items: center; gap: 8px; }
 .panel-title strong { font-size: 13px; }
-.panel-meta { color: #8f8f8f; font-size: 11px; }
+/* 主题与收起按钮贴身排列在最右，不被 space-between 拉散 */
+.panel-theme { margin-left: auto; }
 /* 版本徽标：一眼看到页面里跑的是哪一版运行时，升级后刷新即可确认 */
 .panel-version {
   flex: none; margin-left: auto;
   padding: 1px 7px; border-radius: 999px;
   background: #262626; color: #8f8f8f; font-size: 10px;
 }
+.panel footer { display: flex; align-items: center; gap: 8px; }
+.panel footer .panel-version { margin-left: auto; }
 /* 收缩按钮固定在最右上角 */
 .panel-collapse {
   flex: none; width: 24px; height: 24px; padding: 0;
@@ -5249,6 +6164,15 @@ const CSS_TEXT = `
 }
 .panel-collapse svg { width: 15px; height: 15px; }
 .panel-collapse:hover { background: #383838; color: #fff; }
+/* 主题切换钮：无底裸图标，与钉钮同风格 */
+.panel-theme {
+  flex: none; width: 24px; height: 24px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: 0; border-radius: 6px; cursor: pointer;
+  background: none; color: #c9c9c9; font-size: 13px;
+}
+.panel-theme:hover { background: #333; color: #fff; }
+.panel-theme svg { width: 13px; height: 13px; }
 /* 看板入口：与版本徽标并排的小链接，新标签打开只读看板 */
 .panel-board {
   flex: none; border: 0; cursor: pointer; padding: 0;
@@ -5276,7 +6200,137 @@ const CSS_TEXT = `
 .panel-tools button.ghost-danger:hover { background: #4a2626; color: #ffb4b4; }
 /* 清空是危险操作，推到最右侧与常用操作拉开距离 */
 .panel-tools button.push-right { margin-left: auto; }
+/* 检验归档按钮角标：(N) 直接跟在文字后，0 时按钮禁用 */
+.panel-tools .va-count { font-variant-numeric: tabular-nums; font-weight: 700; margin-left: 1px; }
 .panel-list { flex: 1; overflow: auto; padding: 6px 9px 9px; }
+
+/* ---- 双折叠区：待执行任务 / 待归档检验，等分剩余高度、独立折叠 ---- */
+.region {
+  flex: 1; min-height: 0; display: flex; flex-direction: column;
+  position: relative; font-family: inherit; overflow: hidden;
+}
+/* 折叠态：只剩头部摘要行，不参与空间分配 */
+.region:not(.open) { flex: none; }
+.region:not(.open) .region-body { display: none; }
+.panel-arch { border-top: 1px solid #333; }
+.arch-drawer-head {
+  flex: none; display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  user-select: none; border-bottom: 1px solid #333; color: #e6e6ea; font-size: 12px;
+}
+.arch-drawer-head button { cursor: pointer; }
+/* 区域折叠开关：整条头部可点，箭头方向指示展开态 */
+.arch-region-toggle {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px;
+  border: 0; background: none; color: inherit; font-family: inherit;
+  font-size: 12px; text-align: left; cursor: pointer; padding: 0;
+}
+.arch-region-toggle:hover strong { color: #fff; }
+.arch-region-chev {
+  flex: none; width: 11px; height: 11px; color: #8b8b96;
+  transition: transform .15s;
+}
+.arch-region-toggle.open .arch-region-chev { transform: rotate(180deg); }
+/* 批量归档的贴按钮确认 popover：非模态，面板布局不收起不打断 */
+.arch-pop {
+  position: absolute; z-index: 50; width: 210px; padding: 10px 12px;
+  background: #232329; border: 1px solid #3a3a46; border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0,0,0,.45);
+}
+.arch-pop p { margin: 0 0 9px; font-size: 12px; color: #e8e8ee; line-height: 1.5; }
+.arch-pop-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.arch-pop-actions button {
+  padding: 4px 10px; border-radius: 6px; border: 1px solid #3a3a46;
+  background: #2a2a33; color: #c8c8d0; font-size: 12px; cursor: pointer;
+}
+.arch-pop-actions button:hover { background: #33333d; color: #fff; }
+.arch-pop-actions button.primary { background: #6f63c4; border-color: #6f63c4; color: #fff; }
+.arch-pop-actions button.primary:hover { background: #7a6fd0; }
+.region-count, .arch-drawer-count {
+  color: #9a8fd0; font-size: 11px; font-weight: 600;
+  font-variant-numeric: tabular-nums; margin-left: 4px;
+}
+.arch-drawer-head .arch-all {
+  margin-left: auto; border: 1px solid #4a4670; border-radius: 6px; padding: 3px 9px;
+  background: #2b2840; color: #b7ade8; font-size: 11px; cursor: pointer; font-family: inherit;
+}
+.arch-drawer-head .arch-all:hover { background: #38355a; color: #d5ccf5; }
+.arch-drawer-body { flex: 1; min-height: 0; overflow: auto; padding: 6px 8px 10px; }
+.arch-empty { padding: 18px 10px; text-align: center; color: #8b8b96; font-size: 11px; }
+.arch-page { margin-bottom: 4px; }
+.arch-page-row { display: flex; align-items: center; gap: 6px; }
+.arch-chev { flex: none; width: 11px; height: 11px; color: #8b8b96; transition: transform .15s; }
+.arch-page.open .arch-chev { transform: rotate(90deg); }
+.arch-tasks.hidden { display: none; }
+.arch-goto {
+  flex: none; width: 24px; height: 24px; border: 0; border-radius: 6px; cursor: pointer;
+  background: none; color: #8b8b96; display: inline-flex; align-items: center; justify-content: center;
+}
+.arch-goto:hover { background: #333; color: #dedaff; }
+.arch-goto svg { width: 12px; height: 12px; }
+.arch-page-head {
+  flex: 1; min-width: 0; display: flex; align-items: center; gap: 6px; text-align: left;
+  border: 0; border-radius: 7px; padding: 6px 8px; cursor: pointer;
+  background: #26262e; color: #d5d5dc; font-family: inherit; font-size: 11px; font-weight: 600;
+}
+.arch-page-head:hover { background: #30303a; color: #fff; }
+/* 当前所在页的组高亮：核对跳转循环里一眼定位「我现在在哪页」 */
+.arch-page.current .arch-page-head { background: #2b2840; color: #d5ccf5; }
+.arch-cur {
+  flex: none; font-size: 9px; color: #fff; font-weight: 700;
+  background: #4f5bd5; border-radius: 6px; padding: 0 6px; line-height: 16px;
+}
+.arch-page-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.arch-page-count {
+  flex: none; font-size: 10px; color: #9a8fd0; font-variant-numeric: tabular-nums;
+  background: #2b2840; border-radius: 8px; padding: 1px 7px;
+}
+.arch-page-arch {
+  flex: none; border: 1px solid #4a4670; border-radius: 6px; padding: 4px 8px;
+  background: none; color: #9a8fd0; font-size: 10px; cursor: pointer; font-family: inherit;
+}
+.arch-page-arch:hover { background: #2b2840; color: #d5ccf5; }
+.arch-tasks { padding: 2px 0 2px 10px; }
+.arch-task {
+  display: flex; align-items: flex-start; gap: 6px; padding: 4px 4px 4px 8px;
+  border-left: 2px solid #3a3a46; margin: 3px 0;
+  /* 不换行：名字列内部折行，缩略图+按钮钉右端成一组，
+     否则按钮掉到第二三行把行高撑成五倍 */
+  flex-wrap: nowrap;
+}
+.arch-task-name {
+  flex: 1 1 auto; min-width: 0; font-size: 11px; color: #b9b9c2; line-height: 1.5;
+  /* 完整显示不缩略：核对归档时指令全文必须一眼可见 */
+  white-space: normal; word-break: break-word;
+}
+.arch-thumbs { display: flex; gap: 4px; flex: none; padding-top: 1px; }
+.arch-thumb {
+  width: 34px; height: 24px; object-fit: cover; border-radius: 4px;
+  border: 1px solid #3a3a46; cursor: zoom-in; display: block;
+}
+.arch-thumb:hover { border-color: #7a63c9; }
+/* 单图 + 数量角标：多图任务行内只露首图，遮罩徽标提示总数 */
+.arch-thumb-wrap { position: relative; display: block; flex: none; }
+.arch-thumb-n {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-style: normal; font-size: 10px; font-weight: 700; color: #fff;
+  background: rgba(10, 12, 20, .55); border-radius: 4px; pointer-events: none;
+}
+/* 操作钮纵向一列钉右端：打回上、归档下，整列垂直居中 */
+.arch-task-acts {
+  flex: none; margin-left: auto; align-self: center;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.arch-task button {
+  flex: none;
+  border: 1px solid #4a4670; border-radius: 5px; padding: 2px 8px;
+  background: none; color: #9a8fd0; font-size: 10px; cursor: pointer; font-family: inherit;
+  opacity: .6; transition: opacity .15s;
+}
+.arch-task:hover button { opacity: 1; }
+.arch-task button:hover { background: #2b2840; color: #d5ccf5; }
+/* 打回=返工信号色：与归档紫区分，一眼认出「这条要重做」 */
+.arch-task .arch-reject { border-color: #6b4a2a; color: #d9a85f; }
+.arch-task .arch-reject:hover { background: #3a2c1c; color: #f0c088; }
 
 /* ---- 总体进度条 ---- */
 /* 三段权重（分派 10 / 开发 70 / 验收 20）已折算进 fill 的宽度，条上不再分段，
@@ -5292,6 +6346,9 @@ const CSS_TEXT = `
   color: #9a9a9a; font-size: 11px;
 }
 .progress-pct { color: #dedaff; font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+/* 清空挪到进度行最右：危险操作贴近统计而非主操作区 */
+.progress-clear { border: 0; border-radius: 5px; padding: 2px 8px; cursor: pointer; background: none; color: #d98585; font-family: inherit; font-size: 10px; }
+.progress-clear:hover { background: #4a2626; color: #ffb4b4; }
 /* 次要状态行（排队数 / 阻塞原因）：可换行，不省略——这里的信息不能丢 */
 .progress-note {
   margin-top: 5px;
@@ -5352,6 +6409,11 @@ const CSS_TEXT = `
   background: #7c6cff; color: #fff; font-family: inherit; font-weight: 700; font-size: 10px; line-height: 18px; text-align: center;
 }
 .panel .item-seq.manual { background: #d8a45a; color: #2b1e08; }
+/* 任务卡主体行：缩略图左 + 输入框右，与待归档检验行同款横排 */
+.panel .item-body { display: flex; align-items: flex-start; gap: 8px; margin-top: 6px; }
+.panel .item-body .item-thumbs { flex: none; padding-top: 2px; }
+.panel .item-body .item-instruction { flex: 1; min-width: 0; }
+.panel .item-body .item-instruction textarea { margin-top: 0; }
 .panel .item-thumbs { display: flex; gap: 4px; margin: 5px 0 0; flex-wrap: wrap; }
 .panel .item-thumbs img {
   width: 36px; height: 36px; object-fit: cover;
@@ -5382,6 +6444,7 @@ const CSS_TEXT = `
 .panel .tag.status-doing { color: #e8935a; }
 .panel .tag.status-review { color: #e0b464; }
 .panel .tag.status-done { color: #7fce8f; }
+.panel .tag.status-archived { color: #9a8fd0; }
 .panel .tag.status-blocked { color: #e07a7a; }
 .panel .tag.status-cancelled { color: #85858f; }
 /* 处理开始后新增的批注：琥珀描边（与待验收的状态标签区分开） */
@@ -5477,12 +6540,25 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .dock-count:hover { background: var(--zwa-surface-hover); }
 :host([data-zwa-theme="light"]) .dock-dot { background: #b9bfcc; }
 :host([data-zwa-theme="light"]) .dock-sep { background: var(--zwa-border); }
+/* 悬浮快捷按钮/进度条/边缘耳片此前只有暗色硬编码，明亮主题下显突兀黑块 */
+:host([data-zwa-theme="light"]) .dock-float-btn {
+  background: var(--zwa-surface); color: var(--zwa-text-secondary);
+  border-color: var(--zwa-border-strong);
+  box-shadow: 0 6px 18px var(--zwa-shadow, rgba(31,36,48,.14));
+}
+:host([data-zwa-theme="light"]) .dock-float-btn:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); border-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .dock-progress { background: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .dock-edge-tab { background: var(--zwa-surface); color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .toast {
+  background: var(--zwa-surface); color: var(--zwa-text);
+  border-color: var(--zwa-border-strong);
+  box-shadow: 0 10px 26px var(--zwa-shadow, rgba(31,36,48,.16));
+}
 :host([data-zwa-theme="light"]) .panel {
   background: var(--zwa-surface); color: var(--zwa-text);
   border-color: var(--zwa-border-strong);
   box-shadow: 0 16px 40px var(--zwa-shadow);
 }
-:host([data-zwa-theme="light"]) .panel-meta { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel-version { background: var(--zwa-surface-soft); color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel-collapse { background: var(--zwa-surface-soft); color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .panel-collapse:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
@@ -5503,6 +6579,45 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel-tools button.primary:hover { background: #5f6ae0; color: #fff; }
 :host([data-zwa-theme="light"]) .panel-tools button.ghost-danger { color: #c25656; }
 :host([data-zwa-theme="light"]) .panel-tools button.ghost-danger:hover { background: #fdeaea; color: #a83b3b; }
+:host([data-zwa-theme="light"]) .progress-clear { color: #c25656; }
+:host([data-zwa-theme="light"]) .progress-clear:hover { background: #fdeaea; color: #a83b3b; }
+/* 检验归档区：浅色整套 */
+:host([data-zwa-theme="light"]) .panel-arch { border-top-color: var(--zwa-border); }
+:host([data-zwa-theme="light"]) .panel-pin { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .panel-pin:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .panel-pin.on { color: #4a3fc0; background: #eceaff; }
+:host([data-zwa-theme="light"]) .panel-edge-tab { background: var(--zwa-surface); border-color: var(--zwa-border); color: var(--zwa-text-muted); box-shadow: -4px 0 18px rgba(30,40,70,.15); }
+:host([data-zwa-theme="light"]) .panel-edge-tab:hover { color: var(--zwa-text); background: var(--zwa-surface-hover); }
+:host([data-zwa-theme="light"]) .panel-edge-tab .pet-count { color: #7a63c9; }
+:host([data-zwa-theme="light"]) .arch-drawer-head { border-bottom-color: var(--zwa-border); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-region-toggle strong { color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-drawer-count { color: #7a63c9; }
+:host([data-zwa-theme="light"]) .arch-drawer-head .arch-all { background: #eceaff; border-color: #cdc9f0; color: #5a4fd0; }
+:host([data-zwa-theme="light"]) .arch-drawer-head .arch-all:hover { background: #ddd9fa; color: #4a3fc0; }
+:host([data-zwa-theme="light"]) .arch-empty { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .arch-page-head { background: var(--zwa-surface-soft); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-page-head:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-page.current .arch-page-head { background: #eceaff; color: #4a3fc0; }
+:host([data-zwa-theme="light"]) .arch-page-count { background: #eceaff; color: #5a4fd0; }
+:host([data-zwa-theme="light"]) .arch-page-arch { border-color: #cdc9f0; color: #5a4fd0; }
+:host([data-zwa-theme="light"]) .arch-page-arch:hover { background: #eceaff; color: #4a3fc0; }
+:host([data-zwa-theme="light"]) .arch-goto { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .arch-goto:hover { background: var(--zwa-surface-hover); color: #4f5bd5; }
+:host([data-zwa-theme="light"]) .arch-chev { color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .arch-task { border-left-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .arch-task-name { color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-task button { border-color: #cdc9f0; color: #5a4fd0; }
+:host([data-zwa-theme="light"]) .arch-task button:hover { background: #eceaff; color: #4a3fc0; }
+:host([data-zwa-theme="light"]) .arch-task .arch-reject { border-color: #e8c48a; color: #b07a2a; }
+:host([data-zwa-theme="light"]) .arch-task .arch-reject:hover { background: #fdf3e2; color: #96661d; }
+:host([data-zwa-theme="light"]) .arch-thumb { border-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .arch-thumb:hover { border-color: #7a63c9; }
+:host([data-zwa-theme="light"]) .arch-pop { background: var(--zwa-surface); border-color: var(--zwa-border); box-shadow: 0 8px 28px rgba(30,40,70,.18); }
+:host([data-zwa-theme="light"]) .arch-pop p { color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-pop-actions button { background: var(--zwa-surface); border-color: var(--zwa-border); color: var(--zwa-text-muted); }
+:host([data-zwa-theme="light"]) .arch-pop-actions button:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+:host([data-zwa-theme="light"]) .arch-pop-actions button.primary { background: #5a55d6; border-color: #5a55d6; color: #fff; }
+:host([data-zwa-theme="light"]) .arch-pop-actions button.primary:hover { background: #4c47c9; }
 :host([data-zwa-theme="light"]) .panel-progress { border-bottom-color: var(--zwa-border); }
 :host([data-zwa-theme="light"]) .progress-label { color: var(--zwa-text-secondary); }
 :host([data-zwa-theme="light"]) .progress-pct { color: #4f5bd5; }
@@ -5539,6 +6654,7 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .tag.status-doing { color: #d97a2e; }
 :host([data-zwa-theme="light"]) .panel .tag.status-review { color: #b07d1c; }
 :host([data-zwa-theme="light"]) .panel .tag.status-done { color: #2e9e57; }
+:host([data-zwa-theme="light"]) .panel .tag.status-archived { color: #7a63c9; }
 :host([data-zwa-theme="light"]) .panel .tag.status-blocked { color: #d04b4b; }
 :host([data-zwa-theme="light"]) .panel .tag.status-cancelled { color: #7a8291; }
 :host([data-zwa-theme="light"]) .panel .tag.queued { color: #a07827; border-color: #d8c391; }

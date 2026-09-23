@@ -434,6 +434,8 @@ test('GET /archive serves the read-only archive overview for the board', async (
     assert.equal((await patch('doing')).status, 200);
     assert.equal((await patch('review')).status, 200);
     assert.equal((await patch('done')).status, 200);
+    // 两阶段归档：done 留在 live 等人工归档，archived 才进归档文件
+    assert.equal((await patch('archived')).status, 200);
 
     const empty = await request(port, { path: '/__zw-web-annotations/archive' });
     assert.equal(empty.status, 200);
@@ -447,7 +449,7 @@ test('GET /archive serves the read-only archive overview for the board', async (
     assert.equal(view.json().archives.length, 1);
     assert.equal(view.json().archives[0].taskCount, 1);
     assert.equal(view.json().archives[0].tasks[0].id, 'task_1');
-    assert.equal(view.json().archives[0].tasks[0].status, 'done');
+    assert.equal(view.json().archives[0].tasks[0].status, 'archived');
     assert.ok(!('history' in view.json().archives[0].tasks[0]), '总览不携带历史记录大字段');
 
     // 任务粒度删除：按 id 只删归档里的这一条

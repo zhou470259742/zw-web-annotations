@@ -4,10 +4,17 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-export const STATUSES = ['todo', 'doing', 'review', 'done', 'blocked', 'cancelled'];
+export const STATUSES = ['todo', 'doing', 'review', 'done', 'archived', 'blocked', 'cancelled'];
 export const STATUS_SET = new Set(STATUSES);
-export const TERMINAL_STATUSES = ['done', 'cancelled'];
+export const TERMINAL_STATUSES = ['done', 'archived', 'cancelled'];
 export const TERMINAL_STATUS_SET = new Set(TERMINAL_STATUSES);
+/**
+ * 文件级归档集合：complete-round 收尾只把「已归档/已取消」移入 archive/。
+ * done（已完成未归档）必须留在 live 文件里等人工归档——若一并收走，
+ * 看板的「已完成=未归档」语义会被轮次收尾偷偷掏空。
+ */
+export const FILE_ARCHIVE_STATUSES = ['archived', 'cancelled'];
+export const FILE_ARCHIVE_STATUS_SET = new Set(FILE_ARCHIVE_STATUSES);
 export const MAX_TASK_ID_LENGTH = 64;
 export const MAX_INSTRUCTION_LENGTH = 4096;
 export const MAX_IMAGES_PER_TASK = 8;
@@ -26,7 +33,9 @@ export const STATUS_TRANSITIONS = {
   todo: new Set(['todo', 'doing', 'cancelled']),
   doing: new Set(['doing', 'review', 'blocked', 'cancelled']),
   review: new Set(['review', 'done', 'blocked', 'cancelled', 'todo']),
-  done: new Set(['done']),
+  // done → archived：看板人工归档（已完成=未归档，归档后进入已归档列）。
+  done: new Set(['done', 'archived']),
+  archived: new Set(['archived']),
   // blocked → todo：人工「重新入列」。队列停下等的就是这个人工决定。
   blocked: new Set(['blocked', 'cancelled', 'todo']),
   cancelled: new Set(['cancelled']),
@@ -723,9 +732,9 @@ export function createStore(workspace, options = {}) {
     }
     const archived = [];
     for (const group of groups) {
-      const hits = group.tasks.filter(t => t.round === round && TERMINAL_STATUS_SET.has(t.status));
+      const hits = group.tasks.filter(t => t.round === round && FILE_ARCHIVE_STATUS_SET.has(t.status));
       if (!hits.length) continue;
-      const result = await archiveTasks(group.id, { statuses: [...TERMINAL_STATUSES], round });
+      const result = await archiveTasks(group.id, { statuses: [...FILE_ARCHIVE_STATUSES], round });
       archived.push({ groupId: group.id, archived: result.archived });
     }
     const after = await roundSummary();
@@ -1016,6 +1025,11 @@ export function createStore(workspace, options = {}) {
           instruction: t.instruction || '',
           completedAt: t.completedAt || null,
           updatedAt: t.updatedAt || null,
+          // 看板已归档列要渲缩略图角标/灯箱，只需附件文件名；附件本体经
+          // /files 路由按需回源，不会随总览一起搬字节。
+          images: Array.isArray(t.images)
+            ? t.images.filter(img => img && img.file).map(img => ({ file: img.file }))
+            : [],
           element: t.element ? {
             selector: t.element.selector || '',
             tagName: t.element.tagName || '',
@@ -1225,7 +1239,7 @@ export function createStore(workspace, options = {}) {
     const at = nowIso();
     if (patch.status && patch.status !== task.status) {
       const allowed = STATUS_TRANSITIONS[task.status] || new Set();
-      if (!allowed.has(patch.status) && !(patch.reopen === true && patch.status === 'todo' && ['done', 'blocked', 'cancelled'].includes(task.status))) {
+      if (!allowed.has(patch.status) && !(patch.reopen === true && patch.status === 'todo' && ['done', 'archived', 'blocked', 'cancelled'].includes(task.status))) {
         throw new Error(`invalid status transition: ${task.status} -> ${patch.status}`);
       }
       task.status = patch.status;
@@ -1234,6 +1248,7 @@ export function createStore(workspace, options = {}) {
         task.result = null;
         task.reviewAt = null;
         task.completedAt = null;
+        task.archivedAt = null;
         task.history.push({ at, event: 'reopened', detail: 'explicit reopen' });
       }
       if (patch.status === 'doing') {
@@ -1251,6 +1266,7 @@ export function createStore(workspace, options = {}) {
       // review = 开发完成、等待验收。提交时刻单独记，验收耗时才有据可查。
       if (patch.status === 'review') task.reviewAt = at;
       if (patch.status === 'done') task.completedAt = at;
+      if (patch.status === 'archived') task.archivedAt = at;
       // 没有轮次号的任务一旦开始推进（模型派发时读取的就是当时文件里的
       // 任务集合），自动定稿/并入轮次，保证进度条能跟踪到它。
       if (!task.round && (patch.status === 'doing' || patch.status === 'review')) {
@@ -1503,9 +1519,10 @@ export function createStore(workspace, options = {}) {
   const archiveTasks = async (groupIdOrUrl, options = {}) => {
     const groupId = options.byPageUrl ? groupIdForPage(groupIdOrUrl) : groupIdOrUrl;
     if (!groupId) throw new Error('groupId is required');
-    const statuses = new Set(options.statuses || TERMINAL_STATUSES);
+    // 文件级归档只收 archived/cancelled：done 必须留在 live 等人工归档
+    const statuses = new Set(options.statuses || FILE_ARCHIVE_STATUSES);
     for (const status of statuses) {
-      if (!TERMINAL_STATUS_SET.has(status)) throw new Error(`invalid archive status: ${status}`);
+      if (!FILE_ARCHIVE_STATUS_SET.has(status)) throw new Error(`invalid archive status: ${status}`);
     }
     const targetRound = options.round == null ? null : Number(options.round);
 

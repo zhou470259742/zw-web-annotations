@@ -59,6 +59,11 @@ async function completeTask(store, groupId, taskId, result) {
   return store.updateTask(groupId, { taskId, status: 'done' });
 }
 
+/** 人工归档一步：done → archived，文件级归档（archiveTasks）只收 archived/cancelled。 */
+async function archiveTask(store, groupId, taskId) {
+  return store.updateTask(groupId, { taskId, status: 'archived' });
+}
+
 test('validateGroup accepts a complete group and rejects malformed input', () => {
   const group = { version: '1.0', id: 'g1', createdAt: 'x', updatedAt: 'x', page, tasks: [task()] };
   assert.equal(validateGroup(group).id, 'g1');
@@ -297,9 +302,13 @@ test('archiveTasks moves done/cancelled tasks into the archive file', async () =
   await store.updateTask(id, { taskId: 'task_done', status: 'doing' });
   await submitReview(store, id, 'task_done');
   await completeTask(store, id, 'task_done');
+  // 两阶段归档：done 留在 live 等人工归档，archived/cancelled 才进归档文件
+  const premature = await store.archiveTasks(id);
+  assert.equal(premature.archived, 1, 'done 未归档前只有 cancelled 进文件');
+  await archiveTask(store, id, 'task_done');
 
   const result = await store.archiveTasks(id);
-  assert.equal(result.archived, 2, '默认归档 done 与 cancelled');
+  assert.equal(result.archived, 1, '人工归档后 archived 进文件');
   assert.equal(result.remaining, 1);
   assert.equal(result.fileRemoved, false);
   assert.ok(result.archiveFile.startsWith(path.join(store.taskDir, ARCHIVE_DIRNAME)));
@@ -309,7 +318,7 @@ test('archiveTasks moves done/cancelled tasks into the archive file', async () =
   // 归档文件沿用任务组结构，必须能被同一套 schema 校验读回
   const archived = validateGroup(JSON.parse(await fs.readFile(result.archiveFile, 'utf8')));
   assert.deepEqual(archived.tasks.map(t => t.id).sort(), ['task_cancel', 'task_done']);
-  assert.equal(archived.tasks.find(t => t.id === 'task_done').status, 'done');
+  assert.equal(archived.tasks.find(t => t.id === 'task_done').status, 'archived');
   // 归档副本仍保留附件引用，这正是附件不能被 prune 删除的原因
   assert.match(archived.tasks.find(t => t.id === 'task_done').images[0].file, /attachments\//);
   assert.equal((await fs.readdir(store.attachmentsDir)).length, 1, '归档任务的附件仍被引用');
@@ -320,6 +329,7 @@ test('re-archiving the same task updates the archive copy instead of duplicating
   await store.appendTasks({ page, tasks: [task({ id: 'task_a' })] });
   const id = pageKey(page.url);
   await completeTask(store, id, 'task_a');
+  await archiveTask(store, id, 'task_a');
   const first = await store.archiveTasks(id);
   assert.equal(first.archived, 1);
   assert.equal(first.fileRemoved, true, '组被清空后应删除组文件');
@@ -327,6 +337,7 @@ test('re-archiving the same task updates the archive copy instead of duplicating
   // 同一任务重新出现（新时间戳）时，再次归档应更新而非重复追加
   await store.appendTasks({ page, tasks: [{ ...task({ id: 'task_a', result: 'v2' }), updatedAt: '2099-01-01T00:00:00.000Z' }] });
   await completeTask(store, id, 'task_a', 'v2');
+  await archiveTask(store, id, 'task_a');
   const second = await store.archiveTasks(id);
   assert.equal(second.archived, 1);
   const archived = JSON.parse(await fs.readFile(second.archiveFile, 'utf8'));
@@ -362,6 +373,7 @@ test('listArchives summarizes archived groups with trimmed task fields', async (
   });
   const id = pageKey(page.url);
   await completeTask(store, id, 'task_a');
+  await archiveTask(store, id, 'task_a');
   await store.archiveTasks(id);
 
   const { archives } = await store.listArchives();
@@ -371,19 +383,19 @@ test('listArchives summarizes archived groups with trimmed task fields', async (
   assert.equal(group.page.url, page.url);
   assert.equal(group.page.title, page.title);
   assert.equal(group.taskCount, 1);
-  assert.deepEqual(group.counts, { done: 1 });
+  assert.deepEqual(group.counts, { archived: 1 });
   assert.equal(group.tasks[0].id, 'task_a');
-  assert.equal(group.tasks[0].status, 'done');
+  assert.equal(group.tasks[0].status, 'archived');
   assert.equal(group.tasks[0].instruction, '调整宽度');
   assert.equal(group.tasks[0].element.selector, '#login');
   assert.ok(group.tasks[0].completedAt, '归档任务带完成时间');
-  // 只挑渲染字段：附件引用、历史、dom 片段都不出 store
+  // 只挑渲染字段：附件只留文件名引用（看板缩略图经 /files 按需回源）、
+  // 历史与 dom 片段不出 store
   assert.deepEqual(
     Object.keys(group.tasks[0]).sort(),
-    ['completedAt', 'element', 'id', 'instruction', 'round', 'seq', 'status', 'updatedAt'],
+    ['completedAt', 'element', 'id', 'images', 'instruction', 'round', 'seq', 'status', 'updatedAt'],
   );
   assert.deepEqual(Object.keys(group.tasks[0].element).sort(), ['accessibleName', 'selector', 'tagName', 'text']);
-  assert.ok(!JSON.stringify(archives).includes('attachments'), '归档总览不得携带附件引用');
   assert.ok(!JSON.stringify(archives).includes('"history"'), '归档总览不得携带历史记录');
 });
 
@@ -392,6 +404,7 @@ test('listArchives isolates a corrupt archive file into diagnostics', async () =
   await store.appendTasks({ page, tasks: [task()] });
   const id = pageKey(page.url);
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   await store.archiveTasks(id);
   await fs.writeFile(path.join(store.archiveDir, 'broken.json'), '{oops', 'utf8');
 
@@ -443,6 +456,7 @@ test('appendTasks does not resurrect archived tasks from the stale browser buffe
   await store.updateTask(id, { taskId: 'task_done', status: 'doing' });
   await submitReview(store, id, 'task_done');
   await completeTask(store, id, 'task_done');
+  await archiveTask(store, id, 'task_done');
   await store.archiveTasks(id);
 
   // 全量同步带着已归档的 task_done 回来（fixture 的 updatedAt 早于归档副本）
@@ -469,6 +483,7 @@ test('appendTasks flags skipped when nothing was written so no bogus path is rep
   await store.updateTask(id, { taskId: 'task_done', status: 'doing' });
   await submitReview(store, id, 'task_done');
   await completeTask(store, id, 'task_done');
+  await archiveTask(store, id, 'task_done');
   await store.archiveTasks(id);
 
   const synced = await store.appendTasks({ page, tasks: [task({ id: 'task_done' })] });
@@ -494,6 +509,7 @@ test('re-annotating an archived element with a newer local edit still lands', as
   await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
   await submitReview(store, id, 'task_abc');
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   const first = await store.archiveTasks(id);
   assert.equal(first.fileRemoved, true);
 
@@ -517,6 +533,7 @@ test('equal timestamps keep the user edit instead of dropping it as stale', asyn
   await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
   await submitReview(store, id, 'task_abc');
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   const { archiveFile } = await store.archiveTasks(id);
 
   // 取归档副本的 updatedAt，用它作为「同一时刻」的编辑时间
@@ -537,6 +554,7 @@ test('purgeArchive removes a single archive file and its orphaned attachments', 
   await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
   await submitReview(store, id, 'task_abc');
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   const result = await store.archiveTasks(id);
   assert.equal(result.fileRemoved, true);
   assert.equal((await fs.readdir(store.attachmentsDir)).length, 1, '归档引用保住了附件');
@@ -559,6 +577,8 @@ test('purgeArchive without a group clears the whole archive directory', async ()
   await store.appendTasks({ page: pageB, tasks: [task({ id: 'task_b', element: { ...task().element, selector: '#b' } })] });
   await completeTask(store, pageKey(page.url), 'task_abc');
   await completeTask(store, pageKey(pageB.url), 'task_b');
+  await archiveTask(store, pageKey(page.url), 'task_abc');
+  await archiveTask(store, pageKey(pageB.url), 'task_b');
   await store.archiveTasks(pageKey(page.url));
   await store.archiveTasks(pageKey(pageB.url));
 
@@ -581,6 +601,8 @@ test('purgeArchive supports granular removal by task id and by status', async ()
   const id = pageKey(page.url);
   await completeTask(store, id, 'task_done1');
   await completeTask(store, id, 'task_done2');
+  await archiveTask(store, id, 'task_done1');
+  await archiveTask(store, id, 'task_done2');
   await store.updateTask(id, { taskId: 'task_cancel', status: 'cancelled' });
   await store.archiveTasks(id);
 
@@ -712,6 +734,7 @@ test('mode lock releases when the active round is fully delivered via direct arc
 
   // 部分交付：task_a 完成并归档，task_b 仍在途 → 锁不释放
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   const partial = await store.archiveTasks(id);
   assert.equal(partial.archived, 1);
   let execution = JSON.parse(await fs.readFile(store.executionFile, 'utf8'));
@@ -720,6 +743,7 @@ test('mode lock releases when the active round is fully delivered via direct arc
 
   // 全部交付：最后一条本轮任务归档 → activeRound 释放，模式可切换
   await completeTask(store, id, 'task_b');
+  await archiveTask(store, id, 'task_b');
   const final = await store.archiveTasks(id);
   assert.equal(final.archived, 1);
   assert.equal(final.roundReleased, true, '归档响应必须带回释放标记');
@@ -1016,6 +1040,7 @@ test('round numbering is monotonically increasing across rounds', async () => {
   await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
   await submitReview(store, id, 'task_abc');
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   await store.archiveTasks(id);
   const fresh = { ...task({ instruction: 'r2', element: { ...task().element, selector: '#a' } }), updatedAt: new Date().toISOString() };
   await store.appendTasks({ page, tasks: [fresh] });
@@ -1134,6 +1159,7 @@ test('archiveTasks records rounds log into execution.json', async () => {
   await store.updateTask(id, { taskId: 'task_abc', status: 'doing' });
   await submitReview(store, id, 'task_abc');
   await completeTask(store, id, 'task_abc');
+  await archiveTask(store, id, 'task_abc');
   await store.archiveTasks(id);
 
   const execution = await store.readExecution();
@@ -1165,6 +1191,7 @@ test('corrupt archive is rejected and preserved', async () => {
   const id = pageKey(page.url);
   await store.appendTasks({ page, tasks: [task({ id: 'task_a' })] });
   await completeTask(store, id, 'task_a');
+  await archiveTask(store, id, 'task_a');
   await fs.mkdir(store.archiveDir, { recursive: true });
   const file = path.join(store.archiveDir, `${id}.json`);
   await fs.writeFile(file, '{"marker":"archive-preserve",', 'utf8');
@@ -1288,6 +1315,7 @@ test('completeRound stops in round mode and continues in queue mode without losi
   await store.updateTask(id, { taskId: 'task_r1', status: 'doing' });
   await store.updateTask(id, { taskId: 'task_r1', status: 'review' });
   await store.updateTask(id, { taskId: 'task_r1', status: 'done' });
+  await archiveTask(store, id, 'task_r1');
   const round = (await store.roundSummary()).activeRound;
   const stopped = await store.completeRound(round);
   assert.equal(stopped.action, 'stop');
@@ -1298,6 +1326,7 @@ test('completeRound stops in round mode and continues in queue mode without losi
   await store.updateTask(id, { taskId: 'task_r2', status: 'doing' });
   await store.updateTask(id, { taskId: 'task_r2', status: 'review' });
   await store.updateTask(id, { taskId: 'task_r2', status: 'done' });
+  await archiveTask(store, id, 'task_r2');
   await store.appendTasks({ page, tasks: [task({ id: 'task_q', element: { ...task().element, selector: '#q' } })] });
   const continued = await store.completeRound((await store.roundSummary()).activeRound);
   assert.equal(continued.action, 'continue');

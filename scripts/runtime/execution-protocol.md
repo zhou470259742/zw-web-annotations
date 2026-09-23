@@ -9,7 +9,7 @@
 任务目录是 `.zwa/tasks/`。开始处理时只扫描该目录**顶层的 `*.json`** 任务文件；不要递归进入 `archive/` 或 `attachments/`，也不要读取 `.tmp`、`.corrupt-*`、锁文件或其他诊断文件。同一页面的标注归并在一个顶层 JSON 文件里。每条任务包含：
 
 - `id`：任务标识（回写状态时要用）；
-- `status`：`todo`（待处理）/ `doing`（处理中）/ `review`（待验收）/ `done`（已验收）/ `blocked`（受阻）/ `cancelled`（已取消）；
+- `status`：`todo`（待处理）/ `doing`（处理中）/ `review`（待验收）/ `done`（已验收）/ `archived`（已归档，done 后经看板人工归档）/ `blocked`（受阻）/ `cancelled`（已取消）；
 - `instruction`：用户的调整要求（目标文案、样式等）；
 - `element`：目标元素线索——`componentFile`（组件源文件绝对路径，**最可靠的定位入口**）、`selector`、`xpath`、`domSnippet`、元素文本、`attributes`、`rect` 尺寸；
 - `element.ownStyles` / `element.inheritedStyles`：区分元素自身声明与继承值。**`inheritedStyles` 里的属性要改必须改祖先规则或主题变量，改本元素选择器无效**（否则一次影响全站）；
