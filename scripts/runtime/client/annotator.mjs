@@ -6313,7 +6313,9 @@ const CSS_TEXT = `
   /* 完整显示不缩略：核对归档时指令全文必须一眼可见 */
   white-space: normal; word-break: break-word;
 }
-.arch-thumbs { display: flex; gap: 4px; flex: none; padding-top: 1px; }
+.arch-thumbs { display: flex; gap: 4px; flex: none; }
+/* 归档行缩略图贴行顶：清掉 .panel .item-thumbs 的 margin-top（该选择器特异性更高需点名压过） */
+.panel .item-thumbs.arch-thumbs { margin: 0; padding-top: 0; }
 .arch-thumb {
   width: 64px; height: 44px; object-fit: cover; border-radius: 4px;
   border: 1px solid #3a3a46; cursor: zoom-in; display: block;
