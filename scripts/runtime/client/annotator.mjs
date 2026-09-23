@@ -6109,7 +6109,7 @@ const CSS_TEXT = `
 }
 .panel-pin:hover { background: #333; color: #fff; }
 .panel-pin.on { color: #b7ade8; background: #2b2840; }
-.panel-pin svg { width: 12px; height: 12px; }
+.panel-pin svg { width: 14px; height: 14px; }
 /* 悬浮模式边耳：屏幕边缘细条，悬停滑出面板 */
 .panel-edge-tab {
   position: fixed; top: 50%; transform: translateY(-50%);
@@ -6167,7 +6167,7 @@ const CSS_TEXT = `
   border: 0; border-radius: 6px; cursor: pointer;
   background: #2b2b2b; color: #c9c9c9;
 }
-.panel-collapse svg { width: 15px; height: 15px; }
+.panel-collapse svg { width: 17px; height: 17px; }
 .panel-collapse:hover { background: #383838; color: #fff; }
 /* 主题切换钮：无底裸图标，与钉钮同风格 */
 .panel-theme {
@@ -6177,7 +6177,7 @@ const CSS_TEXT = `
   background: none; color: #c9c9c9; font-size: 13px;
 }
 .panel-theme:hover { background: #333; color: #fff; }
-.panel-theme svg { width: 13px; height: 13px; }
+.panel-theme svg { width: 15px; height: 15px; }
 /* 看板入口：与版本徽标并排的小链接，新标签打开只读看板 */
 .panel-board {
   flex: none; border: 0; cursor: pointer; padding: 0;
@@ -6604,8 +6604,13 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .arch-drawer-head .arch-all { background: #eceaff; border-color: #cdc9f0; color: #5a4fd0; }
 :host([data-zwa-theme="light"]) .arch-drawer-head .arch-all:hover { background: #ddd9fa; color: #4a3fc0; }
 :host([data-zwa-theme="light"]) .arch-empty { color: var(--zwa-text-muted); }
-:host([data-zwa-theme="light"]) .arch-page-head { background: var(--zwa-surface-soft); color: var(--zwa-text); }
-:host([data-zwa-theme="light"]) .arch-page-head:hover { background: var(--zwa-surface-hover); color: var(--zwa-text); }
+/* 待归档检验区与待执行任务区同语言：白卡片、细边框、轻投影 */
+:host([data-zwa-theme="light"]) .arch-page-head {
+  background: #ffffff; color: var(--zwa-text);
+  border: 1px solid #e7e9f2; border-radius: 9px;
+  box-shadow: 0 1px 2px rgba(30,40,70,.05);
+}
+:host([data-zwa-theme="light"]) .arch-page-head:hover { background: #fafbfe; border-color: #d5d9e8; color: var(--zwa-text); }
 :host([data-zwa-theme="light"]) .arch-page.current .arch-page-head { background: #eceaff; color: #4a3fc0; }
 :host([data-zwa-theme="light"]) .arch-page-count { background: #eceaff; color: #5a4fd0; }
 :host([data-zwa-theme="light"]) .arch-page-arch { border-color: #cdc9f0; color: #5a4fd0; }
@@ -6613,7 +6618,11 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .arch-goto { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .arch-goto:hover { background: var(--zwa-surface-hover); color: #4f5bd5; }
 :host([data-zwa-theme="light"]) .arch-chev { color: var(--zwa-text-muted); }
-:host([data-zwa-theme="light"]) .arch-task { border-left-color: var(--zwa-border-strong); }
+:host([data-zwa-theme="light"]) .arch-task {
+  border-left: 0; border: 1px solid #e7e9f2; border-radius: 10px;
+  background: #ffffff; padding: 7px 10px; margin: 6px 0;
+  box-shadow: 0 1px 2px rgba(30,40,70,.05);
+}
 :host([data-zwa-theme="light"]) .arch-task-name { color: var(--zwa-text); }
 :host([data-zwa-theme="light"]) .arch-task button { border-color: #cdc9f0; color: #5a4fd0; }
 :host([data-zwa-theme="light"]) .arch-task button:hover { background: #eceaff; color: #4a3fc0; }
@@ -6693,7 +6702,7 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .lock-note { color: #b07d1c; border-color: #e2d3ac; }
 :host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: #c9c4f0; }
 :host([data-zwa-theme="light"]) .group-head {
-  border-color: #e7e9f2; background: #ffffff; border-radius: 12px;
+  border-color: #e7e9f2; background: #ffffff; border-radius: 9px;
   padding: 7px 10px; box-shadow: 0 1px 2px rgba(30,40,70,.05);
 }
 :host([data-zwa-theme="light"]) .group-head:hover { background: #fafbfe; border-color: #d5d9e8; }
