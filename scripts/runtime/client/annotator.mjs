@@ -2681,6 +2681,31 @@ export function mountAnnotator(options = {}) {
     return null;
   }
 
+  /**
+   * 遮挡判定：标注 host 的 z-index 永远是页面最高，弹窗/抽屉打开后底层
+   * 页面的图钉仍然浮在弹窗之上，视觉上很乱。用 elementFromPoint 实测
+   * 元素中心点的最顶元素——纯几何事实，不区分弹窗类型，天然支持多级
+   * 弹窗/下拉浮层嵌套：元素在哪一层不重要，只认它当前是否被盖住。
+   * 命中自家 host（图钉/拦截层恰在采样点）或元素本身 pointer-events:none
+   * （不参与命中）时不判定，宁可见不可误隐。
+   */
+  function isCoveredByOverlay(el, rect) {
+    try {
+      // 采样点必须取元素【可见部分】的中心而非整体中心：超高元素（大表格）
+      // 整体中心在视口外，钳回视口边采样会落到元素外 → 误判被遮。
+      const vx0 = Math.max(rect.left, 0), vy0 = Math.max(rect.top, 0);
+      const vx1 = Math.min(rect.right, window.innerWidth), vy1 = Math.min(rect.bottom, window.innerHeight);
+      if (vx1 - vx0 < 2 || vy1 - vy0 < 2) return true; // 可见部分不足 2px，视为被遮
+      const cx = Math.min(Math.max((vx0 + vx1) / 2, 1), window.innerWidth - 1);
+      const cy = Math.min(Math.max((vy0 + vy1) / 2, 1), window.innerHeight - 1);
+      const top = document.elementFromPoint(cx, cy);
+      if (!top || top === el || el.contains(top) || top.contains(el)) return false;
+      if (top.id === HOST_ID) return false;
+      if (getComputedStyle(el).pointerEvents === 'none') return false;
+      return true;
+    } catch { return false; }
+  }
+
   function positionPin(pin, task) {
     // 手动任务没有关联元素，不显示页面图钉
     if (!task.element?.selector) {
@@ -2694,13 +2719,20 @@ export function mountAnnotator(options = {}) {
       return;
     }
     const rect = el.getBoundingClientRect();
+    // 零尺寸（选择器命中未渲染的兄弟节点，如折叠面板里的同名 el-table）
+    // 不是「被遮」而是「没渲染」——直接隐藏，别走进遮挡判定误报。
     const offscreen =
-      rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth;
+      rect.bottom < 0 || rect.top > window.innerHeight || rect.right < 0 || rect.left > window.innerWidth
+      || rect.width < 2 || rect.height < 2;
     if (offscreen) {
       pin.style.display = 'none';
       return;
     }
     pin.style.display = 'flex';
+    // 被更高层覆盖物（弹窗/抽屉/浮层）遮住的元素降级为幽影：
+    // 仍保留「这里有标注」的空间提示但不再喧宾夺主，且不吃点击——
+    // 避免浮在弹窗上的残影拦截对弹窗的操作；弹窗关闭自动恢复。
+    pin.dataset.covered = isCoveredByOverlay(el, rect) ? 'on' : 'off';
     // 贴在元素左上角，略微向外偏移，避免压住内容本身
     pin.style.left = `${Math.max(2, rect.left - 9)}px`;
     pin.style.top = `${Math.max(2, rect.top - 9)}px`;
@@ -5997,6 +6029,8 @@ const CSS_TEXT = `
 .pin[data-empty="on"] { background: #d8a45a; }
 .pin[data-flash="on"], .pin:hover { transform: scale(1.25); }
 .pin[data-orphan="on"] { background: #8a8a8a; }
+/* 元素被弹窗等更高层覆盖时的幽影态：弱化存在感、不拦截点击 */
+.pin[data-covered="on"] { opacity: .18; pointer-events: none; transition: opacity .18s ease; }
 
 /* ---- 就地编辑器（胶囊式，参考 Codex 注释输入） ---- */
 .editor {
