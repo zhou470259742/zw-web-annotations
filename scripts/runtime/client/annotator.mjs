@@ -760,22 +760,41 @@ async function settleAnimations() {
  * foreignObject 内嵌文档继承宿主 devicePixelRatio：非整数 dpr（浏览器缩放
  * 125%/150% 等）下 Chrome 对 flex item 的子像素收缩与活页不一致——恰满的
  * flex 行会被多压出 1~2px，表现为顶栏文字折行、定宽卡片被收窄容器裁短等
- * 「页面被挤压」。序列化窗口内全局禁止 flex 收缩（活页本就装得下，视觉无感），
- * 克隆体按原始尺寸排版宁可溢出也不收缩。实测 dpr=1.8 复现挤压并消除。
+ * 「页面被挤压」。禁止 flex 收缩让克隆体按原始尺寸排版宁可溢出也不收缩。
+ *
+ * 必须注入到【克隆体】而非活页：活页注入会引起真实重排（如 el-input 的
+ * inner width:100%+flex:1 被禁收缩后溢出、justify-content:center 把 prefix
+ * 图标顶出框外），且坏掉的活页 computed 值会被内联冻结进克隆体——既让
+ * 用户看到「标注时样式跳动」，成图也跟着错。克隆侧渲染规则效果相同、活页零扰动。
  */
 const SHOT_ANTIDRIFT_CSS = '*{flex-shrink:0 !important}';
 /**
- * 目标打标色：页面内容不可能出现的品红。序列化前给活元素挂 outline 标记
- * （computed outline 经内联白名单进克隆体），光栅化后从位图扫回标记环——
+ * 目标打标色：页面内容不可能出现的品红。序列化前给活元素挂属性标记，
+ * 克隆体内同名选择器命中后画 outline，光栅化后从位图扫回标记环——
  * 元素在成图里的真实绘制位置，红框随之精确贴合（防克隆体布局漂移导致偏移）。
+ * 同样在克隆体生效：活页不需要真的闪出品红描边。
  */
 const SHOT_MARK_COLOR = '#FF00FF';
 const SHOT_MARK_CSS = `[data-zwa-shot-target]{outline:4px solid ${SHOT_MARK_COLOR} !important}`;
+const SHOT_INJECT_CSS = SHOT_ANTIDRIFT_CSS + SHOT_MARK_CSS;
+
+/**
+ * 把抗漂移/打标规则注入克隆体：domshot 的 svgStyleElement（svg 顶层 <style>，
+ * 样式跨 foreignObject 作用于整个内嵌文档）是现成注入点；无样式收集时
+ * （极小页）兜底新建 svg 命名空间 style 节点。注意不能走克隆 head——
+ * filter 的 checkVisibility 剪枝会把不可见的 head 整棵移除。
+ */
+function injectShotCss(svg) {
+  try {
+    const styleEl = svg.querySelector('style');
+    if (styleEl) { styleEl.textContent += SHOT_INJECT_CSS; return; }
+    const st = svg.ownerDocument.createElementNS('http://www.w3.org/2000/svg', 'style');
+    st.textContent = SHOT_INJECT_CSS;
+    svg.insertBefore(st, svg.firstChild);
+  } catch {}
+}
 
 function serializePage(endpoint, hostId = HOST_ID) {
-  const antiDrift = document.createElement('style');
-  antiDrift.textContent = SHOT_ANTIDRIFT_CSS;
-  document.head.appendChild(antiDrift);
   return Promise.resolve()
     .then(() => settleAnimations())
     .then(() => loadDomshot(endpoint))
@@ -799,10 +818,10 @@ function serializePage(endpoint, hostId = HOST_ID) {
               && !node.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
           return true;
         },
+        onCreateForeignObjectSvg: injectShotCss,
       })
       : null))
-    .catch(() => null)
-    .finally(() => antiDrift.remove());
+    .catch(() => null);
 }
 
 export function pageSnapshot(endpoint, hostId = HOST_ID) {
@@ -849,18 +868,16 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     if (!rect) return null;
     const vw = window.innerWidth;
     const vh = window.innerHeight;
-    // 点选元素：序列化前给活元素挂品红 outline 标记并走新鲜快照（标记随元素
+    // 点选元素：序列化前给活元素挂属性标记并走新鲜快照（标记随元素
     // 而变不进缓存）。克隆体在分数 dpr 下有亚像素布局漂移，红框按 live rect
     // 画必然偏——标记环随元素在克隆体里一起排版，位图扫回即得真实绘制位置。
+    // 只设属性、不动活页样式：outline 由克隆体内 SHOT_MARK_CSS 画，活页零闪烁。
     let unmark = null;
     if (liveEl && liveEl.isConnected && typeof liveEl.getBoundingClientRect === 'function') {
       const r = liveEl.getBoundingClientRect();
       if (r.width > 0 && r.height > 0) rect = { x: r.x, y: r.y, width: r.width, height: r.height };
       liveEl.setAttribute('data-zwa-shot-target', '1');
-      const markStyle = document.createElement('style');
-      markStyle.textContent = SHOT_MARK_CSS;
-      document.head.appendChild(markStyle);
-      unmark = () => { markStyle.remove(); liveEl.removeAttribute('data-zwa-shot-target'); };
+      unmark = () => { liveEl.removeAttribute('data-zwa-shot-target'); };
     }
     const full = await (unmark ? serializePage(endpoint, hostId) : pageSnapshot(endpoint, hostId));
     if (unmark) unmark();
