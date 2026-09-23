@@ -6496,7 +6496,7 @@ const CSS_TEXT = `
   border: 1px solid #2e2e2e; border-radius: 7px;
   background: #191919; cursor: default; user-select: none;
   /* 行高钉死：徽标/跳页钮高度不同不得撑出行差 */
-  min-height: 32px; box-sizing: border-box;
+  min-height: 36px; box-sizing: border-box;
 }
 /* .panel header 的拖拽 grab 特异性更高会压掉上面这条，必须点名为分组头恢复 */
 .panel .group-head, .panel .group-head:active { cursor: default; }
@@ -6525,11 +6525,11 @@ const CSS_TEXT = `
 .group-count { flex: none; color: #8f8f8f; font-size: 10px; }
 /* 组内跳页钮：只挂在非当前页组头（当前页跳自己无意义） */
 .group-goto {
-  flex: none; width: 18px; height: 18px; border: 0; border-radius: 5px; cursor: pointer;
+  flex: none; width: 22px; height: 22px; border: 0; border-radius: 6px; cursor: pointer;
   background: none; color: #8b8b96; display: inline-flex; align-items: center; justify-content: center;
 }
 .group-goto:hover { background: #333; color: #dedaff; }
-.group-goto svg { width: 12px; height: 12px; }
+.group-goto svg { width: 13px; height: 13px; }
 .panel footer { padding: 8px 11px 10px; border-top: 1px solid #333; }
 /* 提示行单行显示：长回执（如模式切换）超出即省略号截断，不再折行把面板撑高。
    min-width:0 允许 flex/grid 环境下收缩；完整文案通过 title 悬停可见。 */
@@ -6732,7 +6732,8 @@ const CSS_TEXT = `
 :host([data-zwa-theme="light"]) .panel .item.locked .item-title { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .panel .item.locked textarea { background: #f6f7fa; color: var(--zwa-text-muted); cursor: not-allowed; }
 :host([data-zwa-theme="light"]) .panel .lock-note { color: #b07d1c; border-color: #e2d3ac; }
-:host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: rgba(190,184,240,.8); }
+/* 当前页靠紫边凸显（底色与非当前页统一淡蓝玻璃） */
+:host([data-zwa-theme="light"]) .page-group.current .group-head { border-color: rgba(150,140,230,.85); }
 :host([data-zwa-theme="light"]) .group-goto { color: var(--zwa-text-muted); }
 :host([data-zwa-theme="light"]) .group-goto:hover { background: var(--zwa-surface-hover); color: #4f5bd5; }
 /* 页面分组头：淡蓝玻璃——浅蓝半透明 + 背景模糊 + 顶部内高光。
