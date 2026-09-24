@@ -6595,7 +6595,8 @@ const CSS_TEXT = `
 .panel-edge-tab svg { width: 14px; height: 14px; }
 .panel-edge-tab .pet-count {
   font-size: 9px; font-weight: 700; color: #9a8fd0;
-  writing-mode: vertical-rl; letter-spacing: 1px;
+  /* upright：默认 mixed 会把数字横躺旋转 90°，「9」在小字号下会被看成 6/∞ */
+  writing-mode: vertical-rl; text-orientation: upright; letter-spacing: 1px;
 }
 /* 悬耳竖向进度条：细轨道贴边，填充自下而上，100% 转绿 */
 .panel-edge-tab .pet-progress {
