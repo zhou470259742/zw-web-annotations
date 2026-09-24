@@ -7018,7 +7018,13 @@ const CSS_TEXT = `
   background: rgba(236,234,255,.9); color: #4a3fc0; border-color: rgba(190,184,240,.9);
 }
 :host([data-zwa-theme="light"]) .dock-progress { background: var(--zwa-border); }
-:host([data-zwa-theme="light"]) .dock-edge-tab { background: rgba(255,255,255,.78); color: var(--zwa-text-muted); }
+/* 耳片必须近不透明：半透明会透出下层胶囊内容（铅笔钮与箭头叠影）。
+   毛玻璃保留让边缘观感与药丸一致 */
+:host([data-zwa-theme="light"]) .dock-edge-tab {
+  background: rgba(255,255,255,.96); color: var(--zwa-text-muted);
+  backdrop-filter: blur(12px) saturate(1.4);
+  -webkit-backdrop-filter: blur(12px) saturate(1.4);
+}
 /* 悬耳进度条浅色版：暗色轨道在白底上发灰看不清，换浅蓝灰轨道+亮紫填充 */
 :host([data-zwa-theme="light"]) .panel-edge-tab .pet-progress {
   width: 5px;
