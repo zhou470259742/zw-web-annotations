@@ -6280,7 +6280,7 @@ const CSS_TEXT = `
 .editor-pill {
   display: flex; align-items: center; gap: 4px;
   padding: 4px 4px 4px 6px;
-  background: #fff; border-radius: 999px;
+  background: #fff; border-radius: 15px;
   box-shadow: 0 6px 22px rgba(0,0,0,.28), 0 0 0 1px rgba(0,0,0,.06);
 }
 .editor-pill textarea {
@@ -6316,7 +6316,7 @@ const CSS_TEXT = `
 .editor-caption {
   display: flex; align-items: center; gap: 6px;
   padding: 4px 10px; font-size: 11px;
-  background: #fff; border-radius: 999px;
+  background: #fff; border-radius: 15px;
   box-shadow: 0 3px 12px rgba(0,0,0,.16), 0 0 0 1px rgba(0,0,0,.06);
 }
 .editor-seq {
