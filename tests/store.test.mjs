@@ -827,8 +827,8 @@ test('review then done completes the task and keeps both timestamps', async () =
 /**
  * 待验收/已完成的任务被改了要求：新指令暂存为 pendingInstruction，
  * 当前状态/结果/分母一律不动（处理者按原指令收尾，冻结集合不可变）；
- * 批次交付（completeRound）时统一重开为无轮次 todo 并应用新指令，
- * 被下一批冻结纳入。旧的「立即退回重做」行为已由该机制取代。
+ * 批次交付（completeRound）时**另建一条新任务**承接新指令排队下一批，
+ * 原任务保持终态正常归档——交付结论不被回写篡改。
  */
 test('changing the instruction of a review task stores a pending requirement', async () => {
   const store = await tempStore();
@@ -849,7 +849,7 @@ test('changing the instruction of a review task stores a pending requirement', a
   );
 });
 
-test('pendingInstruction is applied when the round is delivered and queues for the next batch', async () => {
+test('pendingInstruction spawns a new task at delivery; the original archives as done', async () => {
   const store = await tempStore();
   await store.appendTasks({ page, tasks: [task({ instruction: '改成：登录' })] });
   const id = pageKey(page.url);
@@ -865,13 +865,25 @@ test('pendingInstruction is applied when the round is delivered and queues for t
   const delivered = await store.completeRound(round);
   assert.equal(delivered.action, 'stop');
   assert.equal(delivered.appliedPendings, 1);
-  const t = (await store.readGroup(id)).tasks[0];
-  assert.equal(t.status, 'todo', '交付时重开为下一轮的 todo');
-  assert.equal(t.instruction, '改成：注册', '应用暂存的新指令');
-  assert.equal(t.round, null, '轮次清空 → 下一批冻结时纳入');
-  assert.equal(t.result, null, '重开清掉旧结果');
-  assert.ok(t.history.some(h => h.event === 'pending_applied'), '应用动作要留在历史里');
-  assert.equal(t.pendingInstruction, undefined, '应用后移除暂存字段');
+
+  // 原任务保持 done 留在 live 组等人工归档（两阶段归档：文件级只收
+  // archived/cancelled），交付结论原样保留不被回写
+  const live = (await store.readGroup(id)).tasks;
+  assert.equal(live.length, 2, '原任务(done 待人工归档) + 新任务(todo) 各一条');
+  const original = live.find(t => t.id === 'task_abc');
+  const spawned = live.find(t => t.id !== 'task_abc');
+  assert.ok(original && spawned);
+  assert.equal(original.status, 'done', '原任务保持 done 等人工归档');
+  assert.equal(original.instruction, '改成：登录', '交付结论保留原指令');
+  assert.equal(original.supersededBy, spawned.id, '原任务记录被谁承接');
+  assert.equal(original.pendingInstruction, undefined, '暂存字段已消费');
+  assert.ok(original.history.some(h => h.event === 'pending_spawned'), '孵化动作留在原任务历史里');
+
+  assert.equal(spawned.status, 'todo', '新任务作为下一轮 todo');
+  assert.equal(spawned.instruction, '改成：注册', '新任务承接新指令');
+  assert.equal(spawned.round, null, '无轮次 → 下一批冻结时纳入');
+  assert.equal(spawned.supersedes, 'task_abc', '记录承接关系');
+  assert.equal(spawned.element?.selector, '#login', '沿用原元素定位');
 });
 
 test('a review task keeps its status when the instruction is unchanged', async () => {

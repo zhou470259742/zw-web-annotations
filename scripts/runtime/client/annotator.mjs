@@ -2402,7 +2402,8 @@ export function mountAnnotator(options = {}) {
     // 非 todo（doing/review/done/blocked）的列表输入框一律只读——它们的当前
     // 指令对应着在途工作或已验收的结论，随手一改会作废它。要提交新要求，
     // 点图钉/详情打开编辑器：新指令存为 pendingInstruction，批次交付时
-    // 统一重开为下一轮的 todo（服务端语义，见 store.mjs appendTasks）。
+    // **另建一条新任务**排队下一轮，本条保持终态正常归档（服务端语义，
+    // 见 store.mjs completeRound）。
     const locked = task.status === 'doing';
     // 轮次冻结后，同批 todo 已随首个 doing 整批读取进当前处理批次：
     // 与未入批的普通待处理不同——不可删、不可就地改（新要求走编辑器 → 下一轮），
@@ -2429,8 +2430,8 @@ export function mountAnnotator(options = {}) {
     const readonlyAttr = readonly ? ' readonly' : '';
     const readonlyHint = readonly
       ? (batchQueued
-        ? ' title="本批已整批锁定读取，暂不可就地修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"'
-        : ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理"')
+        ? ' title="本批已整批锁定读取，暂不可就地修改；要提交新要求，点图钉或「详情」打开编辑器，将另建一条任务在下一轮处理"'
+        : ' title="只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将另建一条任务在下一轮处理"')
       : '';
     // review = 子 agent 已交活、等人看过页面确认。这是唯一面向人的验收入口：
     // 以前 done 只能靠裸 PATCH 回写，主线程没有可点的东西，于是反复让用户
@@ -2442,7 +2443,7 @@ export function mountAnnotator(options = {}) {
         <span class="item-seq${manual ? ' manual' : ''}">${seq}</span>
         <span class="item-title">${escapeHtml(title)}</span>
         ${locked ? '<span class="lock-note" title="正在处理中，暂不可修改或删除">🔒 处理中</span>' : ''}
-        ${batchQueued ? '<span class="lock-note" title="已锁定进当前处理批次：整批读取后按顺序完成，暂不可修改或删除；新要求可通过详情提交，下一轮处理">🔒 本批待处理</span>' : ''}
+        ${batchQueued ? '<span class="lock-note" title="已锁定进当前处理批次：整批读取后按顺序完成，暂不可修改或删除；新要求可通过详情提交，另建任务下一轮处理">🔒 本批待处理</span>' : ''}
         ${reviewable ? `<button type="button" class="link accept" data-accept="${escapeHtml(task.id)}" title="验收通过：确认这处改动符合要求，标记为已完成">✓ 验收</button>` : ''}
         ${current ? `<button type="button" class="link" data-details="${escapeHtml(task.id)}" title="查看元素详情">详情</button>` : ''}
         ${locked || batchQueued
@@ -2457,7 +2458,7 @@ export function mountAnnotator(options = {}) {
       </div>
       <div class="item-foot">
         <code>${escapeHtml(sub)}</code>
-        <span class="tag${empty ? ' warn' : ` status-${task.status}`}" title="状态：${STATUS_LABELS[task.status] || task.status}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${pending ? `<span class="tag pending" title="已提交新要求（下一轮处理）：${escapeHtml(task.pendingInstruction)}">新要求</span>` : ''}${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
+        <span class="tag${empty ? ' warn' : ` status-${task.status}`}" title="状态：${STATUS_LABELS[task.status] || task.status}">${empty ? '未填写' : STATUS_LABELS[task.status] || task.status}</span>${pending ? `<span class="tag pending" title="已提交新要求（交付后另建一条任务进入下一轮）：${escapeHtml(task.pendingInstruction)}">新要求</span>` : ''}${queued ? '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>' : ''}
       </div>
     </article>`;
   }
@@ -2562,7 +2563,7 @@ export function mountAnnotator(options = {}) {
           // 「提交新要求」路径（下一轮生效）。
           if (localTask.status !== 'todo') {
             el.value = localTask.instruction || '';
-            state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理。';
+            state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将另建一条任务在下一轮处理。';
             renderMessage();
             return;
           }
@@ -2579,7 +2580,7 @@ export function mountAnnotator(options = {}) {
         if (!remote) return;
         if (remote.task.status !== 'todo') {
           el.value = remote.task.instruction || '';
-          state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将在下一轮处理。';
+          state.syncMessage = '只有待处理的任务可直接修改；要提交新要求，点图钉或「详情」打开编辑器，将另建一条任务在下一轮处理。';
           renderMessage();
           return;
         }
@@ -3130,12 +3131,12 @@ export function mountAnnotator(options = {}) {
       : '手动任务';
     // 非 todo（doing/review/done/blocked）：编辑器是「提交新要求」模式——
     // 当前指令对应在途工作或已验收结论，这里写下的文字不会改动它，
-    // 而是存为 pendingInstruction，批次交付后作为下一轮的 todo 重新处理。
+    // 而是存为 pendingInstruction，批次交付时**另建一条新任务**排队下一轮。
     // todo：普通编辑，Enter 即改当前指令。
     const nonTodo = task.status !== 'todo';
     input.readOnly = false;
     $('[data-el="editorHint"]').textContent = nonTodo
-      ? '提交新要求 · 下一轮处理（不改当前指令）· Esc 取消'
+      ? '另建新任务 · 本条保持已交付 · Esc 取消'
       : 'Enter 确认 · Esc 取消';
     input.value = task.instruction || '';
     renderEditorImages();
@@ -3486,7 +3487,7 @@ export function mountAnnotator(options = {}) {
       if (task) {
         // 非 todo：编辑器是「提交新要求」模式——写入 pendingInstruction，
         // 当前指令/状态/结果一律不动（处理者按原指令收尾不受干扰），
-        // 批次交付后新要求自动重开为下一轮的 todo。todo：普通编辑当前指令。
+        // 批次交付时另建一条新任务排队下一轮，本条保持终态归档。
         if (task.status !== 'todo') {
           if (!text || text === task.instruction || text === task.pendingInstruction) {
             // 没有提出新要求（含仅粘贴图片）：视为取消
@@ -3497,7 +3498,7 @@ export function mountAnnotator(options = {}) {
           task.history = [...(task.history || []), { at: new Date().toISOString(), event: 'pending_instruction_updated', detail: text }];
           task.updatedAt = new Date().toISOString();
           finishConfirm(task);
-          setReceipt('新要求已提交，将在下一轮处理。', 6000);
+          setReceipt('新要求已提交，交付后将另建一条待处理任务。', 6000);
           return task;
         }
         const hasImages = state.pendingImages.length > 0;

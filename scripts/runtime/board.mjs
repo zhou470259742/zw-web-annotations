@@ -321,6 +321,9 @@ export function renderBoardHtml({ version = '' } = {}) {
   .card-act.accept.armed { background: var(--st-review); border-color: var(--st-review); }
   .card-act.arch:hover { color: var(--st-archived); border-color: var(--st-archived); }
   .card-act.arch.armed { background: var(--st-archived); border-color: var(--st-archived); }
+  /* armed 确认态悬停保持白字：.card-act.arch:hover 同优先级会把文字
+     染成主题紫，叠在紫色 armed 底上等于隐形——这里强制盖回去 */
+  .card-act.armed:hover { color: #fff; }
   /* 列内按页面分组：组头常驻（不随卡片悬停），页面级归档按钮在组头右侧 */
   .pg-group { margin-bottom: 4px; }
   .pg-head { display: flex; align-items: center; gap: 6px; padding: 4px 2px 3px;
@@ -332,6 +335,21 @@ export function renderBoardHtml({ version = '' } = {}) {
   .pg-arch, .col-arch { opacity: .75; }
   .pg-head:hover .pg-arch { opacity: 1; }
   .col-arch { margin-left: auto; }
+  /* 已归档列页面组折叠：箭头指示 + 整头可点；折叠时卡片区整体隐藏 */
+  .pg-collapsible .pg-head { cursor: pointer; user-select: none; }
+  .pg-collapsible .pg-head:hover .pg-name { color: var(--text); }
+  .pg-chev { flex: none; width: 10px; height: 10px; color: var(--text-faint);
+             transform: rotate(90deg); transition: transform .15s; }
+  .pg-group.collapsed .pg-chev { transform: rotate(0deg); }
+  .pg-group.collapsed .pg-items { display: none; }
+  /* 折叠组内缩略图不渲 img，留个占位底框（角标还在） */
+  .card-thumb { background: var(--panel-2); }
+  /* 已归档整列折叠：列收成只剩列头的窄条，卡片区整体隐藏 */
+  .col-archived .col-head { cursor: pointer; user-select: none; }
+  .col-archived .col-head:hover h2 { color: var(--text); }
+  .col-archived.collapsed { flex: none; min-width: 0; }
+  .col-archived.collapsed .cards { display: none; }
+  .col-archived.collapsed .col-chev { transform: rotate(0deg); }
   .empty { font-size: 11px; color: var(--text-empty); padding: 8px 4px; text-align: center; }
   .empty-note { flex: none; font-size: 12px; color: var(--text-dim); padding: 0 2px 10px; }
   .error { max-width: 420px; text-align: center; color: var(--st-blocked); }
@@ -416,6 +434,11 @@ export function renderBoardHtml({ version = '' } = {}) {
   var lastRecords = [];
   // 常用过滤条件：关键词 / 页面 / 归档开关 / 状态（不持久化，进页面即重置）
   var filters = { q: '', page: 'all', archived: true, status: 'all' };
+  // 已归档列的页面组展开态：默认全折叠，点开一组记一组；
+  // 内存级即可——SSE/定时重渲染不丢，页面刷新回到默认折叠。
+  var archPgOpen = {};
+  // 已归档整列折叠态：默认展开（组内默认折叠），点列头整列收成窄条。
+  var archColCollapsed = false;
 
   // 任务文本来自不可信页面：一律经 textContent 语义转义后再进 innerHTML。
   function esc(value) {
@@ -505,7 +528,7 @@ export function renderBoardHtml({ version = '' } = {}) {
    * 任务卡片：左缘状态条纹 + 悬停浮起。看板列/半区已经说明了状态，
    * 卡片上不再重复「归档」与状态标签（表格视图才有状态列）。
    */
-  function cardHtml(r) {
+  function cardHtml(r, noImg) {
     var t = r.t, el = t.element || {};
     var title = taskTitle(t);
     var instruction = t.instruction || '（未填写）';
@@ -528,7 +551,7 @@ export function renderBoardHtml({ version = '' } = {}) {
         // data 属性内不能放裸双引号（esc 不转义引号会截断属性值），改用 URI 编码
         return '<div class="card-thumbs"><span class="card-thumb" data-srcs="'
           + encodeURIComponent(JSON.stringify(srcs)) + '" data-cap="' + encodeURIComponent(instruction) + '">'
-          + '<img src="' + srcs[0] + '" loading="lazy" alt="">'
+          + (noImg ? '' : '<img src="' + srcs[0] + '" loading="lazy" alt="" onerror="var p=this.parentNode,l=[];try{l=JSON.parse(decodeURIComponent(p.dataset.srcs||\\\'[]\\\'))}catch(x){}var i=l.indexOf(this.getAttribute(\\\'src\\\'));if(i>-1&&i+1<l.length){this.src=l[i+1]}else{p.style.display=\\\'none\\\'}">')
           + (srcs.length > 1 ? '<i class="thumb-n">' + srcs.length + '</i>' : '')
           + '</span></div>';
       })()
@@ -538,7 +561,7 @@ export function renderBoardHtml({ version = '' } = {}) {
         ? ((t.round != null ? '<span class="tag round">第 ' + esc(t.round) + ' 轮</span>' : '')
           + (t.completedAt ? '<span class="tag round" title="完成时间">' + esc(fmtTime(t.completedAt)) + '</span>' : '')
           + (t.status === 'cancelled' ? '<button type="button" class="card-act del" data-action="purge-archived" data-group="' + esc(r.group) + '" data-task="' + esc(t.id) + '" title="从归档中永久删除这条任务">删除</button>' : ''))
-        : ((t.pendingInstruction ? '<span class="tag pending" title="已提交新要求（下一轮处理）：' + esc(t.pendingInstruction) + '">新要求</span>' : '')
+        : ((t.pendingInstruction ? '<span class="tag pending" title="已提交新要求（交付后另建一条任务进入下一轮）：' + esc(t.pendingInstruction) + '">新要求</span>' : '')
           + (t.round != null ? '<span class="tag round">第 ' + esc(t.round) + ' 轮</span>' : '<span class="tag queued" title="处理开始后新增，自动排队下一轮">下一轮</span>')
           // 待验收卡的正式人工出口：done 只能由主线程验收后回写，
           // 看板上给不出这个按钮，用户就只能被指去点一个不存在的东西。
@@ -575,7 +598,11 @@ export function renderBoardHtml({ version = '' } = {}) {
       var batchBtn = key === 'done' && countOf(key)
         ? '<button type="button" class="card-act arch col-arch" data-action="archive-all-done" title="把已完成列全部任务移入「已归档」">全部归档</button>'
         : '';
-      return '<div class="col-head"><span class="dot" style="--c:' + stVar(key) + '"></span>'
+      var colChev = key === 'archived'
+        ? '<svg class="pg-chev col-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>'
+        : '';
+      return '<div class="col-head"' + (key === 'archived' ? ' data-arch-col title="点击折叠/展开已归档列"' : '') + '>'
+        + colChev + '<span class="dot" style="--c:' + stVar(key) + '"></span>'
         + '<h2>' + esc(STATUS_LABELS[key]) + '</h2><span class="count">' + countOf(key) + '</span>' + batchBtn + '</div>';
     }
     /** 列内按页面分组：组内已完成/已归档时间倒序，其余序号升序。 */
@@ -598,6 +625,10 @@ export function renderBoardHtml({ version = '' } = {}) {
         var name = recs[0].page || k;
         var qi = k.indexOf('?');
         if (qi > 0) name += ' ' + k.slice(qi);
+        // 已归档列：页面组默认折叠、点头展开；折叠组连缩略 img 都不渲，
+        // 136+ 条归档卡片一次性铺开既卡又长，图片请求也全部省掉。
+        var collapsible = key === 'archived';
+        var open = !collapsible || !!archPgOpen[k];
         var items = recs.slice().sort(function (x, y) {
           if (desc) {
             var a = recTime(x), b = recTime(y);
@@ -605,18 +636,27 @@ export function renderBoardHtml({ version = '' } = {}) {
             return (y.t.seq || 0) - (x.t.seq || 0);
           }
           return (x.t.seq || 0) - (y.t.seq || 0);
-        }).map(cardHtml).join('');
+        }).map(function (x) { return cardHtml(x, collapsible && !open); }).join('');
         var pbtn = key === 'done'
           ? '<button type="button" class="card-act arch pg-arch" data-action="archive-page" data-page="' + esc(k) + '" title="归档此页面的全部已完成任务">归档本页</button>'
           : '';
-        return '<div class="pg-group"><div class="pg-head"><span class="pg-name" title="' + esc(k) + '">' + esc(name) + '</span>'
-          + '<span class="pg-count">' + recs.length + '</span>' + pbtn + '</div>' + items + '</div>';
+        var chev = collapsible
+          ? '<svg class="pg-chev" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>'
+          : '';
+        return '<div class="pg-group' + (collapsible ? ' pg-collapsible' : '') + (open ? '' : ' collapsed') + '">'
+          + '<div class="pg-head"' + (collapsible ? ' data-pg="' + esc(k) + '" title="点击展开/折叠此页面的归档任务"' : '') + '>'
+          + chev + '<span class="pg-name" title="' + esc(k) + '">' + esc(name) + '</span>'
+          + '<span class="pg-count">' + recs.length + '</span>' + pbtn + '</div>'
+          + '<div class="pg-items">' + items + '</div></div>';
       }).join('');
       return '<div class="cards">' + html + '</div>';
     }
     var cols = BOARD_COLUMNS.map(function (group) {
       if (group.length === 1) {
-        return '<div class="col">' + headHtml(group[0]) + cardsHtml(group[0]) + '</div>';
+        var archCls = group[0] === 'archived'
+          ? ' col-archived' + (archColCollapsed ? ' collapsed' : '')
+          : '';
+        return '<div class="col' + archCls + '">' + headHtml(group[0]) + cardsHtml(group[0]) + '</div>';
       }
       var halves = group.map(function (key) {
         return '<div class="col-half">' + headHtml(key) + cardsHtml(key) + '</div>';
@@ -893,6 +933,18 @@ export function renderBoardHtml({ version = '' } = {}) {
     try { srcs = JSON.parse(decodeURIComponent(thumb.dataset.srcs || '[]')); } catch (err) { srcs = [thumb.querySelector('img').src]; }
     vOpen(srcs, 0, decodeURIComponent(thumb.dataset.cap || ''));
   }, true);
+  // 已归档折叠两层开关：列头点一下整列收成窄条；页面组头点一下
+  // 单组开合。都跳过组内按钮，展开态记内存，SSE/定时刷新重渲染后保持。
+  boardRoot.addEventListener('click', function (e) {
+    if (e.target.closest && e.target.closest('[data-action]')) return;
+    var colHead = e.target && e.target.closest ? e.target.closest('.col-head[data-arch-col]') : null;
+    if (colHead && boardRoot.contains(colHead)) { archColCollapsed = !archColCollapsed; rerender(); return; }
+    var head = e.target && e.target.closest ? e.target.closest('.pg-head[data-pg]') : null;
+    if (!head || !boardRoot.contains(head)) return;
+    var pgk = head.getAttribute('data-pg');
+    if (archPgOpen[pgk]) delete archPgOpen[pgk]; else archPgOpen[pgk] = 1;
+    rerender();
+  });
   viewer.addEventListener('click', function (e) {
     if (e.target === viewer) { viewer.classList.add('hidden'); return; }
     if (e.target.closest('.prev')) vStep(-1);

@@ -262,10 +262,10 @@ test('client lifecycle handlers have symmetric cleanup and no stale whole-group 
   const vite = await fs.readFile(new URL('../scripts/runtime/vite/index.mjs', import.meta.url), 'utf8');
   assert.doesNotMatch(vite, /route === '\/tasks'[\s\S]{0,200}writeGroup/);
   // 面板编辑规则：只有 todo 可直接改当前指令；非 todo（doing/review/done/
-  // blocked）只读，编辑器提交新要求（pendingInstruction），交付时排队下一轮。
+  // blocked）只读，编辑器提交新要求（pendingInstruction），交付时另建任务排队下一轮。
   assert.match(client, /const readonly = task\.status !== 'todo'/);
   assert.match(client, /task\.pendingInstruction = text/);
-  assert.match(client, /提交新要求 · 下一轮处理/);
+  assert.match(client, /另建新任务 · 本条保持已交付/);
   // 复制提示词前必须确认接口清单已生成：协议会让模型从 endpoint.json 发现
   // 实际回写入口，清单缺失时复制出来的提示词就指向一份无法执行的协议。
   assert.match(client, /state\.endpointManifestPath = data\.endpointManifestPath/);

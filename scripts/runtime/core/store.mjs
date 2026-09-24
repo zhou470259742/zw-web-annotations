@@ -707,24 +707,49 @@ export function createStore(workspace, options = {}) {
       return { action: 'blocked', round, summary, obstacles: summary.obstacles };
     }
     const mode = (await readExecution()).mode;
-    // 交付前先应用暂存新要求（pendingInstruction）：带它的任务重开为无轮次
-    // todo（指令换成新值、清验收痕迹），不进入本轮归档，自然排队下一批——
-    // 「冻结集合在处理期间不可变，追加一律进下一批」由此严格成立。
-    // 必须在归档前做：重开成 todo 后任务不再是终态，不会被按轮归档误收。
+    // 交付前先应用暂存新要求（pendingInstruction）：带它的任务**另建一条新
+    // 任务**承接新指令——原任务保持终态随本轮正常归档，交付结论不被回写篡
+    // 改；新任务无轮次 todo，自然排队下一批。「冻结集合在处理期间不可变，
+    // 追加一律进下一批」由此严格成立。必须在归档前做：新任务此时入组，
+    // 归档循环才不会把它误收（round=null 本就不命中归档条件）。
+    // 新任务沿用原 element/selector：后续同元素再标注仍按 bySelector 归并
+    // 到这条活任务上（原任务已归档，组内 selector 唯一）；客户端残留的旧
+    // 任务副本会因 updatedAt 严格早于归档副本被防复活过滤，不会重复孵化。
     const groups = await listGroups();
     let appliedPendings = 0;
     for (const group of groups) {
       let changed = false;
+      let maxSeq = group.tasks.reduce((m, t) => Math.max(m, Number(t.seq) || 0), 0);
       for (const task of group.tasks) {
         if (!task.pendingInstruction) continue;
-        task.instruction = task.pendingInstruction;
+        const text = task.pendingInstruction;
         delete task.pendingInstruction;
-        task.status = 'todo';
-        task.result = null;
-        task.reviewAt = null;
-        task.completedAt = null;
-        task.round = null;
-        task.history.push({ at: nowIso(), event: 'pending_applied', detail: task.instruction, reason: 'applied at round delivery' });
+        const at2 = nowIso();
+        const spawned = {
+          // id 不能用 stableTaskId 口径（与已归档原任务同 selector 会撞 id）：
+          // 原 id + 孵化序号后缀，同元素多次追加各自成条、永不复用。
+          id: validateTaskId(`${task.id}_r${Date.now().toString(36)}${appliedPendings}`),
+          seq: ++maxSeq,
+          kind: task.kind || (task.element ? 'element' : 'manual'),
+          instruction: text,
+          status: 'todo',
+          round: null,
+          createdAt: at2,
+          updatedAt: at2,
+          confirmedAt: at2,
+          startedAt: null,
+          completedAt: null,
+          reviewAt: null,
+          element: task.element || null,
+          images: Array.isArray(task.images) ? task.images.slice(0, MAX_IMAGES_PER_TASK) : [],
+          meta: { ...(task.meta && typeof task.meta === 'object' ? task.meta : {}), gitHead: gitHeadOf() },
+          supersedes: task.id,
+          history: [{ at: at2, event: 'created', detail: `承接 ${task.id} 的新要求：${text.slice(0, 80)}` }],
+          result: null,
+        };
+        task.supersededBy = spawned.id;
+        task.history.push({ at: at2, event: 'pending_spawned', detail: `新要求已另建任务 ${spawned.id}` });
+        group.tasks.push(spawned);
         changed = true;
         appliedPendings++;
       }
@@ -1153,20 +1178,28 @@ export function createStore(workspace, options = {}) {
         //   在途工作或已验收的结论，直接改会作废它（doing）或把任务拉回
         //   当前批（review/done）——都违背「冻结集合在处理期间不可变」。
         //   新指令存为 pendingInstruction 暂存：当前状态/结果/分母一律不动，
-        //   批次交付（completeRound）时统一重开为无轮次 todo，被下一批纳入。
-        //   重复追加取最新值；客户端全量同步经 incoming.pendingInstruction
+        //   批次交付（completeRound）时**另建一条新任务**承接，原任务保持终态
+        //   归档。重复追加取最新值；客户端全量同步经 incoming.pendingInstruction
         //   或变化后的 instruction 都能触达同一条暂存路径。
+        //   该任务若已孵化过承接任务（supersedes 链），新要求改写到链尾活
+        //   任务上——否则终态原任务上的旧暂存会随下次交付重复孵化出重复任务。
         const incomingText = (typeof incoming.pendingInstruction === 'string' && incoming.pendingInstruction.trim())
           ? incoming.pendingInstruction
           : (typeof incoming.instruction === 'string' ? incoming.instruction : '');
-        if (incomingText.trim() && incomingText !== existing.instruction && incomingText !== existing.pendingInstruction) {
-          if (existing.status === 'todo') {
-            existing.history.push({ at, event: 'instruction_updated', detail: incomingText });
-            existing.instruction = incomingText;
-            if (existing.pendingInstruction) delete existing.pendingInstruction;
+        let heirTarget = existing;
+        for (let hop = 0; hop < 8; hop++) {
+          const next = group.tasks.find(t => t.supersedes === heirTarget.id);
+          if (!next) break;
+          heirTarget = next;
+        }
+        if (incomingText.trim() && incomingText !== heirTarget.instruction && incomingText !== heirTarget.pendingInstruction) {
+          if (heirTarget.status === 'todo') {
+            heirTarget.history.push({ at, event: 'instruction_updated', detail: incomingText });
+            heirTarget.instruction = incomingText;
+            if (heirTarget.pendingInstruction) delete heirTarget.pendingInstruction;
           } else {
-            existing.pendingInstruction = incomingText;
-            existing.history.push({ at, event: 'pending_instruction_updated', detail: incomingText });
+            heirTarget.pendingInstruction = incomingText;
+            heirTarget.history.push({ at, event: 'pending_instruction_updated', detail: incomingText });
           }
         }
         // 职责划分：任务「内容」（element/instruction）由浏览器拥有，
