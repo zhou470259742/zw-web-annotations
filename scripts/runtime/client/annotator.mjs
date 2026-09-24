@@ -4570,6 +4570,7 @@ export function mountAnnotator(options = {}) {
     if (!l) {
       // 回默认右下角：清掉全部内联定位，样式表 right:18/bottom:18 生效
       ['left', 'top', 'right', 'bottom'].forEach(p => bar.style.removeProperty(p));
+      avoidAppChrome();
       syncBarAnchored();
       return;
     }
@@ -4591,6 +4592,44 @@ export function mountAnnotator(options = {}) {
       bar.style.bottom = 'auto';
     }
     syncBarAnchored();
+  }
+
+  /**
+   * 默认落点避障：右下角常被应用自己的底栏/悬浮控件占着（如 Master Dock
+   * 标签条），胶囊直接压上去会盖住它的图标。取胶囊中心点命中栈里最上层
+   * 的非标注元素——贴屏底的窄条（≤200px）视为应用 chrome，把胶囊抬到
+   * 它上方 10px；大面积背景内容（地图/表格）照常覆盖不避让。
+   */
+  function avoidAppChrome() {
+    try {
+      const dockEl = $('[data-el="dock"]');
+      const r = (dockEl || bar).getBoundingClientRect();
+      if (r.width < 10) return;
+      // 采样点打在胶囊底缘内 2px——胶囊与应用底栏的重叠发生在底部条带，
+      // 取中心点会落到底栏上方的内容里而漏判
+      const stack = document.elementsFromPoint(
+        r.left + r.width / 2, r.bottom - 2) || [];
+      let need = 0;
+      for (const el of stack) {
+        if (el === host || host.contains(el)) continue;
+        if (el === document.documentElement || el === document.body) continue;
+        const er = el.getBoundingClientRect();
+        if (er.height > 200) break; // 命中大背景内容：底下的被它盖住，不避让
+        if (er.bottom < window.innerHeight - 4) continue; // 不贴屏底的小元素：底栏里的按钮等，继续向下找
+        // 贴屏底的窄条 = 应用底栏/悬浮 chrome；嵌套多层时抬到最外层上方 10px
+        need = Math.max(need, window.innerHeight - er.top + 10);
+      }
+      if (need > 18 && need < window.innerHeight * 0.5) {
+        bar.style.bottom = `${need}px`;
+        bar._avoidChrome = true;
+        return;
+      }
+      // 底栏消失（切页/收起）：把之前抬过的胶囊放回默认位
+      if (bar._avoidChrome) {
+        bar._avoidChrome = false;
+        bar.style.removeProperty('bottom');
+      }
+    } catch {}
   }
 
   /** 面板跟随胶囊：贴胶囊上方、水平按胶囊所在半屏对齐；胶囊近顶时翻到下方（toast 已改顶部居中，不再锚定） */
@@ -5499,6 +5538,7 @@ export function mountAnnotator(options = {}) {
   function onResize() {
     repositionPins();
     hideSizeBadge();
+    if (!state.dockLayout && !bar.classList.contains('dragging')) avoidAppChrome();
     syncBarAnchored();
     repositionEditor();
     updateFocusFx();
@@ -5534,7 +5574,15 @@ export function mountAnnotator(options = {}) {
     //   尾随一次收尾——最长延迟封顶 250ms 而非等变化静默；
     // - attributes 监听 class/style：v-show 型弹窗只切 display 不增删节点。
     const REPOSITION_INTERVAL = 250;
-    const repositionAll = () => { repositionPins(); repositionEditor(); repositionRegionMarks(); updateFocusFx(); };
+    // 应用底栏可能比标注器晚渲染/随路由出现消失：默认落点下每次重排都重评
+    // 避障（用户拖过的自由/贴边布局不打扰，拖拽中途也不回写）
+    const reevalDockAvoid = () => {
+      if (!state.dockLayout && !bar.classList.contains('dragging')) {
+        avoidAppChrome();
+        syncBarAnchored();
+      }
+    };
+    const repositionAll = () => { reevalDockAvoid(); repositionPins(); repositionEditor(); repositionRegionMarks(); updateFocusFx(); };
     let lastRepositionAt = 0;
     let repositionTimer = null;
     const domObserver = new MutationObserver(recs => {
