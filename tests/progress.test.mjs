@@ -75,8 +75,14 @@ test('dispatch is a one-shot gate paid in full once anything starts', () => {
   const tasks = [t('doing'), ...Array.from({ length: 9 }, () => t('todo'))];
   const p = computeProgress(tasks);
   assert.equal(p.started, 1);
-  // 10（分派）+ 0（还没进 review）+ 0（还没 done）
-  assert.equal(p.percent, 10);
+  // 10（分派）+ 70×0.5/10=3.5（doing 在途开发记半份）≈ 14
+  assert.equal(p.percent, 14);
+});
+
+test('doing earns half dev weight so the bar moves mid-work', () => {
+  // 4 条全在 doing：10 + 70×(4×0.5)/4 = 45，而不是钉死在 10
+  const p = computeProgress([t('doing'), t('doing'), t('doing'), t('doing')]);
+  assert.equal(p.percent, 45);
 });
 
 test('cancelled tasks are excluded from the denominator', () => {

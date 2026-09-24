@@ -164,7 +164,8 @@ const runtimeTail = (() => {
  *
  * 三段按「已达成该阶段的任务数 / 有效任务数」计分：
  * - 分派：任一任务离开 todo 即得满分 10%（它是关卡，不是斜坡）；
- * - 开发：到达 review 或 done 即算开发完成，每项贡献 70/total；
+ * - 开发：doing 记半份（在途开发，每项 35/total），到达 review/done 记全份 70/total——
+ *   否则 agent 干活全程任务都挂在 doing，进度条会钉死在 10% 直到第一条 review 才跳变；
  * - 验收：只有 done 才算验收通过，每项贡献 20/total。
  * cancelled 不计入分母——用户主动取消的任务不该把进度永远压住。
  */
@@ -175,8 +176,9 @@ export function computeProgress(tasks = []) {
   for (const t of active) counts[t.status] = (counts[t.status] || 0) + 1;
   if (!total) return { percent: 0, total: 0, counts, started: 0, devDone: 0, verified: 0 };
   const started = total - (counts.todo || 0);
-  // archived 是 done 的人工归档终态，进度权重与 done 同档计入
-  const devDone = (counts.review || 0) + (counts.done || 0) + (counts.archived || 0);
+  // archived 是 done 的人工归档终态，进度权重与 done 同档计入；
+  // doing 在途开发记半份，进 review 才补成全份
+  const devDone = (counts.doing || 0) * 0.5 + (counts.review || 0) + (counts.done || 0) + (counts.archived || 0);
   const verified = (counts.done || 0) + (counts.archived || 0);
   const percent = Math.round(
     (started > 0 ? PROGRESS_WEIGHTS.dispatch : 0)
