@@ -2668,7 +2668,8 @@ export function mountAnnotator(options = {}) {
       pin.className = 'pin';
       pin.dataset.pin = task.id;
       pin.dataset.empty = empty ? 'on' : 'off';
-      pin.title = `${seq}. ${task.instruction || '未填写'}`;
+      pin.dataset.status = task.status;
+      pin.title = `${seq}. [${STATUS_LABELS[task.status] || task.status}] ${task.instruction || '未填写'}`;
       pin.textContent = String(seq);
       pin.addEventListener('click', event => {
         event.preventDefault();
@@ -2775,6 +2776,9 @@ export function mountAnnotator(options = {}) {
       pin.style.display = 'none';
       return;
     }
+    // 元素可能晚于图钉挂载才渲染（先置 orphan 后解析成功）：每轮重排必须复位，
+    // 否则 stale 的 orphan 灰会盖住真实状态色。
+    pin.dataset.orphan = 'off';
     const rect = el.getBoundingClientRect();
     // 零尺寸（选择器命中未渲染的兄弟节点，如折叠面板里的同名 el-table）
     // 不是「被遮」而是「没渲染」——直接隐藏，别走进遮挡判定误报。
@@ -6242,9 +6246,16 @@ const CSS_TEXT = `
   box-shadow: 0 2px 6px rgba(0,0,0,.35);
   pointer-events: auto; transition: transform .12s ease;
 }
-.pin[data-empty="on"] { background: #d8a45a; }
+/* 状态着色：todo 默认紫 / doing 蓝 / review 橙 / done 绿 / blocked 红 / cancelled 灰 */
+.pin[data-status="doing"] { background: #3b82f6; }
+.pin[data-status="review"] { background: #f59e0b; }
+.pin[data-status="done"] { background: #22c55e; }
+.pin[data-status="blocked"] { background: #ef4444; }
+.pin[data-status="cancelled"] { background: #9ca3af; }
+/* 未填写指令的草稿态：空心琥珀（与 review 实心橙区分，也避让状态底色） */
+.pin[data-empty="on"] { background: #fff; color: #d8a45a; border-color: #d8a45a; }
 .pin[data-flash="on"], .pin:hover { transform: scale(1.25); }
-.pin[data-orphan="on"] { background: #8a8a8a; }
+.pin[data-orphan="on"] { background: #525252; }
 /* 元素被弹窗等更高层覆盖时的幽影态：弱化存在感、不拦截点击 */
 .pin[data-covered="on"] { opacity: .18; pointer-events: none; transition: opacity .18s ease; }
 
