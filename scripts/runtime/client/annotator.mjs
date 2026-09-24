@@ -770,16 +770,55 @@ async function settleAnimations() {
 const SHOT_ANTIDRIFT_CSS = '*{flex-shrink:0 !important}';
 /**
  * 目标打标色：页面内容不可能出现的品红。序列化前给活元素挂属性标记，
- * 克隆体内同名选择器命中后画 outline，光栅化后从位图扫回标记环——
+ * 克隆体侧注入一个贴边内框标记子元素，光栅化后从位图扫回标记环——
  * 元素在成图里的真实绘制位置，红框随之精确贴合（防克隆体布局漂移导致偏移）。
- * 同样在克隆体生效：活页不需要真的闪出品红描边。
+ *
+ * 不用 outline/外凸环：目标边缘与 overflow:hidden 祖先裁剪边界重合时
+ * （如 .track-top-bar 恰好贴住 .sleek-track-container 顶缘），外凸的环
+ * 会整圈落在裁剪区外被裁光，位图 0 像素。内凹标记画在元素自身边界内、
+ * 永不超出 → 任何祖先裁剪都伤不到它。
  */
 const SHOT_MARK_COLOR = '#FF00FF';
-const SHOT_MARK_CSS = `[data-zwa-shot-target]{outline:4px solid ${SHOT_MARK_COLOR} !important}`;
-const SHOT_INJECT_CSS = SHOT_ANTIDRIFT_CSS + SHOT_MARK_CSS;
+const SHOT_MARK_W = 4; // 标记环厚度（CSS px）
+const SHOT_INJECT_CSS = SHOT_ANTIDRIFT_CSS;
+// 无法容纳渲染子节点的元素（void/替换/外部文档容器）退化为 inset box-shadow
+const SHOT_NO_CHILD_TAGS = new Set(('area,base,br,col,embed,hr,img,input,link,meta,param,' +
+  'source,track,wbr,canvas,svg,iframe,video,audio,object,textarea,select').split(','));
 
 /**
- * 把抗漂移/打标规则注入克隆体：domshot 的 svgStyleElement（svg 顶层 <style>，
+ * 克隆体打标：给 [data-zwa-shot-target] 克隆节点追加 position:absolute +
+ * inset:0 + border 的标记子元素——脱离文档流、DOM 序最后、z-index 封顶 →
+ * 画在元素全部内容之上。环外缘 = 目标 padding-box（位图扫回后外扩元素
+ * border 宽度即得 border-box）。
+ * 必须 createElementNS(XHTML)：foreignObject 内嵌文档是 XML 语境，
+ * createElement('div') 产出的无命名空间节点是未知元素、根本不渲染。
+ * 元素克隆本身是 static 时补 position:relative（不动布局）让它成为定位祖先。
+ */
+function markCloneTarget(svg) {
+  try {
+    const t = svg.querySelector('[data-zwa-shot-target]');
+    if (!t) return;
+    if (SHOT_NO_CHILD_TAGS.has(t.tagName.toLowerCase())) {
+      t.setAttribute('style', (t.getAttribute('style') || '') +
+        `;box-shadow:inset 0 0 0 ${SHOT_MARK_W}px ${SHOT_MARK_COLOR} !important`);
+      return;
+    }
+    const st = t.getAttribute('style') || '';
+    if (!/position\s*:\s*(relative|absolute|fixed|sticky)/.test(st))
+      t.setAttribute('style', st + ';position:relative !important');
+    const m = svg.ownerDocument.createElementNS('http://www.w3.org/1999/xhtml', 'div');
+    m.setAttribute('style',
+      `position:absolute !important;inset:0 !important;` +
+      `border:${SHOT_MARK_W}px solid ${SHOT_MARK_COLOR} !important;` +
+      `box-sizing:border-box !important;border-radius:0 !important;` +
+      `margin:0 !important;padding:0 !important;width:auto !important;height:auto !important;` +
+      `background:none !important;pointer-events:none !important;z-index:2147483647 !important;`);
+    t.appendChild(m);
+  } catch {}
+}
+
+/**
+ * 把抗漂移规则注入克隆体：domshot 的 svgStyleElement（svg 顶层 <style>，
  * 样式跨 foreignObject 作用于整个内嵌文档）是现成注入点；无样式收集时
  * （极小页）兜底新建 svg 命名空间 style 节点。注意不能走克隆 head——
  * filter 的 checkVisibility 剪枝会把不可见的 head 整棵移除。
@@ -818,7 +857,7 @@ function serializePage(endpoint, hostId = HOST_ID) {
               && !node.checkVisibility({ checkOpacity: false, checkVisibilityCSS: true })) return false;
           return true;
         },
-        onCreateForeignObjectSvg: injectShotCss,
+        onCreateForeignObjectSvg: svg => { injectShotCss(svg); markCloneTarget(svg); },
       })
       : null))
     .catch(() => null);
@@ -890,18 +929,27 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
     const layoutH = Math.max(document.documentElement.scrollHeight, document.documentElement.clientHeight) || vh;
     const sx = full.width / layoutW || 1;
     const sy = full.height / layoutH || 1;
-    // 红框基准（视口 CSS 坐标）：优先位图扫回的标记环（outline 外缘 = 元素盒外 4px，
-    // 环内缘即 border-box）；扫不到回退 live rect
+    // 红框基准（视口 CSS 坐标）：优先位图扫回的标记环——内凹标记环外缘
+    // 即目标 padding-box，外扩元素四边 border 宽度回到 border-box；
+    // 扫不到回退 live rect
     let mark = null;
     let bx = rect.x, by = rect.y, bw = rect.width, bh = rect.height;
+    let ringX = 0, ringY = 0, ringW = 0, ringH = 0;
     if (unmark) {
       mark = scanMarkBounds(full);
       if (mark) {
-        // 位图坐标 → 布局坐标（÷sx）→ 视口坐标（−scrollX）；outline 环厚 4 CSS px
-        bx = mark.x / sx - window.scrollX + 4;
-        by = mark.y / sy - window.scrollY + 4;
-        bw = mark.w / sx - 8;
-        bh = mark.h / sy - 8;
+        // 位图坐标 → 布局坐标（÷sx）→ 视口坐标（−scrollX）
+        ringX = mark.x / sx - window.scrollX;
+        ringY = mark.y / sy - window.scrollY;
+        ringW = mark.w / sx;
+        ringH = mark.h / sy;
+        const cs = getComputedStyle(liveEl);
+        const bl = parseFloat(cs.borderLeftWidth) || 0;
+        const br = parseFloat(cs.borderRightWidth) || 0;
+        const bt = parseFloat(cs.borderTopWidth) || 0;
+        const bb = parseFloat(cs.borderBottomWidth) || 0;
+        bx = ringX - bl; by = ringY - bt;
+        bw = ringW + bl + br; bh = ringH + bt + bb;
       }
     }
     const out = document.createElement('canvas');
@@ -926,11 +974,19 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
       (rw + 8) * sx, (rh + 8) * sy,
       rx - 4, ry - 4, rw + 8, rh + 8,
     );
-    // 红框压在标记环中心（元素盒外 2px）：5px 线宽完全盖住 4px 品红标记环，
+    // 红框压在标记环中心：内凹环在元素盒内 [0, MARK_W] 区间，环中心内缩
+    // MARK_W/2，线宽 MARK_W+1 完全盖住品红环（成图零残留）；
     // 无标记时沿用旧样式（元素盒外 4px、3px 线宽）
     ctx.strokeStyle = '#FF584D';
-    ctx.lineWidth = mark ? 5 : 3;
-    ctx.strokeRect(rx - (mark ? 2 : 4), ry - (mark ? 2 : 4), rw + (mark ? 4 : 8), rh + (mark ? 4 : 8));
+    if (mark) {
+      ctx.lineWidth = SHOT_MARK_W + 1;
+      const i = SHOT_MARK_W / 2;
+      ctx.strokeRect(Math.round(ringX) + i, Math.round(ringY) + i,
+        Math.round(ringW) - SHOT_MARK_W, Math.round(ringH) - SHOT_MARK_W);
+    } else {
+      ctx.lineWidth = 3;
+      ctx.strokeRect(rx - 4, ry - 4, rw + 8, rh + 8);
+    }
     // 双图策略（读图才耗 token）：
     //   ctx  = 目标 + 周边 ~480px 语境的裁剪图，挂 images[] 做默认证据
     //          （~300 token/次，全视口 ~1300 的零头）；
@@ -5470,12 +5526,39 @@ export function mountAnnotator(options = {}) {
     window.addEventListener('resize', onResize, true);
     bar.addEventListener('pointerdown', onBarPointerDown);
     // DOM 变化重排：SPA 内嵌视图切换/局部重渲染既不触发 scroll 也不触发
-    // resize，pin 与打开中的编辑器都会钉死在旧坐标。MutationObserver 节流 300ms 兜底。
-    const domObserver = new MutationObserver(() => {
-      clearTimeout(domObserver._t);
-      domObserver._t = setTimeout(() => { repositionPins(); repositionEditor(); repositionRegionMarks(); updateFocusFx(); }, 300);
+    // resize，pin 与打开中的编辑器都会钉死在旧坐标。MutationObserver 兜底，
+    // 节流而非防抖——防抖会被弹窗内的持续渲染（地图瓦片/表格数据流）反复
+    // 重置饿死，层级调整拖上好几秒：
+    // - body 直属子节点增删（teleport 弹窗/浮层开合的特征）立即重排；
+    // - 其余变化持续发生时每 250ms 保底必刷一次（throttle），变化停止后
+    //   尾随一次收尾——最长延迟封顶 250ms 而非等变化静默；
+    // - attributes 监听 class/style：v-show 型弹窗只切 display 不增删节点。
+    const REPOSITION_INTERVAL = 250;
+    const repositionAll = () => { repositionPins(); repositionEditor(); repositionRegionMarks(); updateFocusFx(); };
+    let lastRepositionAt = 0;
+    let repositionTimer = null;
+    const domObserver = new MutationObserver(recs => {
+      const overlayToggle = recs.some(r =>
+        r.type === 'childList' && r.target === document.body
+        && (r.addedNodes.length || r.removedNodes.length));
+      const now = performance.now();
+      if (overlayToggle || now - lastRepositionAt >= REPOSITION_INTERVAL) {
+        clearTimeout(repositionTimer);
+        repositionTimer = null;
+        lastRepositionAt = now;
+        repositionAll();
+        return;
+      }
+      if (!repositionTimer) repositionTimer = setTimeout(() => {
+        repositionTimer = null;
+        lastRepositionAt = performance.now();
+        repositionAll();
+      }, REPOSITION_INTERVAL - (now - lastRepositionAt));
     });
-    domObserver.observe(document.body, { childList: true, subtree: true });
+    domObserver.observe(document.body, {
+      childList: true, subtree: true,
+      attributes: true, attributeFilter: ['class', 'style'],
+    });
     document.addEventListener('visibilitychange', onVisibilityChange, true);
     window.addEventListener('pagehide', onPageHide, true);
 
@@ -5668,6 +5751,7 @@ export function mountAnnotator(options = {}) {
       document.removeEventListener('visibilitychange', onVisibilityChange, true);
       window.removeEventListener('pagehide', onPageHide, true);
       domObserver.disconnect();
+      clearTimeout(repositionTimer);
       document.documentElement.style.cursor = '';
       host.remove();
       delete window.__zwAnnotator;
