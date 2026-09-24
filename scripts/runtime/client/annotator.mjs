@@ -3357,10 +3357,6 @@ export function mountAnnotator(options = {}) {
 
   function placeEditor(selector, input, opts = {}) {
     editor.classList.remove('hidden');
-    // 弹窗隐藏时 scrollHeight 恒为 0，openEditor* 在取消隐藏前调用的
-    // syncEditorInput 会把输入条高度算成 0（首开 16px、二开 37px，
-    // 看起来像弹窗"跳了一下"）。取消隐藏后必须重新量一次。
-    syncEditorInput();
     // 弹窗打开期间悬停高亮与尺寸标签会跟聚光圈叠在一起，全部让位
     outline.style.display = 'none';
     hideSizeBadge();
@@ -3369,6 +3365,12 @@ export function mountAnnotator(options = {}) {
     const vh = window.innerHeight;
     const width = Math.min(380, Math.max(260, vw - 24));
     editor.style.width = `${width}px`;
+    // 弹窗隐藏时 scrollHeight 恒为 0，openEditor* 在取消隐藏前调用的
+    // syncEditorInput 会把输入条高度算成 0（首开 16px、二开 37px，
+    // 看起来像弹窗"跳了一下"）。取消隐藏后必须重新量一次；
+    // 且必须在宽度定稿后量——按残留窄宽度排版量出的 scrollHeight
+    // 会把 2 行文本算成多行高度，胶囊被白白撑高。
+    syncEditorInput();
     // 先清掉上一轮的限高，否则量到的不是弹窗的自然高度
     editor.style.maxHeight = '';
 
