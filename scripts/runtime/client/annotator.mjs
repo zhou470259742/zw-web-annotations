@@ -839,7 +839,9 @@ function serializePage(endpoint, hostId = HOST_ID) {
     .then(() => loadDomshot(endpoint))
     .then(mod => (mod
       ? mod.domToCanvas(document.documentElement, {
-        scale: 0.75,
+        // 采样率跟随设备像素比（封顶 2 防极端 dpr 爆内存）：固定 0.75 在
+        // Retina 屏上成图物理密度只有 ~0.4，截图整体发虚
+        scale: Math.min(window.devicePixelRatio || 1, 2),
         // 布局尺寸必须显式给：domToCanvas 默认取 html.getBoundingClientRect()——
         // 页面位于 transform:scale 容器（如 IDE 内嵌预览缩放）时拿到的是缩放后
         // 的视觉宽度，克隆体会按更窄宽度重排（顶栏换行、内容挤压）。
@@ -952,53 +954,57 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
         bw = ringW + bl + br; bh = ringH + bt + bb;
       }
     }
-    const out = document.createElement('canvas');
-    out.width = vw;
-    out.height = vh;
-    const ctx = out.getContext('2d');
-    // 当前视口在采样图里的切片（文档坐标×采样比），铺满整个输出画布：
-    // 内容与视口严格 1:1，高亮红框按视口坐标描即精确命中；
-    // 旧写法按原尺寸画 0.75 图只占 75% 画布，红框会偏右下 1/3。
+    // 当前视口在采样图里的切片（文档坐标×采样比）。输出画布按位图分辨率
+    // （非 CSS 像素）出图——Retina 采样配 1x 输出仍会把高清位图缩回发虚
     const srcX = Math.round(window.scrollX * sx);
     const srcY = Math.round(window.scrollY * sy);
     const srcW = Math.min(Math.round(vw * sx), full.width - srcX);
     const srcH = Math.min(Math.round(vh * sy), full.height - srcY);
-    ctx.drawImage(full, srcX, srcY, srcW, srcH, 0, 0, vw, vh);
-    const rx = Math.round(bx), ry = Math.round(by), rw = Math.round(bw), rh = Math.round(bh);
+    const out = document.createElement('canvas');
+    out.width = srcW;
+    out.height = srcH;
+    const ctx = out.getContext('2d');
+    ctx.drawImage(full, srcX, srcY, srcW, srcH, 0, 0, srcW, srcH);
+    // 以下几何一律位图坐标（视口 CSS 坐标×采样比）
+    const rx = Math.round(bx * sx), ry = Math.round(by * sy);
+    const rw = Math.round(bw * sx), rh = Math.round(bh * sy);
+    const m4 = 4 * sx;
     // 遮罩压暗四周、亮区只重绘红框那一小条（不整幅二次绘制）
     ctx.fillStyle = 'rgba(15, 23, 42, 0.45)';
-    ctx.fillRect(0, 0, vw, vh);
+    ctx.fillRect(0, 0, srcW, srcH);
     ctx.drawImage(
       full,
-      srcX + (rx - 4) * sx, srcY + (ry - 4) * sy,
-      (rw + 8) * sx, (rh + 8) * sy,
-      rx - 4, ry - 4, rw + 8, rh + 8,
+      srcX + rx - m4, srcY + ry - m4,
+      rw + m4 * 2, rh + m4 * 2,
+      rx - m4, ry - m4, rw + m4 * 2, rh + m4 * 2,
     );
     // 红框压在标记环中心：内凹环在元素盒内 [0, MARK_W] 区间，环中心内缩
     // MARK_W/2，线宽 MARK_W+1 完全盖住品红环（成图零残留）；
-    // 无标记时沿用旧样式（元素盒外 4px、3px 线宽）
+    // 无标记时沿用旧样式（元素盒外 4px、3px 线宽，按位图坐标换算）
     ctx.strokeStyle = '#FF584D';
     if (mark) {
-      ctx.lineWidth = SHOT_MARK_W + 1;
-      const i = SHOT_MARK_W / 2;
-      ctx.strokeRect(Math.round(ringX) + i, Math.round(ringY) + i,
-        Math.round(ringW) - SHOT_MARK_W, Math.round(ringH) - SHOT_MARK_W);
+      ctx.lineWidth = (SHOT_MARK_W + 1) * sx;
+      const i = (SHOT_MARK_W / 2) * sx;
+      ctx.strokeRect(Math.round(ringX * sx) + i, Math.round(ringY * sy) + i,
+        Math.round(ringW * sx) - SHOT_MARK_W * sx, Math.round(ringH * sy) - SHOT_MARK_W * sy);
     } else {
-      ctx.lineWidth = 3;
-      ctx.strokeRect(rx - 4, ry - 4, rw + 8, rh + 8);
+      ctx.lineWidth = 3 * sx;
+      ctx.strokeRect(rx - m4, ry - m4, rw + m4 * 2, rh + m4 * 2);
     }
     // 双图策略（读图才耗 token）：
     //   ctx  = 目标 + 周边 ~480px 语境的裁剪图，挂 images[] 做默认证据
     //          （~300 token/次，全视口 ~1300 的零头）；
     //   full = 全视口，走 meta.fullShot 独立通道落盘备查——不占 images，
     //          处理者需要页面全局语境时按路径取，不读零成本。
+    // 语境裁剪：~240 CSS px 周边（位图坐标下按采样比换算），画布取整
     const PAD = 240;
-    const cx = Math.max(0, rx - PAD), cy = Math.max(0, ry - PAD);
-    const cw = Math.min(vw - cx, rw + PAD * 2), ch = Math.min(vh - cy, rh + PAD * 2);
+    const padX = PAD * sx, padY = PAD * sy;
+    const cx = Math.max(0, rx - padX), cy = Math.max(0, ry - padY);
+    const cw = Math.min(srcW - cx, rw + padX * 2), ch = Math.min(srcH - cy, rh + padY * 2);
     const crop = document.createElement('canvas');
-    crop.width = cw;
-    crop.height = ch;
-    crop.getContext('2d').drawImage(out, cx, cy, cw, ch, 0, 0, cw, ch);
+    crop.width = Math.round(cw);
+    crop.height = Math.round(ch);
+    crop.getContext('2d').drawImage(out, cx, cy, cw, ch, 0, 0, crop.width, crop.height);
     // 环境诊断随任务落盘：页面处于 transform:scale/zoom 容器（如 IDE 内嵌预览）
     // 时坐标系分裂，截图偏移类问题凭这几项指标可直接定位是哪种缩放机制
     let diag = null;
@@ -1016,6 +1022,7 @@ export async function captureContextShot(endpoint, rect, hostId = HOST_ID, liveE
         htmlZoom: dcs.zoom, htmlTransform: String(dcs.transform).slice(0, 60),
         bodyZoom: bcs.zoom, bodyTransform: String(bcs.transform).slice(0, 60),
         fullW: full.width, fullH: full.height,
+        shotScale: +sx.toFixed(3),   // 位图采样比（dpr 封顶 2），清晰度排查指标
         markHit: !!mark,   // 位图是否扫回目标标记环（false=回退 live rect）
       };
     } catch {}
