@@ -6302,13 +6302,13 @@ const CSS_TEXT = `
 .pill-submit[data-ready="on"]:hover { background: #2f5fd0; }
 
 /* 输入条下方的辅助信息：编号、目标元素、按键提示。
-   自带白底胶囊——编辑器浮在 veil/spotlight 压暗层之上，无底色时
-   灰字直接压在变灰的页面上完全看不清。 */
+   与上方输入胶囊同族样式（白底+同款 1px 描边环+收淡投影）——编辑器浮在
+   veil/spotlight 压暗层之上，无底色时灰字直接压在变灰的页面上完全看不清。 */
 .editor-caption {
   display: flex; align-items: center; gap: 6px;
-  padding: 3px 10px; font-size: 11px;
-  background: rgba(255,255,255,.96); border-radius: 999px;
-  box-shadow: 0 2px 8px rgba(0,0,0,.18), 0 0 0 1px rgba(0,0,0,.05);
+  padding: 4px 10px; font-size: 11px;
+  background: #fff; border-radius: 999px;
+  box-shadow: 0 3px 12px rgba(0,0,0,.16), 0 0 0 1px rgba(0,0,0,.06);
 }
 .editor-seq {
   flex: none; padding: 1px 6px; border-radius: 999px;
