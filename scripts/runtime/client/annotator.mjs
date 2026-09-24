@@ -6220,7 +6220,8 @@ const CSS_TEXT = `
 }
 .thumb {
   position: relative; width: 64px; height: 64px;
-  border: 1px solid #4a4a4a; border-radius: 7px; overflow: hidden; background: #111;
+  border: 1px solid rgba(0,0,0,.35); border-radius: 7px; overflow: hidden; background: #111;
+  box-shadow: 0 2px 6px rgba(0,0,0,.22);
 }
 .thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .thumb-size {
@@ -6300,11 +6301,15 @@ const CSS_TEXT = `
 .pill-submit:hover { background: #93a0b0; }
 .pill-submit[data-ready="on"]:hover { background: #2f5fd0; }
 
-/* 输入条下方的辅助信息：编号、目标元素、按键提示 */
+/* 输入条下方的辅助信息：编号、目标元素、按键提示。
+   自带白底胶囊——编辑器浮在 veil/spotlight 压暗层之上，无底色时
+   灰字直接压在变灰的页面上完全看不清。 */
 .editor-caption {
   display: flex; align-items: center; gap: 6px;
-  padding: 0 10px; font-size: 11px;
-  text-shadow: 0 1px 2px rgba(255,255,255,.7);
+  align-self: flex-start;
+  padding: 3px 10px; font-size: 11px;
+  background: rgba(255,255,255,.96); border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.18), 0 0 0 1px rgba(0,0,0,.05);
 }
 .editor-seq {
   flex: none; padding: 1px 6px; border-radius: 999px;
