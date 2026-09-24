@@ -4584,6 +4584,7 @@ export function mountAnnotator(options = {}) {
       // 原先 vh-90 把沉底落点又顶回半腰——「拖不下去」就是它。
       bar.style.top = `${clampNum(l.y ?? 140, 40, window.innerHeight - 40)}px`;
       bar.style.bottom = 'auto';
+      avoidEdgeChrome(l.side);
     } else if (Number.isFinite(l.x) && Number.isFinite(l.y)) {
       bar.style.left = `${clampNum(l.x, 0, window.innerWidth - 90)}px`;
       bar.style.right = 'auto';
@@ -4628,6 +4629,77 @@ export function mountAnnotator(options = {}) {
       if (bar._avoidChrome) {
         bar._avoidChrome = false;
         bar.style.removeProperty('bottom');
+      }
+    } catch {}
+  }
+
+  /**
+   * 贴边耳片避障：应用右缘常有自带的悬浮控件列（地图工具、收展钮），
+   * 耳片贴边会压住它们。在耳片中心采样命中栈，命中交互控件时上溯到
+   * 贴缘的定位祖先（整列按钮视为一个阻挡体），把耳片挪到它下方；
+   * 下方放不下则抬到上方。阻挡消失后恢复拖拽落点原位。
+   */
+  function avoidEdgeChrome(side) {
+    try {
+      const l = state.dockLayout;
+      if (!l || l.side !== side) return;
+      const ear = $('[data-el="edgeTab"]') || bar;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      for (let attempt = 0; attempt < 6; attempt++) {
+        const er0 = ear.getBoundingClientRect();
+        // 采样点取耳片自身中心：应用的悬浮工具条不一定贴屏缘（如地图
+        // 工具列 absolute 在画布内缘），采样屏缘会漏掉它
+        const cy = Math.min(vh - 4, Math.max(4, er0.top + er0.height / 2));
+        const stack = document.elementsFromPoint(er0.left + er0.width / 2, cy) || [];
+        let hit = null;
+        for (const el of stack) {
+          if (el === host || host.contains(el)) continue;
+          if (el === document.documentElement || el === document.body) continue;
+          const er = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          // 大面积蒙层/背景不是控件：半透明的（loading mask 等）穿透继续找
+          // 下层控件；不透明的才算真背景，停止
+          if (er.width * er.height > vw * vh * 0.25) {
+            const m = cs.backgroundColor.match(/[\d.]+/g);
+            const translucent = parseFloat(cs.opacity) < 0.95
+              || (m && m.length >= 4 && parseFloat(m[3]) < 0.9);
+            if (translucent) continue;
+            break;
+          }
+          // 普通静态内容被耳片压住是悬浮件的常态，不避让；
+          // 只有交互控件或浮层容器才算阻挡
+          const interactive = el.closest &&
+            el.closest('button,a,input,select,textarea,[role="button"],[class*="btn"],[class*="tool"]');
+          const floating = cs.position === 'fixed' || cs.position === 'absolute';
+          if (!interactive && !floating) break;
+          hit = el;
+          break;
+        }
+        if (!hit) {
+          // 无阻挡：恢复被自动挪开前的落点
+          if (l._origY != null) {
+            l.y = l._origY;
+            delete l._origY;
+            bar.style.top = `${clampNum(l.y, 40, vh - 40)}px`;
+          }
+          return;
+        }
+        // 上溯到浮层祖先：整列按钮容器当一个阻挡体（如 map-floating-toolbar）
+        let blk = hit;
+        for (let p = hit.parentElement; p && p !== document.body; p = p.parentElement) {
+          const ps = getComputedStyle(p), pr = p.getBoundingClientRect();
+          if ((ps.position === 'fixed' || ps.position === 'absolute')
+              && pr.height < vh * 0.8 && pr.width < vw * 0.5) blk = p;
+          else break;
+        }
+        const br = blk.getBoundingClientRect();
+        const down = br.bottom + 10;
+        const up = br.top - er0.height - 10;
+        const ny = down + er0.height + 8 < vh ? down : Math.max(8, up);
+        if (Math.abs(ny - er0.top) < 4) return; // 已在避让位，不再振荡
+        if (l._origY == null) l._origY = l.y;
+        l.y = ny;
+        bar.style.top = `${ny}px`;
       }
     } catch {}
   }
@@ -5538,7 +5610,10 @@ export function mountAnnotator(options = {}) {
   function onResize() {
     repositionPins();
     hideSizeBadge();
-    if (!state.dockLayout && !bar.classList.contains('dragging')) avoidAppChrome();
+    if (!bar.classList.contains('dragging')) {
+      if (!state.dockLayout) avoidAppChrome();
+      else if (state.dockLayout.side) avoidEdgeChrome(state.dockLayout.side);
+    }
     syncBarAnchored();
     repositionEditor();
     updateFocusFx();
@@ -5577,8 +5652,12 @@ export function mountAnnotator(options = {}) {
     // 应用底栏可能比标注器晚渲染/随路由出现消失：默认落点下每次重排都重评
     // 避障（用户拖过的自由/贴边布局不打扰，拖拽中途也不回写）
     const reevalDockAvoid = () => {
-      if (!state.dockLayout && !bar.classList.contains('dragging')) {
+      if (bar.classList.contains('dragging')) return;
+      if (!state.dockLayout) {
         avoidAppChrome();
+        syncBarAnchored();
+      } else if (state.dockLayout.side) {
+        avoidEdgeChrome(state.dockLayout.side);
         syncBarAnchored();
       }
     };
@@ -5615,6 +5694,10 @@ export function mountAnnotator(options = {}) {
   $('[data-el="panelVersion"]').textContent = config.version ? `v${config.version}` : '';
   restorePanelTheme();
   applyDockLayout();
+  // 挂载时机缝隙：应用底栏/工具列可能比标注器晚渲染且其后再无 DOM
+  // mutation（observer 不触发）——延迟兜底各重评一次避障
+  setTimeout(() => { reevalDockAvoid(); }, 600);
+  setTimeout(() => { reevalDockAvoid(); }, 2500);
   renderBar();
   renderPins();
   renderMessage();
