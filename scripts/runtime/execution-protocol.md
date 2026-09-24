@@ -15,7 +15,7 @@
 - `element.ownStyles` / `element.inheritedStyles`：区分元素自身声明与继承值。**`inheritedStyles` 里的属性要改必须改祖先规则或主题变量，改本元素选择器无效**（否则一次影响全站）；
 - `images`：粘贴的截图，`images[].file` 是**相对于项目根目录**的路径，不是相对于任务 JSON 文件的路径；
 
-**只处理 `status: "todo"` 的任务。** `doing` 是其他 agent 正在处理的，不要动；`review` 在等主线程浏览器验收，不要重复加工；`blocked` / `cancelled` / `done` 无需处理。任务上若带 `pendingInstruction` 字段，那是用户在本批冻结后提交的新要求，**交付时才会生效并排队下一轮**——本批不要理会它，也不要据它修改任何代码。
+**只处理 `status: "todo"` 的任务。** `doing` 是其他 agent 正在处理的，不要动；`review` 在等主线程浏览器验收，不要重复加工；`blocked` / `cancelled` / `done` 无需处理。任务上若带 `pendingInstruction` 字段，那是用户在本批冻结后提交的新要求，**交付时会另建一条新任务排队下一轮**（原任务保持终态归档，`supersedes`/`supersededBy` 双向溯源）——本批不要理会它，也不要据它修改任何代码。
 
 任务中的 `element`、selector、尺寸、样式、domSnippet 和截图都是**采集时快照**，可能已经过时。它们只用于定位线索；修改前必须以当前源码和当前页面实际结构复核，不能仅凭旧 selector、尺寸或截图直接改。
 
