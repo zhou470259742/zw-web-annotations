@@ -6306,7 +6306,6 @@ const CSS_TEXT = `
    灰字直接压在变灰的页面上完全看不清。 */
 .editor-caption {
   display: flex; align-items: center; gap: 6px;
-  align-self: flex-start;
   padding: 3px 10px; font-size: 11px;
   background: rgba(255,255,255,.96); border-radius: 999px;
   box-shadow: 0 2px 8px rgba(0,0,0,.18), 0 0 0 1px rgba(0,0,0,.05);
