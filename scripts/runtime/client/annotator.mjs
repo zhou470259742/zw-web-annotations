@@ -1509,12 +1509,14 @@ export function mountAnnotator(options = {}) {
           <button type="button" class="arch-all" data-act="archive-all-done" title="把全部已完成任务一次性归档">全部归档</button>
         </div>
         <div class="arch-drawer-body region-body" data-el="archDrawerBody"></div>
-        <div class="arch-pop hidden" data-el="archPop">
-          <p data-el="archPopText"></p>
-          <div class="arch-pop-actions">
-            <button type="button" data-el="archPopCancel">取消</button>
-            <button type="button" class="primary" data-el="archPopOk">确认归档</button>
-          </div>
+      </div>
+      <!-- 确认 popover 挂面板根级：折叠态的归档区只有一行高且 overflow:hidden，
+           气泡放区域里会被裁掉；面板 500px 高足以完整显示 -->
+      <div class="arch-pop hidden" data-el="archPop">
+        <p data-el="archPopText"></p>
+        <div class="arch-pop-actions">
+          <button type="button" data-el="archPopCancel">取消</button>
+          <button type="button" class="primary" data-el="archPopOk">确认归档</button>
         </div>
       </div>
       <footer><span class="panel-msg" data-el="msg"></span><span class="panel-version" data-el="panelVersion" title="标注组件运行时版本"></span></footer>
@@ -3425,14 +3427,29 @@ export function mountAnnotator(options = {}) {
     setTimeout(() => {
       // focus:false 用于 DOM 稳定后的补定位——不打断正在进行的输入
       if (opts.focus === false) return;
-      input.focus();
-      // 光标放到末尾，便于继续编辑已有内容
-      const len = input.value.length;
-      try {
-        input.setSelectionRange(len, len);
-      } catch {
-        /* 忽略 */
-      }
+      const doFocus = () => {
+        input.focus();
+        // 光标放到末尾，便于继续编辑已有内容
+        const len = input.value.length;
+        try {
+          input.setSelectionRange(len, len);
+        } catch {
+          /* 忽略 */
+        }
+      };
+      doFocus();
+      // 有些页面组件（焦点陷阱、异步聚焦的控件）会在编辑器打开后一拍
+      // 才把焦点抢走，首开的一次 focus 容易被顶掉。隔帧与延时各复查一次：
+      // 焦点已不在输入框才抢回，仍在则不打扰（focus 会重置用户已敲的选区）。
+      const refocusIfLost = () => {
+        if (editor.classList.contains('hidden')) return;
+        const root = input.getRootNode();
+        const active = (root && root.activeElement) || document.activeElement;
+        if (active === input) return;
+        doFocus();
+      };
+      requestAnimationFrame(refocusIfLost);
+      setTimeout(refocusIfLost, 150);
     }, 0);
   }
 
@@ -4326,6 +4343,38 @@ export function mountAnnotator(options = {}) {
     const next = event.relatedTarget;
     if (next && (next === host || host.contains(next))) return;
     input.focus({ preventScroll: true });
+  }
+
+  /**
+   * 编辑期间对外部焦点陷阱的「反陷阱」：antd6/@rc-component dialog 的
+   * useLockFocus 在 window 冒泡阶段监听 focusin，焦点一旦离开弹窗就
+   * 立刻拉回弹窗（首个可聚焦元素=关闭按钮）。textarea 在 shadow DOM 里，
+   * document.activeElement 恒为 host，对陷阱来说永远是「弹窗外」——
+   * 于是 placeEditor 的 focus 与 onEditorFocusLeak 的抢焦会和陷阱打成
+   * 上百轮的乒乓，最终焦点停在关闭按钮上，输入框看得见却打不了字。
+   *
+   * 焦点事件捕获顺序 window→…→目标：这里在捕获阶段把「编辑中、且焦点
+   * 落在自身 UI 内」的 focusin 直接 stopPropagation，陷阱的冒泡监听
+   * 根本收不到事件，就不会再抢；落在页面上的 focusin 则同步把焦点
+   * 抢回输入框（与 onEditorFocusLeak 同职责，但更早、且同时屏蔽陷阱）。
+   * 编辑关闭（isEditing=false）时函数直接放行，不影响页面正常焦点流。
+   */
+  function onFocusTrapGuard(event) {
+    if (!isEditing()) return;
+    const input = $('[data-el="editorInput"]');
+    if (!input) return;
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [];
+    const onOwnUi = path.includes(host);
+    if (onOwnUi) {
+      // 焦点进入自身 UI（含输入框本框）：事件对页面陷阱隐形，焦点放行
+      event.stopPropagation();
+      return;
+    }
+    // 焦点落在页面（含外部弹窗）：同步抢回输入框，并让这次 focusin 对
+    // 页面陷阱隐形——stopPropagation 后陷阱不知道发生过这次转移，
+    // 不会再拉一次，乒乓到此终止。
+    input.focus({ preventScroll: true });
+    event.stopPropagation();
   }
 
   function onClick(event) {
@@ -5237,7 +5286,9 @@ export function mountAnnotator(options = {}) {
     return !$('[data-el="archPop"]')?.classList.contains('hidden');
   }
   function askArchPop(anchorBtn, text, onConfirm) {
-    const box = $('[data-el="archInline"]');
+    // popover 挂在面板根级（archInline 折叠时 overflow:hidden 会裁掉气泡），
+    // 定位基准用面板矩形而不是归档区矩形
+    const box = $('[data-el="panel"]');
     const pop = $('[data-el="archPop"]');
     if (!box || !pop) { onConfirm(); return; }
     archPopPending = onConfirm;
@@ -5248,7 +5299,7 @@ export function mountAnnotator(options = {}) {
     pop.style.right = `${Math.max(8, dr.right - br.right)}px`;
     pop.style.left = 'auto';
     const ph = pop.offsetHeight || 92;
-    // 固定弹在按钮上方；钳在归档区内部（贴顶时覆盖头部，保证文字完整可见）。
+    // 固定弹在按钮上方；钳在面板内部（贴顶时覆盖头部，保证文字完整可见）。
     const top = Math.max(br.top - dr.top - ph - 6, 4);
     pop.style.top = `${top}px`;
   }
@@ -5261,7 +5312,8 @@ export function mountAnnotator(options = {}) {
       if (fn) fn();
     });
     $('[data-el="archPopCancel"]')?.addEventListener('click', closeArchPop);
-    $('[data-el="archInline"]')?.addEventListener('pointerdown', event => {
+    // popover 在面板根级：面板内任意位置按下（pop 自身除外）都收起它
+    $('[data-el="panel"]')?.addEventListener('pointerdown', event => {
       if (archPopOpen() && !event.target.closest('.arch-pop')) closeArchPop();
     });
   }
@@ -5651,6 +5703,7 @@ export function mountAnnotator(options = {}) {
     document.addEventListener('mousedown', onMouseDown, true);
     document.addEventListener('mouseup', onMouseUp, true);
     document.addEventListener('focusout', onEditorFocusLeak, true);
+    document.addEventListener('focusin', onFocusTrapGuard, true);
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
     window.addEventListener('scroll', onScroll, true);
@@ -5671,9 +5724,6 @@ export function mountAnnotator(options = {}) {
       if (bar.classList.contains('dragging')) return;
       if (!state.dockLayout) {
         avoidAppChrome();
-        syncBarAnchored();
-      } else if (state.dockLayout.side) {
-        avoidEdgeChrome(state.dockLayout.side);
         syncBarAnchored();
       }
     };
